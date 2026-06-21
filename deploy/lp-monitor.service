@@ -1,0 +1,21 @@
+# /etc/systemd/system/lp-monitor.service
+# 把它放到 VPS 的 /etc/systemd/system/ 下，然后：
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now lp-monitor
+# 查看日志：journalctl -u lp-monitor -f
+
+[Unit]
+Description=LP Monitor (Next.js)
+After=network.target
+
+[Service]
+Type=simple
+User=hejie
+WorkingDirectory=/home/hejie/lp-monitor
+EnvironmentFile=/home/hejie/lp-monitor/.env.local
+ExecStart=/usr/bin/npm start
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
