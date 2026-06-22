@@ -9,15 +9,16 @@
 import { getDb } from "../db";
 import { appEnv } from "../db/config";
 import { getClient, listChains } from "../chains";
+import type { PublicClient } from "viem";
 import { resolveTokens } from "../chains/tokens";
 import { listDexes, listStaking, type DexRow, type StakingRow } from "../chains/dexes";
 import { getAdapter } from "../adapters";
 import {
   findDirectPositions,
-  findStakedPositionsByEvents,
-  findStakedPositionsByTransfer,
+  findStakedPositions,
   type DiscoveredPosition,
 } from "../staking/discover";
+import { ownerOf } from "../adapters/v3-fork";
 import { notifyAll } from "../notify";
 
 export interface ScanSummary {
@@ -56,23 +57,21 @@ export async function runScan(): Promise<ScanSummary> {
       const dexes = listDexes(w.chain_id_ref, true);
       const staking = listStaking(w.chain_id_ref, true);
 
-      // 发现仓位（三种方式合并去重）
+      // 发现仓位：直接持有 + 质押溯源（转账扫描），合并去重
       const direct = await findDirectPositions(client, w.address as `0x${string}`, dexes);
-      const stakedByEvents = await findStakedPositionsByEvents(
+      const staked = await findStakedPositions(
         client,
         w.address as `0x${string}`,
         dexes,
         staking
       );
-      const stakedByTransfer = await findStakedPositionsByTransfer(
-        client,
-        w.address as `0x${string}`,
-        dexes,
-        staking
-      );
-      const discovered = dedupeDiscovered([...direct, ...stakedByEvents, ...stakedByTransfer]);
+      const discovered = dedupeDiscovered([...direct, ...staked]);
 
-      for (const dp of discovered) {
+      // 兜底恢复：库里有但本次未发现的仓位（尤其质押仓位：转账发生在扫描窗口外）。
+      // 反查 ownerOf，仍命中钱包或已知质押合约 → 纳入本次扫描；否则视为已转移/已平仓 → 标记 closed。
+      const recovered = await recoverMissedPositions(client, w, dexes, staking, discovered);
+
+      for (const dp of [...discovered, ...recovered]) {
         try {
           const dex = dexes.find((d) => d.id === dp.dexId);
           if (!dex) continue;
@@ -219,6 +218,94 @@ function dedupeDiscovered(list: DiscoveredPosition[]): DiscoveredPosition[] {
     if (!map.has(key) || d.source === "direct") map.set(key, d);
   }
   return [...map.values()];
+}
+
+interface DbPositionRow {
+  id: number;
+  dex_id: number | null;
+  dex_name: string;
+  token_id: string;
+  source: string;
+  staker_contract: string;
+  staking_id: number | null;
+  notify_state: string;
+}
+
+/**
+ * 兜底恢复：本次扫描没发现、但库里仍存在（且非 closed）的仓位。
+ *
+ * 场景：质押溯源依赖近 N 个块的 Transfer 日志；如果质押发生在更早的区块（fromBlockDelta 之外），
+ * 转账扫描就抓不到，仓位会从 discovered 列表里「消失」。直接按消失处理会误标 closed。
+ *
+ * 策略：反查 NFT 当前 owner ——
+ *   - owner == 钱包本身            → 视为直接持有，恢复
+ *   - owner 命中已知质押合约        → 视为质押，恢复（带质押信息）
+ *   - owner 为其它地址 / 已销毁     → 真的没了，标记 closed
+ *
+ * 这样即便扫描窗口外的老仓位也能被持续监控，直到它真正被转走或平仓。
+ */
+async function recoverMissedPositions(
+  client: PublicClient,
+  wallet: WalletRow,
+  dexes: DexRow[],
+  staking: StakingRow[],
+  discovered: DiscoveredPosition[]
+): Promise<DiscoveredPosition[]> {
+  const db = getDb();
+  const nowIso = new Date().toISOString();
+
+  // 本次发现的 (dexId, tokenId) 集合
+  const foundKeys = new Set(discovered.map((d) => `${d.dexId}:${d.tokenId}`));
+
+  // 库里属于该钱包、且非 closed 的仓位
+  const rows = db
+    .prepare(
+      `SELECT id, dex_id, dex_name, token_id, source, staker_contract, staking_id, notify_state
+       FROM positions WHERE wallet_id=? AND notify_state!='closed'`
+    )
+    .all(wallet.id) as DbPositionRow[];
+
+  // 已知质押合约：地址小写 → StakingRow（含 dex 归属信息由 staking_contracts 表的 chain 唯一即可）
+  const stakingByAddr = new Map(staking.map((s) => [s.contract.toLowerCase(), s]));
+  const walletLower = wallet.address.toLowerCase();
+
+  const recovered: DiscoveredPosition[] = [];
+
+  for (const row of rows) {
+    const dex = dexes.find((d) => d.id === row.dex_id) ?? dexes.find((d) => d.name === row.dex_name);
+    if (!dex) continue; // 该 DEX 已被禁用/删除，跳过
+    if (foundKeys.has(`${dex.id}:${row.token_id}`)) continue; // 本次已发现，无需恢复
+
+    // 反查当前 owner
+    const currentOwner = await ownerOf(client, dex.npm as `0x${string}`, BigInt(row.token_id));
+
+    if (currentOwner && currentOwner.toLowerCase() === walletLower) {
+      // 仍在钱包里（直接持有），恢复
+      recovered.push({ tokenId: row.token_id, dexId: dex.id, source: "direct" });
+      continue;
+    }
+
+    const s = currentOwner ? stakingByAddr.get(currentOwner.toLowerCase()) : undefined;
+    if (s) {
+      // 仍质押在已知合约里，恢复（带质押信息）
+      recovered.push({
+        tokenId: row.token_id,
+        dexId: dex.id,
+        source: "staking",
+        stakerContract: s.contract,
+        stakingId: s.id,
+      });
+      continue;
+    }
+
+    // 既不在钱包也不在已知质押合约 → 真正转移或销毁，标记 closed
+    db.prepare(
+      `UPDATE positions SET notify_state='closed', last_checked_at=?, last_in_range=0
+       WHERE id=?`
+    ).run(nowIso, row.id);
+  }
+
+  return recovered;
 }
 
 function withinCooldown(lastNotifiedIso: string | undefined): boolean {

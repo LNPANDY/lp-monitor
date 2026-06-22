@@ -1,12 +1,17 @@
 /**
- * 仓位发现（v2）：
- * 1. 直接持有 —— 钱包当前持有的各 DEX NFT 仓位
- * 2. 质押溯源 —— 三种互补方式：
- *    a) 反向查询（最可靠）：遍历质押合约中记录的仓位，
- *       用 deposits(tokenId).owner 反向匹配钱包地址。
- *       适用于：已知质押合约 + 知道 tokenId 范围的场景。
- *    b) 事件扫描：扫质押合约的 Deposit 事件，筛选出 owner=wallet 的记录。
- *    c) Transfer 扫描兜底：扫钱包历史转出的 NFT，查当前 owner 是否命中质押合约。
+ * 仓位发现（v3）：
+ *
+ * 1. 直接持有 —— 钱包当前持有的各 DEX NFT 仓位（tokenOfOwnerByIndex 枚举）
+ *
+ * 2. 质押溯源 —— 单一可靠方式：转账扫描
+ *    扫该钱包历史上「作为转出方」的 ERC721 Transfer 事件，拿到所有曾经流出的 tokenId，
+ *    反查每个 tokenId 的当前 owner；若当前 owner 命中「已知质押合约」，则视为该钱包的质押仓位。
+ *
+ *    这种方式不依赖质押合约的事件签名（各协议签名千差万别，猜测极易失败），
+ *    只依赖 ERC721 标准 Transfer 事件（所有 NFT 必然实现），可靠性最高。
+ *
+ *    为覆盖「很久前质押」的场景：从该仓位首次被发现的区块起，或默认扫最近 N 个块；
+ *    若用户知道具体 tokenId，可在前端「手动登记」直接监控（v2 待做）。
  */
 import type { PublicClient } from "viem";
 import { parseAbiItem, type Address } from "viem";
@@ -21,7 +26,7 @@ export interface DiscoveredPosition {
   stakingId?: number;
 }
 
-/** 直接持有：用 tokenOfOwnerByIndex 枚举（标准 ERC721Enumerable，Uniswap NPM 支持）。 */
+/** 直接持有：用 tokenOfOwnerByIndex 枚举。 */
 export async function findDirectPositions(
   client: PublicClient,
   wallet: Address,
@@ -59,14 +64,10 @@ export async function findDirectPositions(
 }
 
 /**
- * 方式 a)：从质押合约的事件中发现属于该钱包的仓位。
- * 查质押合约发出的 Deposit 事件（tokenDeposited / staked），筛选 owner = wallet。
- * 同时查 Withdraw 事件排除已取出的。
- *
- * 这种方式不依赖 DEX NPM 合约，直接从质押合约本身发现仓位。
- * 适用性：Uniswap V3 Staker、大部分 V3-fork 质押合约都会 emit Deposit/Withdraw 事件。
+ * 质押溯源：转账扫描。
+ * 并发限制：对每个 DEX 一次 getLogs，再对命中的 tokenId 并发反查 owner（限制并发数）。
  */
-export async function findStakedPositionsByEvents(
+export async function findStakedPositions(
   client: PublicClient,
   wallet: Address,
   dexes: DexRow[],
@@ -75,154 +76,75 @@ export async function findStakedPositionsByEvents(
 ): Promise<DiscoveredPosition[]> {
   if (staking.length === 0 || dexes.length === 0) return [];
 
-  const latest = await client.getBlockNumber();
-  const fromBlock = latest > fromBlockDelta ? latest - fromBlockDelta : 0n;
-
-  // 建立 npm 地址 → dexId 映射
-  const npmToDex = new Map(dexes.map((d) => [d.npm.toLowerCase(), d]));
-  const stakingByAddr = new Map(staking.map((s) => [s.contract.toLowerCase(), s]));
-
-  // 尝试多种事件签名（不同质押合约可能用不同事件名）
-  const eventSigs = [
-    // Uniswap V3 Staker: Deposit(tokenId, owner, ...)
-    parseAbiItem("event Deposit(uint256 indexed tokenId, address indexed owner, uint256 liquidity)"),
-    // 通用 Staked 事件
-    parseAbiItem("event Staked(uint256 indexed tokenId, address indexed user, uint256 amount)"),
-    // Uniswap V3 Staker 另一种签名
-    parseAbiItem("event Deposit(address indexed sender, uint256 indexed tokenId, uint256 liquidity)"),
-  ];
-
-  const out: DiscoveredPosition[] = [];
-  const seen = new Set<string>(); // dedup: "stakingId:tokenId"
-
-  for (const s of staking) {
-    let found = false;
-
-    for (const sig of eventSigs) {
-      // 尝试识别哪个 indexed 参数是 tokenId / owner
-      const inputNames = (sig as any).inputs?.map((i: any) => i.name) ?? [];
-
-      let logs: any[] = [];
-      try {
-        logs = await client.getLogs({
-          address: s.contract as Address,
-          event: sig,
-          fromBlock,
-          toBlock: "latest",
-        });
-      } catch {
-        // 该事件签名不匹配此合约，试下一个
-        continue;
-      }
-
-      for (const log of logs) {
-        const args = log.args as any;
-        // 尝试从不同位置提取 tokenId 和 owner
-        const tokenId = args.tokenId ?? args.id ?? null;
-        const owner = args.owner ?? args.user ?? args.sender ?? null;
-
-        if (!tokenId || !owner) continue;
-        if ((owner as string).toLowerCase() !== wallet.toLowerCase()) continue;
-
-        // 反查该 tokenId 当前 owner 是否仍是质押合约
-        // 找到对应的 DEX
-        let matchedDex: DexRow | undefined;
-        let currentOwner: string | null = null;
-
-        for (const dex of dexes) {
-          const own = await ownerOf(client, dex.npm as Address, BigInt(tokenId));
-          if (own) {
-            currentOwner = own;
-            if (own.toLowerCase() === s.contract.toLowerCase()) {
-              matchedDex = dex;
-              break;
-            }
-          }
-        }
-
-        if (!matchedDex) continue; // 该 NFT 不属于任何已知 DEX
-
-        const key = `${s.id}:${tokenId.toString()}`;
-        if (seen.has(key)) continue;
-        seen.add(key);
-
-        out.push({
-          tokenId: tokenId.toString(),
-          dexId: matchedDex.id,
-          source: "staking",
-          stakerContract: s.contract,
-          stakingId: s.id,
-        });
-        found = true;
-        break; // 该 staking 合约已找到匹配
-      }
-
-      if (found) break;
-    }
-  }
-
-  return out;
-}
-
-/**
- * 方式 c)：转账扫描兜底。
- * 扫钱包历史上从自己转出的 ERC721 Transfer 事件，
- * 查这些 tokenId 现在的 owner，若命中「已知质押合约」则建立溯源。
- */
-export async function findStakedPositionsByTransfer(
-  client: PublicClient,
-  wallet: Address,
-  dexes: DexRow[],
-  staking: StakingRow[],
-  fromBlockDelta = 100_000n
-): Promise<DiscoveredPosition[]> {
-  if (staking.length === 0) return [];
   const stakingByAddr = new Map(staking.map((s) => [s.contract.toLowerCase(), s]));
 
   const latest = await client.getBlockNumber();
   const fromBlock = latest > fromBlockDelta ? latest - fromBlockDelta : 0n;
 
-  const transferSig = parseAbiItem(
+  const transferEvent = parseAbiItem(
     "event Transfer(address indexed from, address indexed to, uint256 indexed tokenId)"
   );
 
   const out: DiscoveredPosition[] = [];
   const seen = new Set<string>();
 
+  // 每个 DEX 一次 getLogs（按 from=wallet 过滤）
   for (const dex of dexes) {
     let logs: any[] = [];
     try {
       logs = await client.getLogs({
         address: dex.npm as Address,
-        event: transferSig,
+        event: transferEvent,
         args: { from: wallet },
         fromBlock,
         toBlock: "latest",
       });
     } catch {
+      // RPC 可能限制 fromBlock 范围或日志数量，跳过该 DEX
       continue;
     }
+
+    // 收集候选 tokenId（去重）
+    const candidateIds = new Set<string>();
     for (const l of logs) {
-      const idStr = (l.args as any).tokenId?.toString();
-      if (!idStr) continue;
-      const currentOwner = await ownerOf(client, dex.npm as Address, BigInt(idStr));
-      if (!currentOwner) continue;
-      const s = stakingByAddr.get(currentOwner.toLowerCase());
-      if (s) {
-        const key = `${s.id}:${idStr}`;
-        if (seen.has(key)) continue;
-        seen.add(key);
-        out.push({
-          tokenId: idStr,
-          dexId: dex.id,
-          source: "staking",
-          stakerContract: s.contract,
-          stakingId: s.id,
-        });
-      }
+      const id = (l.args as any).tokenId?.toString();
+      if (id) candidateIds.add(id);
     }
+    if (candidateIds.size === 0) continue;
+
+    // 反查每个 tokenId 的当前 owner，判断是否质押合约
+    const ids = [...candidateIds];
+    await eachLimit(ids, 6, async (idStr) => {
+      const currentOwner = await ownerOf(client, dex.npm as Address, BigInt(idStr));
+      if (!currentOwner) return; // 仓位已销毁
+      const s = stakingByAddr.get(currentOwner.toLowerCase());
+      if (!s) return; // 不在任何已知质押合约里
+      const key = `${dex.id}:${idStr}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      out.push({
+        tokenId: idStr,
+        dexId: dex.id,
+        source: "staking",
+        stakerContract: s.contract,
+        stakingId: s.id,
+      });
+    });
   }
+
   return out;
+}
+
+/** 简易并发限制器。 */
+async function eachLimit<T>(items: T[], limit: number, fn: (item: T) => Promise<void>): Promise<void> {
+  let idx = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (idx < items.length) {
+      const cur = idx++;
+      await fn(items[cur]);
+    }
+  });
+  await Promise.all(workers);
 }
 
 /**
