@@ -120,6 +120,11 @@ export default function DashboardPage() {
           )}
         </section>
       )}
+
+      {/* 底部版本号 */}
+      <div className="text-center text-xs text-ink-soft">
+        LP Monitor v{process.env.NEXT_PUBLIC_VERSION}
+      </div>
     </div>
   );
 }
