@@ -1,6 +1,21 @@
 import type { PublicClient } from "viem";
 import { V3RangeStatus, readRangeStatus } from "./v3-fork";
 
+/** 仓位读取结果的三态：closed=已平仓 / unreadable=读不到（保留旧状态）/ ok=正常。 */
+export type RangeReadResult =
+  | { kind: "closed" }
+  | { kind: "unreadable" }
+  | {
+      kind: "ok";
+      status: V3RangeStatus;
+      token0: string;
+      token1: string;
+      fee: number;
+      tickLower: number;
+      tickUpper: number;
+      liquidity: bigint;
+    };
+
 /** 适配器统一接口。后续接入 Trader Joe LB / Uniswap V4 时实现新类型即可。 */
 export interface PositionAdapter {
   type: string;
@@ -8,7 +23,7 @@ export interface PositionAdapter {
     client: PublicClient,
     ctx: { factory: string; npm: string },
     tokenId: bigint
-  ): Promise<{ status: V3RangeStatus; token0: string; token1: string; fee: number; tickLower: number; tickUpper: number; liquidity: bigint } | null>;
+  ): Promise<RangeReadResult>;
 }
 
 const v3ForkAdapter: PositionAdapter = {
@@ -20,8 +35,9 @@ const v3ForkAdapter: PositionAdapter = {
       ctx.npm as `0x${string}`,
       tokenId
     );
-    if (!r) return null;
+    if (r.kind !== "ok") return r; // closed / unreadable 原样透传
     return {
+      kind: "ok",
       status: r.status,
       token0: r.meta.token0,
       token1: r.meta.token1,

@@ -39,16 +39,24 @@ interface MonitorState {
 
 export default function DashboardPage() {
   const { data: positions, mutate: reloadPos } = useSWR<Position[]>("/api/positions", fetcher, { refreshInterval: 60_000 });
+  const { data: closedPositions } = useSWR<Position[]>("/api/positions?all=1", fetcher, { refreshInterval: 60_000 });
   const { data: mon, mutate: reloadMon } = useSWR<MonitorState>("/api/monitor", fetcher, { refreshInterval: 10_000 });
 
   const list = positions ?? [];
   const outOfRange = list.filter((p) => p.last_in_range === 0);
+  const closed = (closedPositions ?? []).filter((p) => p.notify_state === "closed");
+  const [showClosed, setShowClosed] = useState(false);
 
   async function triggerScan() {
     const r = await fetch("/api/monitor", { method: "POST" });
     const j = await r.json();
     if (!j.ok) alert(j.error);
+    // 扫描是异步的(可能耗时 1~2 分钟),先立即刷一次拿最新提交状态,
+    // 再在几秒后补刷一次,确保扫描完成后的结果能尽快呈现。
     reloadPos();
+    setTimeout(() => reloadPos(), 8_000);
+    setTimeout(() => reloadPos(), 30_000);
+    setTimeout(() => reloadPos(), 90_000);
   }
 
   return (
@@ -94,6 +102,24 @@ export default function DashboardPage() {
           </div>
         )}
       </section>
+
+      {/* 已平仓仓位（折叠） */}
+      {closed.length > 0 && (
+        <section>
+          <button
+            className="mb-2 flex items-center gap-2 text-sm font-medium text-ink-soft hover:text-ink"
+            onClick={() => setShowClosed(!showClosed)}
+          >
+            <span className={`transition-transform ${showClosed ? "rotate-90" : ""}`}>▶</span>
+            已平仓仓位（{closed.length}）
+          </button>
+          {showClosed && (
+            <div className="grid grid-cols-1 gap-3 md:grid-cols-2 lg:grid-cols-3 opacity-60">
+              {closed.map((p) => <PositionCard key={p.id} p={p} closed />)}
+            </div>
+          )}
+        </section>
+      )}
     </div>
   );
 }
@@ -183,7 +209,7 @@ function EmptyHint() {
   );
 }
 
-function PositionCard({ p, highlight }: { p: Position; highlight?: boolean }) {
+function PositionCard({ p, highlight, closed }: { p: Position; highlight?: boolean; closed?: boolean }) {
   const inRange = p.last_in_range === 1;
   const explorer = p.explorer_url?.replace(/\/$/, "");
   const dexLabel = p.dex_display_name || p.dex_name;
@@ -194,14 +220,14 @@ function PositionCard({ p, highlight }: { p: Position; highlight?: boolean }) {
   const pair = `${sym0}/${sym1}`;
 
   return (
-    <div className={`card p-4 ${highlight ? "border-warn" : ""}`}>
+    <div className={`card p-4 ${closed ? "border-dashed border-slate-300 bg-slate-50" : highlight ? "border-warn" : ""}`}>
       <div className="mb-2 flex items-start justify-between gap-2">
         <div>
           <div className="flex items-center gap-2">
             <span className="font-semibold">{pair}</span>
             <span className="text-xs text-ink-soft">{dexLabel}</span>
-            {inRange ? <span className="tag-ok">在区间内</span> : <span className="tag-warn">已越界</span>}
-            {p.source === "staking" && <span className="tag-muted">质押中</span>}
+            {closed ? <span className="tag-muted">已平仓</span> : inRange ? <span className="tag-ok">在区间内</span> : <span className="tag-warn">已越界</span>}
+            {!closed && p.source === "staking" && <span className="tag-muted">质押中</span>}
           </div>
           <div className="mt-0.5 text-xs text-ink-soft">
             {p.chain_name} · #{p.token_id}

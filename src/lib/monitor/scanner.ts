@@ -80,15 +80,25 @@ export async function runScan(): Promise<ScanSummary> {
 
           const nowIso = new Date().toISOString();
 
-          // 仓位读不到或 liquidity=0（已关闭）：若库里已存在该仓位，标记为 closed，
-          // 前端会过滤掉 closed 仓位。不再 upsert 最新状态、不告警。
-          if (!r) {
+          // ===== 三态处理 =====
+          if (r.kind === "unreadable") {
+            // RPC 读不到 meta / pool / tick —— 不确定仓位是否还活跃。
+            // 只更新 last_checked_at，保留旧的 notify_state / tick 等字段，不标 closed、不告警。
+            db.prepare(
+              `UPDATE positions SET last_checked_at=? WHERE chain_id_ref=? AND dex_name=? AND token_id=?`
+            ).run(nowIso, w.chain_id_ref, dex.name, dp.tokenId);
+            continue;
+          }
+          if (r.kind === "closed") {
+            // liquidity=0，确认仓位已平仓（NFT 可能还在钱包/质押合约里，但流动性已全部取出）。
             db.prepare(
               `UPDATE positions SET notify_state='closed', last_checked_at=?, last_in_range=0
                WHERE chain_id_ref=? AND dex_name=? AND token_id=?`
             ).run(nowIso, w.chain_id_ref, dex.name, dp.tokenId);
             continue;
           }
+
+          // r.kind === "ok"，正常处理
           positions++;
 
           // 解析 token0/token1 的 symbol（带缓存），用于展示和告警文案

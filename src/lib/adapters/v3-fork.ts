@@ -190,6 +190,11 @@ export async function readPoolTick(
 /**
  * 综合：给定 npm + tokenId，返回完整区间状态。
  * meta 可选传入以避免重复读取。
+ *
+ * 返回值区分三种情况（调用方据此决定标 closed 还是保留旧状态）：
+ *   - { kind: 'closed' }          : meta 读到且 liquidity=0，确认仓位已平仓
+ *   - { kind: 'unreadable' }      : RPC 读不到 meta / 读不到 pool tick，不确定，应保留旧状态
+ *   - { kind: 'ok', meta, status }: 正常，返回完整区间状态
  */
 export async function readRangeStatus(
   client: PublicClient,
@@ -197,14 +202,18 @@ export async function readRangeStatus(
   npm: `0x${string}`,
   tokenId: bigint,
   meta?: V3PositionMeta
-): Promise<{ meta: V3PositionMeta; status: V3RangeStatus } | null> {
+): Promise<
+  | { kind: "closed" }
+  | { kind: "unreadable" }
+  | { kind: "ok"; meta: V3PositionMeta; status: V3RangeStatus }
+> {
   const m = meta ?? (await readPositionMeta(client, npm, tokenId));
-  if (!m) return null;
-  // liquidity=0 表示仓位已关闭（全部 withdrawn），跳过
-  if (m.liquidity === 0n) return null;
+  if (!m) return { kind: "unreadable" }; // NFT 不存在或 RPC 失败 → 不确定，保留旧状态
+  if (m.liquidity === 0n) return { kind: "closed" }; // 确认平仓
+
   const pool = await getPoolAddress(client, factory, m.token0, m.token1, m.fee);
   const currentTick = await readPoolTick(client, pool);
-  if (currentTick === null) return null;
+  if (currentTick === null) return { kind: "unreadable" }; // pool/tick 读不到 → 不确定，保留旧状态
 
   const inRange = currentTick >= m.tickLower && currentTick < m.tickUpper;
   const price = tickToPrice(currentTick);
@@ -214,6 +223,7 @@ export async function readRangeStatus(
   const marginUpper = (m.tickUpper - currentTick) / span;
 
   return {
+    kind: "ok",
     meta: m,
     status: { inRange, currentTick, tickLower: m.tickLower, tickUpper: m.tickUpper, pool, price, marginLower, marginUpper },
   };
