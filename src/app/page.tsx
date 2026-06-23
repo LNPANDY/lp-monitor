@@ -29,6 +29,7 @@ interface Position {
   wallet_label: string;
   wallet_address: string;
   last_alert_type?: string;
+  last_cex_price?: string; // JSON: CexPricePayload，开启 CEX 对比且有报价时写入
 }
 
 interface MonitorState {
@@ -347,6 +348,10 @@ function PositionCard({ p, highlight, closed }: { p: Position; highlight?: boole
   const sym0 = p.token0_symbol || short(p.token0);
   const sym1 = p.token1_symbol || short(p.token1);
   const pair = `${sym0}/${sym1}`;
+  // CEX 对比信息：last_cex_price 是 JSON(CexPricePayload)，解析失败/缺失则不展示该行
+  const cexInfo = parseCexPrice(p.last_cex_price);
+  // 价差超过该值就在卡片里标红（与后端 cex_price_threshold 解耦，前端固定 1% 做视觉提示，真正告警阈值在设置页）
+  const cexWarnThresh = 0.01;
 
   return (
     <div className={`card p-4 ${closed ? "border-dashed border-slate-300 bg-slate-50" : highlight ? "border-warn" : ""}`}>
@@ -357,6 +362,7 @@ function PositionCard({ p, highlight, closed }: { p: Position; highlight?: boole
             <span className="text-xs text-ink-soft">{dexLabel}</span>
             {closed ? <span className="tag-muted">已平仓</span> : inRange ? <span className="tag-ok">在区间内</span> : <span className="tag-warn">已越界</span>}
             {!closed && p.last_alert_type === "tick_move" && <span className="tag-info">波动</span>}
+            {!closed && p.last_alert_type === "cex_price" && <span className="tag-info">CEX 价差</span>}
             {!closed && p.source === "staking" && <span className="tag-muted">质押中</span>}
           </div>
           <div className="mt-0.5 text-xs text-ink-soft">
@@ -376,6 +382,14 @@ function PositionCard({ p, highlight, closed }: { p: Position; highlight?: boole
         </Row>
         <Row label="区间">[{p.tick_lower}, {p.tick_upper}]</Row>
         <Row label="价格">1 {sym0} ≈ {p.last_price0} {sym1}</Row>
+        {cexInfo && (
+          <Row label={`CEX 对比 (${cexInfo.baseSymbol || "—"})`}>
+            <span className={cexInfo.absDiff >= cexWarnThresh ? "text-warn font-semibold" : ""}>
+              差 {pctSigned(cexInfo.diff)}
+            </span>
+            <span className="ml-1 text-ink-soft">（{fmtCex(cexInfo.dexPrice)} vs 币安 {fmtCex(cexInfo.cexPrice)} {cexInfo.quote}）</span>
+          </Row>
+        )}
 
         {/* 区间位置可视化 */}
         <div className="pt-1">
@@ -423,4 +437,46 @@ function Row({ label, children }: { label: string; children: React.ReactNode }) 
       <span className="text-right break-all">{children}</span>
     </div>
   );
+}
+
+/** positions.last_cex_price 的前端结构（与 scanner 写入的 CexPricePayload 对齐）。 */
+interface CexPricePayload {
+  baseTokenAddr: string;
+  baseSymbol: string;
+  cexSymbol: string;
+  quote: string;
+  dexPrice: number;
+  cexPrice: number;
+  diff: number;
+  absDiff: number;
+}
+
+/** 解析 last_cex_price JSON。非法/缺失返回 null。 */
+function parseCexPrice(raw?: string): CexPricePayload | null {
+  if (!raw) return null;
+  try {
+    const o = JSON.parse(raw);
+    if (
+      typeof o.dexPrice === "number" &&
+      typeof o.cexPrice === "number" &&
+      typeof o.diff === "number"
+    ) {
+      return o as CexPricePayload;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/** 带符号百分比，如 +2.30% / -1.50%。 */
+function pctSigned(x: number): string {
+  return `${x >= 0 ? "+" : ""}${(x * 100).toFixed(2)}%`;
+}
+
+/** 价格展示：极小价格多保留有效位，普通价格 6 位小数。 */
+function fmtCex(n: number): string {
+  if (!Number.isFinite(n)) return "—";
+  if (n !== 0 && Math.abs(n) < 1) return n.toPrecision(6);
+  return n.toLocaleString("en-US", { maximumFractionDigits: 6 });
 }

@@ -31,13 +31,18 @@ export default function AlertsPage() {
         <div className="card divide-y divide-slate-100">
           {list.map((a) => {
             const isOut = a.type === "out_of_range";
+            const isCex = a.type === "cex_price";
+            const isTickMove = a.type === "tick_move";
             const chs: string[] = (() => { try { return JSON.parse(a.channels); } catch { return []; } })();
+            const tagLabel = isOut ? "越界" : isCex ? "CEX 价差" : isTickMove ? "波动" : "回到区间";
+            const dotClass = isOut ? "bg-warn" : "bg-ok";
+            const tagClass = isOut ? "tag-warn" : isCex || isTickMove ? "tag-info" : "tag-ok";
             return (
               <div key={a.id} className="flex items-start gap-3 p-4">
-                <div className={`mt-1 h-2 w-2 flex-shrink-0 rounded-full ${isOut ? "bg-warn" : "bg-ok"}`} />
+                <div className={`mt-1 h-2 w-2 flex-shrink-0 rounded-full ${dotClass}`} />
                 <div className="min-w-0 flex-1">
                   <div className="flex flex-wrap items-center gap-2 text-sm">
-                    <span className={`tag ${isOut ? "tag-warn" : "tag-ok"}`}>{isOut ? "越界" : "回到区间"}</span>
+                    <span className={`tag ${tagClass}`}>{tagLabel}</span>
                     <span className="font-medium">{a.chain_name} / {a.dex_name}</span>
                     <span className="text-ink-soft">#{a.token_id}</span>
                     <span className="text-ink-soft">{short(a.token0)}/{short(a.token1)}</span>

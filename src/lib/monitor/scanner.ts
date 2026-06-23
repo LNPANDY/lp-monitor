@@ -13,7 +13,12 @@ import type { PublicClient } from "viem";
 import { resolveTokens } from "../chains/tokens";
 import { listDexes, listStaking, type DexRow, type StakingRow } from "../chains/dexes";
 import { getAdapter } from "../adapters";
-import { getTickMoveThreshold, isTickMoveEnabled } from "../db/settings";
+import {
+  getTickMoveThreshold,
+  isTickMoveEnabled,
+  isCexPriceEnabled,
+  getCexPriceThreshold,
+} from "../db/settings";
 import {
   findDirectPositions,
   findStakedPositions,
@@ -21,6 +26,13 @@ import {
 } from "../staking/discover";
 import { ownerOf } from "../adapters/v3-fork";
 import { notifyAll } from "../notify";
+import {
+  loadAllMappings,
+  fetchQuotes,
+  splitSymbol,
+  type CexMapping,
+  type CexQuote,
+} from "../cex/binance";
 
 export interface ScanSummary {
   wallets: number;
@@ -47,6 +59,14 @@ export async function runScan(): Promise<ScanSummary> {
   let alertsSent = 0;
   const db = getDb();
 
+  // CEX 对比开关 + 阈值：整次扫描共用一份。关闭时跳过所有报价拉取。
+  const cexEnabled = isCexPriceEnabled();
+  const cexThreshold = getCexPriceThreshold() / 100; // 百分比 → 0~1
+  // 所有链上的 token→CEX 映射（按 chain_id_ref 分组）。关闭时不需要加载。
+  const cexMappingsByChain = cexEnabled ? loadAllMappings() : new Map<number, CexMapping[]>();
+  // 报价缓存（本次扫描内复用）：(tokenAddrLower) → CexQuote
+  const cexQuoteByAddr = new Map<string, CexQuote>();
+
   const wallets = db.prepare("SELECT * FROM wallets WHERE enabled=1").all() as WalletRow[];
   if (wallets.length === 0) {
     return { wallets: 0, positions: 0, outOfRange: 0, alertsSent: 0, errors, startedAt: new Date(startedAt).toISOString(), durationMs: Date.now() - startedAt };
@@ -71,6 +91,20 @@ export async function runScan(): Promise<ScanSummary> {
       // 兜底恢复：库里有但本次未发现的仓位（尤其质押仓位：转账发生在扫描窗口外）。
       // 反查 ownerOf，仍命中钱包或已知质押合约 → 纳入本次扫描；否则视为已转移/已平仓 → 标记 closed。
       const recovered = await recoverMissedPositions(client, w, dexes, staking, discovered);
+
+      // ===== 预取本链 CEX 报价（开启 CEX 对比时）=====
+      // 本钱包本链上所有 token0/token1 命中 token_symbols 表的，一次性把需要的币安 symbol 去重批量拉价，
+      // 存进 cexQuoteByAddr 供后续仓位循环按地址查。已拉过的（跨钱包/跨仓位重复 symbol）直接复用缓存。
+      const pending = collectPendingCexSymbols(cexMappingsByChain, w.chain_id_ref);
+      if (cexEnabled && pending.length > 0) {
+        const fresh = await fetchQuotes(pending);
+        // 把刚拉到的报价回填进 byAddr（一个 cexSymbol 可能对应多个 token 地址）
+        for (const [sym, quote] of fresh) {
+          for (const m of cexMappingsByChain.get(w.chain_id_ref) ?? []) {
+            if (m.cexSymbol === sym) cexQuoteByAddr.set(m.tokenAddr, quote);
+          }
+        }
+      }
 
       for (const dp of [...discovered, ...recovered]) {
         try {
@@ -140,18 +174,32 @@ export async function runScan(): Promise<ScanSummary> {
             }
           }
 
+          // ===== CEX 价差判定 =====
+          // DEX 池价（token1/token0）按本链 token→CEX 映射换算成「token0 的 CEX 参考价」，
+          // 再与币安报价对比。仅当 token0 与 token1 中至少一个在 token_symbols 表里有映射、
+          // 且映射出的币安报价本次能拉到时才计算；否则 cexPriceInfo 为 null（不对比、不告警）。
+          const cexPriceInfo = cexEnabled
+            ? computeCexPriceDiff(
+                r.token0.toLowerCase(),
+                r.token1.toLowerCase(),
+                r.status.price,
+                cexQuoteByAddr,
+                cexThreshold
+              )
+            : null;
+
           // upsert 仓位最新状态
           db.prepare(
             `INSERT INTO positions
               (wallet_id, chain_id_ref, dex_id, dex_name, token_id, token0, token1, token0_symbol, token1_symbol, fee, pool,
                tick_lower, tick_upper, source, staker_contract, staking_id,
                last_current_tick, last_in_range, last_price0, last_liquidity,
-               last_margin_lower, last_margin_upper,
+               last_margin_lower, last_margin_upper, last_cex_price,
                last_checked_at, notify_state, last_notified_at)
              VALUES (@wallet_id,@chain_id_ref,@dex_id,@dex_name,@token_id,@token0,@token1,@token0_symbol,@token1_symbol,@fee,@pool,
                      @tick_lower,@tick_upper,@source,@staker_contract,@staking_id,
                      @last_current_tick,@last_in_range,@last_price0,@last_liquidity,
-                     @last_margin_lower,@last_margin_upper,
+                     @last_margin_lower,@last_margin_upper,@last_cex_price,
                      @last_checked_at,@notify_state,@last_notified_at)
              ON CONFLICT(chain_id_ref, dex_name, token_id) DO UPDATE SET
                last_current_tick=excluded.last_current_tick,
@@ -160,6 +208,7 @@ export async function runScan(): Promise<ScanSummary> {
                last_liquidity=excluded.last_liquidity,
                last_margin_lower=excluded.last_margin_lower,
                last_margin_upper=excluded.last_margin_upper,
+               last_cex_price=excluded.last_cex_price,
                last_checked_at=excluded.last_checked_at,
                notify_state=excluded.notify_state,
                token0=excluded.token0, token1=excluded.token1,
@@ -191,6 +240,7 @@ export async function runScan(): Promise<ScanSummary> {
             last_liquidity: r.liquidity?.toString() ?? "",
             last_margin_lower: currMarginLower,
             last_margin_upper: currMarginUpper,
+            last_cex_price: cexPriceInfo ? JSON.stringify(cexPriceInfo.payload) : "",
             last_checked_at: nowIso,
             notify_state: inRange ? "in_range" : "out_of_range",
             last_notified_at: prev?.last_notified_at ?? "",
@@ -250,6 +300,27 @@ export async function runScan(): Promise<ScanSummary> {
             ).run(
               positionRow.id,
               "tick_move",
+              r.status.currentTick,
+              n.body,
+              JSON.stringify(sendRes.sent)
+            );
+          }
+
+          // CEX 价差告警（独立发送，每次超过阈值都发，不设冷却）
+          if (cexPriceInfo && cexPriceInfo.exceedsThreshold) {
+            const n = buildCexPriceNotification(
+              w, chain.name, dex.name, dp, r, sym0, sym1,
+              cexPriceInfo.payload
+            );
+            const sendRes = await notifyAll(n);
+            alertsSent++;
+
+            db.prepare(
+              `INSERT INTO alerts (position_id, type, tick_at, message, channels)
+               VALUES (?, ?, ?, ?, ?)`
+            ).run(
+              positionRow.id,
+              "cex_price",
               r.status.currentTick,
               n.body,
               JSON.stringify(sendRes.sent)
@@ -443,3 +514,171 @@ function buildTickMoveNotification(
 
 // 避免未用导入告警
 void listChains;
+
+// ===== CEX 报价对比辅助函数 =====
+
+/** 对外传递的 DEX↔CEX 对比结果（payload 即写入 last_cex_price 的 JSON）。 */
+interface CexPriceInfo {
+  /** 是否超过告警阈值 */
+  exceedsThreshold: boolean;
+  /** 供持久化 + 展示 + 文案共用的结构化数据 */
+  payload: CexPricePayload;
+}
+
+/** 写入 positions.last_cex_price 的 JSON 结构（前端按相同结构解析展示）。 */
+export interface CexPricePayload {
+  /** 用作定价基准的 base token 地址（小写）：token0 或 token1 中有币安映射的那个 */
+  baseTokenAddr: string;
+  /** base 的链上 symbol（展示用，可能为空） */
+  baseSymbol: string;
+  /** 币安交易对 symbol，如 '0GUSDT' */
+  cexSymbol: string;
+  /** 计价币种，如 'USDT' */
+  quote: string;
+  /** DEX 池里 1 base = ? quote（由 token1/token0 池价 + 两边 CEX 报价换算得出） */
+  dexPrice: number;
+  /** 币安 1 base = ? quote */
+  cexPrice: number;
+  /** (dexPrice - cexPrice) / cexPrice，带符号 */
+  diff: number;
+  /** diff 的绝对值（0~1），用于和阈值比较 */
+  absDiff: number;
+}
+
+/**
+ * 计算单仓位 token0/token1 与币安报价的价差。
+ *
+ * 思路：池价是 token1/token0（1 token0 = price0 token1）。
+ * 若 token0 有币安映射（如 0GUSDT），则「1 token0 的 CEX 价」= 币安报价（直接，币种对齐）；
+ * 若只有 token1 有映射，则用 token1 的币安报价 × 池价反推出「1 token0 = ? quote」。
+ * 任一 token 都没映射、或本次拉不到对应币安价 → 返回 null（不对比、不告警、写空）。
+ *
+ * 注意：CEX 上报的是裸币种（如 0G），链上多为 wrapped/桥接版本（同价近似成立才合理）。
+ * 这是用户在配置页手动建立映射的前提条件，模块本身不做地址↔币种的自动猜测。
+ */
+function computeCexPriceDiff(
+  token0Lower: string,
+  token1Lower: string,
+  dexPrice0Str: string, // r.status.price: 1 token0 = ? token1
+  quoteByAddr: Map<string, CexQuote>,
+  threshold: number
+): CexPriceInfo | null {
+  const dexPrice0 = Number(dexPrice0Str); // 1 token0 = dexPrice0 token1
+  const q0 = quoteByAddr.get(token0Lower);
+  const q1 = quoteByAddr.get(token1Lower);
+
+  let baseTokenAddr = "";
+  let baseSymbol = "";
+  let cexSymbol = "";
+  let quote = "";
+  let dexPrice = NaN; // 1 base = ? quote（同计价口径）
+  let cexPrice = NaN;
+
+  if (q0 && Number.isFinite(dexPrice0)) {
+    // token0 直接有币安报价：DEX 价口径需统一成 token0 的计价币种。
+    // 池里是 1 token0 = dexPrice0 token1；若 token1 也有币安报价 q1，可把 token1 换算成 quote，
+    // 得到「1 token0 = dexPrice0 × q1.price  quote」（计价币种与 q1.quote 一致）。
+    if (q1 && Number.isFinite(dexPrice0)) {
+      baseTokenAddr = token0Lower;
+      baseSymbol = splitSymbol(q0.symbol).base;
+      cexSymbol = q0.symbol;
+      quote = q1.quote;
+      dexPrice = dexPrice0 * q1.price;
+      cexPrice = q0.price;
+    } else {
+      // 只有 token0 有报价：直接用币安价当 DEX 参考近似（口径不完全一致，仅作粗略提示）
+      baseTokenAddr = token0Lower;
+      baseSymbol = splitSymbol(q0.symbol).base;
+      cexSymbol = q0.symbol;
+      quote = q0.quote;
+      dexPrice = dexPrice0; // 口径不一致，仅粗略
+      cexPrice = q0.price;
+    }
+  } else if (q1) {
+    // 只有 token1 有报价：以 token1 为 base。
+    // 池里 1 token0 = dexPrice0 token1，即 1 token1 = 1/dexPrice0 token0；
+    // DEX「1 token1 的 quote 价」需要 token0 的币安价，但 token0 无映射 → 只能用币安价近似 DEX 价。
+    baseTokenAddr = token1Lower;
+    baseSymbol = splitSymbol(q1.symbol).base;
+    cexSymbol = q1.symbol;
+    quote = q1.quote;
+    dexPrice = dexPrice0 > 0 ? 1 / dexPrice0 : NaN; // token1 相对 token0 的池价（口径不齐，粗略）
+    cexPrice = q1.price;
+  }
+
+  if (!baseTokenAddr || !Number.isFinite(dexPrice) || !Number.isFinite(cexPrice) || cexPrice <= 0) {
+    return null;
+  }
+
+  const diff = (dexPrice - cexPrice) / cexPrice;
+  const absDiff = Math.abs(diff);
+
+  const payload: CexPricePayload = {
+    baseTokenAddr,
+    baseSymbol,
+    cexSymbol,
+    quote,
+    dexPrice,
+    cexPrice,
+    diff,
+    absDiff,
+  };
+
+  return { exceedsThreshold: absDiff >= threshold, payload };
+}
+
+/**
+ * 收集本链本批仓位里需要的币安 symbol（去重）。
+ * 本链所有启用映射的 symbol 都纳入——真正的去重与短期复用在 binance.ts 内部完成
+ * （同次扫描跨钱包/跨仓位复用进程缓存，避免重复打接口）。
+ */
+function collectPendingCexSymbols(
+  mappingsByChain: Map<number, CexMapping[]>,
+  chainIdRef: number
+): string[] {
+  const mappings = mappingsByChain.get(chainIdRef);
+  if (!mappings || mappings.length === 0) return [];
+  const symbols = new Set<string>();
+  for (const m of mappings) symbols.add(m.cexSymbol);
+  return [...symbols];
+}
+
+/** CEX 价差告警文案。 */
+function buildCexPriceNotification(
+  w: WalletRow,
+  chainName: string,
+  dexName: string,
+  dp: DiscoveredPosition,
+  r: any,
+  sym0: string,
+  sym1: string,
+  p: CexPricePayload
+) {
+  const tag = w.label ? `[${w.label}]` : "";
+  const short = (a: string) => `${a.slice(0, 6)}…${a.slice(-4)}`;
+  const label0 = sym0 || short(r.token0);
+  const label1 = sym1 || short(r.token1);
+  const pair = `${label0}/${label1}`;
+  const pctSigned = (x: number) => `${x >= 0 ? "+" : ""}${(x * 100).toFixed(2)}%`;
+  const baseLabel = p.baseSymbol || short(p.baseTokenAddr);
+  const title = `💱 CEX 价差 ${tag} ${pair} · ${chainName}/${dexName}`;
+  const body =
+    `仓位 #${dp.tokenId}（${pair}）${baseLabel} 的 DEX 池价与币安报价偏差较大\n` +
+    `对比基准: ${baseLabel}（${p.cexSymbol}）\n` +
+    `DEX 价: 1 ${baseLabel} ≈ ${fmt(p.dexPrice)} ${p.quote}\n` +
+    `币安价: 1 ${baseLabel} ≈ ${fmt(p.cexPrice)} ${p.quote}\n` +
+    `价差: ${pctSigned(p.diff)}（阈值 ${(Math.abs(p.absDiff) * 100).toFixed(2)}%）\n` +
+    `当前 tick: ${r.status.currentTick}\n` +
+    `区间: [${r.tickLower}, ${r.tickUpper}]\n` +
+    (dp.source === "staking" ? `来源: 质押 @ ${short(dp.stakerContract ?? "")}\n` : `来源: 直接持有\n`) +
+    `钱包: ${w.address}`;
+  return { title, body };
+}
+
+/** 价格展示：去掉无意义尾零。 */
+function fmt(n: number): string {
+  if (!Number.isFinite(n)) return "—";
+  // 极小价格用更多小数位，普通价格 6 位足够
+  if (n !== 0 && Math.abs(n) < 1) return n.toPrecision(6);
+  return n.toLocaleString("en-US", { maximumFractionDigits: 6 });
+}
