@@ -144,12 +144,30 @@ function migrate(db: DB) {
       key   TEXT PRIMARY KEY,
       value TEXT NOT NULL
     );
+
+    -- CEX 报价匹配：链上 token 地址 → 币安交易对 symbol（如 0G token → '0GUSDT'）
+    -- 用户在配置页手动为每个 token 配对计价货币（USDT/USDC 自选）
+    CREATE TABLE IF NOT EXISTS token_symbols (
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      chain_id_ref  INTEGER NOT NULL REFERENCES chains(id) ON DELETE CASCADE,
+      token_addr    TEXT    NOT NULL,               -- 链上 token 合约地址（小写）
+      token_symbol  TEXT    NOT NULL DEFAULT '',    -- 缓存的 ERC20 symbol，展示用
+      cex_symbol    TEXT    NOT NULL,               -- 币安交易对 symbol，如 '0GUSDT'
+      enabled       INTEGER NOT NULL DEFAULT 1,
+      created_at    TEXT    NOT NULL DEFAULT (datetime('now')),
+      UNIQUE(chain_id_ref, token_addr)
+    );
   `);
 
   // 兼容已有数据库：新增列用 ADD COLUMN（忽略已存在的错误）
   safeAddColumn(db, "positions", "last_liquidity", "TEXT NOT NULL DEFAULT ''");
   safeAddColumn(db, "positions", "token0_symbol", "TEXT NOT NULL DEFAULT ''");
   safeAddColumn(db, "positions", "token1_symbol", "TEXT NOT NULL DEFAULT ''");
+  // tick 波动预警：上次扫描时 tick 距区间边界的相对位置（百分比 0~1）
+  safeAddColumn(db, "positions", "last_margin_lower", "REAL NOT NULL DEFAULT 0");
+  safeAddColumn(db, "positions", "last_margin_upper", "REAL NOT NULL DEFAULT 0");
+  // CEX 报价对比：上次扫描时该仓位 token 对应的币安参考价（JSON 字符串，存 token0/token1 的报价）
+  safeAddColumn(db, "positions", "last_cex_price", "TEXT NOT NULL DEFAULT ''");
 
   seedDefaults(db);
 }

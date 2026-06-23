@@ -24,3 +24,27 @@ export function getScanCron(): string {
   if (fromDb) return fromDb;
   return process.env.CRON_EXPRESSION ?? "*/3 * * * *";
 }
+
+// ===== 告警阈值设置（DB 优先，回退默认值）=====
+
+/** tick 波动预警阈值：margin 相对位置变化超过该值（百分比，0~100）即告警。默认 10。 */
+export function getTickMoveThreshold(): number {
+  const v = Number(getSetting("tick_move_threshold", ""));
+  return Number.isFinite(v) && v >= 0 ? v : 10;
+}
+
+/** tick 波动预警开关。默认开。 */
+export function isTickMoveEnabled(): boolean {
+  return getSetting("tick_move_enabled", "1") === "1";
+}
+
+/** CEX 报价对比开关。默认关（需用户先配置 token 匹配）。 */
+export function isCexPriceEnabled(): boolean {
+  return getSetting("cex_price_enabled", "0") === "1";
+}
+
+/** CEX 价差预警阈值：DEX 价 vs CEX 价 的百分比差超过该值即告警。默认 3。 */
+export function getCexPriceThreshold(): number {
+  const v = Number(getSetting("cex_price_threshold", ""));
+  return Number.isFinite(v) && v >= 0 ? v : 3;
+}
