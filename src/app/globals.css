@@ -32,3 +32,4 @@ body {
 .tag-ok { @apply tag bg-ok-soft text-ok; }
 .tag-warn { @apply tag bg-warn-soft text-warn; }
 .tag-muted { @apply tag bg-slate-100 text-ink-soft; }
+.tag-info { @apply tag bg-blue-50 text-blue-600; }

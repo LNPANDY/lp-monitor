@@ -28,6 +28,7 @@ interface Position {
   explorer_url: string;
   wallet_label: string;
   wallet_address: string;
+  last_alert_type?: string;
 }
 
 interface MonitorState {
@@ -78,6 +79,9 @@ export default function DashboardPage() {
 
       {/* 扫描频率设置 */}
       <ScanInterval currentCron={mon?.cron ?? ""} onChanged={() => reloadMon()} />
+
+      {/* 告警阈值设置 */}
+      <AlertThreshold />
 
       {/* 越界告警区（如有） */}
       {outOfRange.length > 0 && (
@@ -201,6 +205,126 @@ function ScanInterval({ currentCron, onChanged }: { currentCron: string; onChang
   );
 }
 
+function AlertThreshold() {
+  const { data, mutate } = useSWR<any>("/api/alert-settings", fetcher);
+  const [tickThreshold, setTickThreshold] = useState("");
+  const [cexThreshold, setCexThreshold] = useState("");
+  const [msg, setMsg] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  async function toggleTick() {
+    setBusy(true); setMsg("");
+    try {
+      const r = await fetch("/api/alert-settings", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ tick_move_enabled: data?.tick_move_enabled ? "0" : "1" }),
+      });
+      const j = await r.json();
+      if (!j.ok) throw new Error(j.error);
+      mutate();
+    } catch (e: any) {
+      setMsg(`❌ ${e.message}`);
+    } finally { setBusy(false); }
+  }
+
+  async function toggleCex() {
+    setBusy(true); setMsg("");
+    try {
+      const r = await fetch("/api/alert-settings", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ cex_price_enabled: data?.cex_price_enabled ? "0" : "1" }),
+      });
+      const j = await r.json();
+      if (!j.ok) throw new Error(j.error);
+      mutate();
+    } catch (e: any) {
+      setMsg(`❌ ${e.message}`);
+    } finally { setBusy(false); }
+    }
+
+  async function applyThreshold() {
+    setBusy(true); setMsg("");
+    try {
+      const body: any = {};
+      if (tickThreshold !== "") body.tick_move_threshold = Number(tickThreshold);
+      if (cexThreshold !== "") body.cex_price_threshold = Number(cexThreshold);
+      const r = await fetch("/api/alert-settings", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const j = await r.json();
+      if (!j.ok) throw new Error(j.error);
+      setMsg("✅ 阈值已更新");
+      setTickThreshold(""); setCexThreshold("");
+      mutate();
+    } catch (e: any) {
+      setMsg(`❌ ${e.message}`);
+    } finally { setBusy(false); }
+  }
+
+  return (
+    <div className="card p-4">
+      <div className="mb-2 text-sm font-medium">告警阈值</div>
+      <div className="flex flex-wrap items-center gap-4 text-sm">
+        {/* tick 波动开关 */}
+        <div className="flex items-center gap-2">
+          <button
+            className={data?.tick_move_enabled ? "btn-primary text-xs" : "btn-ghost text-xs"}
+            disabled={busy}
+            onClick={toggleTick}
+          >
+            {data?.tick_move_enabled ? "波动预警：开" : "波动预警：关"}
+          </button>
+          <span className="text-ink-soft">当前阈值 {data?.tick_move_threshold ?? 10}%</span>
+        </div>
+
+        {/* CEX 对比开关 */}
+        <div className="flex items-center gap-2">
+          <button
+            className={data?.cex_price_enabled ? "btn-primary text-xs" : "btn-ghost text-xs"}
+            disabled={busy}
+            onClick={toggleCex}
+          >
+            {data?.cex_price_enabled ? "CEX 价差：开" : "CEX 价差：关"}
+          </button>
+          <span className="text-ink-soft">当前阈值 {data?.cex_price_threshold ?? 3}%</span>
+        </div>
+
+        <span className="mx-1 text-ink-soft">|</span>
+
+        <input
+          className="input max-w-[120px]"
+          type="number"
+          min={0}
+          max={100}
+          value={tickThreshold}
+          onChange={(e) => setTickThreshold(e.target.value)}
+          placeholder="波动阈值 %"
+        />
+        <input
+          className="input max-w-[120px]"
+          type="number"
+          min={0}
+          max={100}
+          value={cexThreshold}
+          onChange={(e) => setCexThreshold(e.target.value)}
+          placeholder="CEX 价差 %"
+        />
+        <button className="btn-ghost text-xs" disabled={busy || (tickThreshold === "" && cexThreshold === "")} onClick={applyThreshold}>
+          应用阈值
+        </button>
+      </div>
+      {msg && <div className="mt-1 text-xs">{msg}</div>}
+      <div className="mt-1 text-xs text-ink-soft">
+        波动阈值：两次扫描间，仓位在区间内的相对位置变化超过该百分比就告警（如 75%→65% = 变动 10%）
+      </div>
+    </div>
+  );
+}
+
 function EmptyHint() {
   return (
     <div className="card p-8 text-center text-ink-soft">
@@ -232,6 +356,7 @@ function PositionCard({ p, highlight, closed }: { p: Position; highlight?: boole
             <span className="font-semibold">{pair}</span>
             <span className="text-xs text-ink-soft">{dexLabel}</span>
             {closed ? <span className="tag-muted">已平仓</span> : inRange ? <span className="tag-ok">在区间内</span> : <span className="tag-warn">已越界</span>}
+            {!closed && p.last_alert_type === "tick_move" && <span className="tag-info">波动</span>}
             {!closed && p.source === "staking" && <span className="tag-muted">质押中</span>}
           </div>
           <div className="mt-0.5 text-xs text-ink-soft">

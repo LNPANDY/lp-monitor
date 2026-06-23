@@ -13,6 +13,7 @@ import type { PublicClient } from "viem";
 import { resolveTokens } from "../chains/tokens";
 import { listDexes, listStaking, type DexRow, type StakingRow } from "../chains/dexes";
 import { getAdapter } from "../adapters";
+import { getTickMoveThreshold, isTickMoveEnabled } from "../db/settings";
 import {
   findDirectPositions,
   findStakedPositions,
@@ -109,11 +110,35 @@ export async function runScan(): Promise<ScanSummary> {
           const inRange = r.status.inRange;
           if (!inRange) outOfRange++;
 
+          // 计算 tick 在区间内的相对位置（0~1，0=下界，1=上界），用于波动预警
+          const span = Math.max(r.tickUpper - r.tickLower, 1);
+          const currMarginLower = (r.status.currentTick - r.tickLower) / span;
+          const currMarginUpper = (r.tickUpper - r.status.currentTick) / span;
+
           const prev = db
             .prepare("SELECT * FROM positions WHERE chain_id_ref=? AND dex_name=? AND token_id=?")
             .get(w.chain_id_ref, dex.name, dp.tokenId) as any;
 
           const prevState = prev?.notify_state ?? "unknown";
+
+          // ===== 波动预警判定（每次扫描都对比上次，超过阈值就告警，不设冷却）=====
+          // prev 里存的是上次扫描时的 margin（首次扫描 prev 为 null，跳过）
+          const tickMoveEnabled = isTickMoveEnabled();
+          const tickMoveThreshold = getTickMoveThreshold() / 100; // 百分比 → 0~1
+          let tickMoveTriggered = false;
+          let tickMoveDelta = 0;
+          let tickMoveDirection = "";
+          if (tickMoveEnabled && prev && typeof prev.last_margin_lower === "number") {
+            const dLower = Math.abs(currMarginLower - prev.last_margin_lower);
+            const dUpper = Math.abs(currMarginUpper - prev.last_margin_upper);
+            const delta = Math.max(dLower, dUpper);
+            if (delta >= tickMoveThreshold) {
+              tickMoveTriggered = true;
+              tickMoveDelta = delta;
+              // 方向：marginLower 变大 = tick 上移 = 靠近上界
+              tickMoveDirection = currMarginLower > prev.last_margin_lower ? "靠近上界" : "靠近下界";
+            }
+          }
 
           // upsert 仓位最新状态
           db.prepare(
@@ -121,16 +146,20 @@ export async function runScan(): Promise<ScanSummary> {
               (wallet_id, chain_id_ref, dex_id, dex_name, token_id, token0, token1, token0_symbol, token1_symbol, fee, pool,
                tick_lower, tick_upper, source, staker_contract, staking_id,
                last_current_tick, last_in_range, last_price0, last_liquidity,
+               last_margin_lower, last_margin_upper,
                last_checked_at, notify_state, last_notified_at)
              VALUES (@wallet_id,@chain_id_ref,@dex_id,@dex_name,@token_id,@token0,@token1,@token0_symbol,@token1_symbol,@fee,@pool,
                      @tick_lower,@tick_upper,@source,@staker_contract,@staking_id,
                      @last_current_tick,@last_in_range,@last_price0,@last_liquidity,
+                     @last_margin_lower,@last_margin_upper,
                      @last_checked_at,@notify_state,@last_notified_at)
              ON CONFLICT(chain_id_ref, dex_name, token_id) DO UPDATE SET
                last_current_tick=excluded.last_current_tick,
                last_in_range=excluded.last_in_range,
                last_price0=excluded.last_price0,
                last_liquidity=excluded.last_liquidity,
+               last_margin_lower=excluded.last_margin_lower,
+               last_margin_upper=excluded.last_margin_upper,
                last_checked_at=excluded.last_checked_at,
                notify_state=excluded.notify_state,
                token0=excluded.token0, token1=excluded.token1,
@@ -160,6 +189,8 @@ export async function runScan(): Promise<ScanSummary> {
             last_in_range: inRange ? 1 : 0,
             last_price0: r.status.price,
             last_liquidity: r.liquidity?.toString() ?? "",
+            last_margin_lower: currMarginLower,
+            last_margin_upper: currMarginUpper,
             last_checked_at: nowIso,
             notify_state: inRange ? "in_range" : "out_of_range",
             last_notified_at: prev?.last_notified_at ?? "",
@@ -169,7 +200,7 @@ export async function runScan(): Promise<ScanSummary> {
             .prepare("SELECT id, last_notified_at FROM positions WHERE chain_id_ref=? AND dex_name=? AND token_id=?")
             .get(w.chain_id_ref, dex.name, dp.tokenId) as { id: number; last_notified_at: string };
 
-          // ===== 告警触发判定（清晰版） =====
+          // ===== 越界告警触发判定 =====
           // 1) 首次发现且越界 → 告警
           // 2) 从「在区间内」翻转为「越界」→ 告警
           // 3) 从「越界」翻回「在区间内」→ 告警（恢复通知）
@@ -181,25 +212,49 @@ export async function runScan(): Promise<ScanSummary> {
           const stillOutOfRangeAndExpired =
             !inRange && prevState === "out_of_range" && !withinCooldown(prev?.last_notified_at);
 
-          const trigger = enteredOutOfRange || reEnteredRange || stillOutOfRangeAndExpired;
-          if (!trigger) continue;
+          const rangeTrigger = enteredOutOfRange || reEnteredRange || stillOutOfRangeAndExpired;
 
-          const alertType = !inRange ? "out_of_range" : "re_in_range";
-          const n = buildNotification(w, chain.name, dex.name, dp, r, sym0, sym1);
-          const sendRes = await notifyAll(n);
-          alertsSent++;
+          // ===== 发送告警（越界 + 波动各自独立发送）=====
+          if (rangeTrigger) {
+            const alertType = !inRange ? "out_of_range" : "re_in_range";
+            const n = buildNotification(w, chain.name, dex.name, dp, r, sym0, sym1);
+            const sendRes = await notifyAll(n);
+            alertsSent++;
 
-          db.prepare(
-            `INSERT INTO alerts (position_id, type, tick_at, message, channels)
-             VALUES (?, ?, ?, ?, ?)`
-          ).run(
-            positionRow.id,
-            alertType,
-            r.status.currentTick,
-            n.body,
-            JSON.stringify(sendRes.sent)
-          );
-          db.prepare("UPDATE positions SET last_notified_at=? WHERE id=?").run(nowIso, positionRow.id);
+            db.prepare(
+              `INSERT INTO alerts (position_id, type, tick_at, message, channels)
+               VALUES (?, ?, ?, ?, ?)`
+            ).run(
+              positionRow.id,
+              alertType,
+              r.status.currentTick,
+              n.body,
+              JSON.stringify(sendRes.sent)
+            );
+            db.prepare("UPDATE positions SET last_notified_at=? WHERE id=?").run(nowIso, positionRow.id);
+          }
+
+          // 波动告警（独立于越界告警，每次超过阈值都发，不设冷却）
+          if (tickMoveTriggered) {
+            const n = buildTickMoveNotification(
+              w, chain.name, dex.name, dp, r, sym0, sym1,
+              prev.last_margin_lower, currMarginLower,
+              tickMoveDelta, tickMoveDirection
+            );
+            const sendRes = await notifyAll(n);
+            alertsSent++;
+
+            db.prepare(
+              `INSERT INTO alerts (position_id, type, tick_at, message, channels)
+               VALUES (?, ?, ?, ?, ?)`
+            ).run(
+              positionRow.id,
+              "tick_move",
+              r.status.currentTick,
+              n.body,
+              JSON.stringify(sendRes.sent)
+            );
+          }
         } catch (e: any) {
           errors.push(`position ${dp.tokenId} on chain ${w.chain_id_ref}: ${e?.message ?? e}`);
         }
@@ -346,6 +401,38 @@ function buildNotification(
     `仓位 #${dp.tokenId}（${pair}）已 ${dir}！\n` +
     `token0: ${label0} (${short(r.token0)})\n` +
     `token1: ${label1} (${short(r.token1)})\n` +
+    `当前 tick: ${r.status.currentTick}\n` +
+    `区间: [${r.tickLower}, ${r.tickUpper}]\n` +
+    `价格(1 ${label0} ≈ x ${label1}): ${r.status.price}\n` +
+    (dp.source === "staking" ? `来源: 质押 @ ${short(dp.stakerContract ?? "")}\n` : `来源: 直接持有\n`) +
+    `钱包: ${w.address}`;
+  return { title, body };
+}
+
+/** tick 波动告警文案。margin 用 0~1 的相对位置，展示时转成百分比。 */
+function buildTickMoveNotification(
+  w: WalletRow,
+  chainName: string,
+  dexName: string,
+  dp: DiscoveredPosition,
+  r: any,
+  sym0: string,
+  sym1: string,
+  prevMarginLower: number,
+  currMarginLower: number,
+  delta: number,
+  direction: string
+) {
+  const tag = w.label ? `[${w.label}]` : "";
+  const short = (a: string) => `${a.slice(0, 6)}…${a.slice(-4)}`;
+  const label0 = sym0 || short(r.token0);
+  const label1 = sym1 || short(r.token1);
+  const pair = `${label0}/${label1}`;
+  const pct = (x: number) => `${(x * 100).toFixed(1)}%`;
+  const title = `📈 LP 波动 ${tag} ${pair} · ${chainName}/${dexName}`;
+  const body =
+    `仓位 #${dp.tokenId}（${pair}）价格波动较大，${direction}\n` +
+    `区间内位置: ${pct(prevMarginLower)} → ${pct(currMarginLower)}（变动 ${pct(delta)}）\n` +
     `当前 tick: ${r.status.currentTick}\n` +
     `区间: [${r.tickLower}, ${r.tickUpper}]\n` +
     `价格(1 ${label0} ≈ x ${label1}): ${r.status.price}\n` +
