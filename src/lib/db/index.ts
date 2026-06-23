@@ -147,12 +147,15 @@ function migrate(db: DB) {
 
     -- CEX 报价匹配：链上 token 地址 → 币安交易对 symbol（如 0G token → '0GUSDT'）
     -- 用户在配置页手动为每个 token 配对计价货币（USDT/USDC 自选）
+    -- fixed_price 非空时走固定价（如 USDC.e=1），不再查币安；quote 货币由 cex_symbol 的 quote 部分确定（如 USDT）
     CREATE TABLE IF NOT EXISTS token_symbols (
       id            INTEGER PRIMARY KEY AUTOINCREMENT,
       chain_id_ref  INTEGER NOT NULL REFERENCES chains(id) ON DELETE CASCADE,
       token_addr    TEXT    NOT NULL,               -- 链上 token 合约地址（小写）
       token_symbol  TEXT    NOT NULL DEFAULT '',    -- 缓存的 ERC20 symbol，展示用
-      cex_symbol    TEXT    NOT NULL,               -- 币安交易对 symbol，如 '0GUSDT'
+      cex_symbol    TEXT    NOT NULL,               -- 币安交易对 symbol，如 '0GUSDT'；固定价时此字段仅用于确定计价币种
+      fixed_price   REAL,                            -- 固定价（如 USDC.e 填 1，计价 USDT）。非空时走固定价
+      quote         TEXT    NOT NULL DEFAULT '',    -- 计价币种，如 'USDT'。固定价时必填；走币安时从 cex_symbol 推导
       enabled       INTEGER NOT NULL DEFAULT 1,
       created_at    TEXT    NOT NULL DEFAULT (datetime('now')),
       UNIQUE(chain_id_ref, token_addr)
@@ -168,6 +171,9 @@ function migrate(db: DB) {
   safeAddColumn(db, "positions", "last_margin_upper", "REAL NOT NULL DEFAULT 0");
   // CEX 报价对比：上次扫描时该仓位 token 对应的币安参考价（JSON 字符串，存 token0/token1 的报价）
   safeAddColumn(db, "positions", "last_cex_price", "TEXT NOT NULL DEFAULT ''");
+  // token_symbols 固定价支持：USDC.e 这类恒定价格 token（如 =1 USDT），不再查币安
+  safeAddColumn(db, "token_symbols", "fixed_price", "REAL");
+  safeAddColumn(db, "token_symbols", "quote", "TEXT NOT NULL DEFAULT ''");
 
   seedDefaults(db);
 }

@@ -304,7 +304,7 @@ function CexMappingSection() {
   const [chainId, setChainId] = useState<number | "">("");
   const key = chainId ? `/api/cex-mapping?chain_id=${chainId}` : "/api/cex-mapping";
   const { data: mappings } = useSWR<any[]>(key, fetcher);
-  const [form, setForm] = useState({ token_addr: "", token_symbol: "", cex_symbol: "" });
+  const [form, setForm] = useState({ token_addr: "", token_symbol: "", cex_symbol: "", fixed_price: "", quote: "" });
   const [err, setErr] = useState("");
   // 测试报价的行内结果：id → { status:'loading'|'ok'|'error', text }
   const [tests, setTests] = useState<Record<number, { status: string; text: string }>>({});
@@ -312,16 +312,37 @@ function CexMappingSection() {
   async function add() {
     setErr("");
     try {
-      await api("/api/cex-mapping", "POST", { chain_id: Number(chainId), ...form });
-      setForm({ token_addr: "", token_symbol: "", cex_symbol: "" });
+      const fp = form.fixed_price.trim();
+      const body: any = {
+        chain_id: Number(chainId),
+        token_addr: form.token_addr,
+        token_symbol: form.token_symbol,
+        cex_symbol: form.cex_symbol,
+        quote: form.quote,
+      };
+      // 有固定价时带上
+      if (fp && Number(fp) > 0) body.fixed_price = Number(fp);
+      await api("/api/cex-mapping", "POST", body);
+      setForm({ token_addr: "", token_symbol: "", cex_symbol: "", fixed_price: "", quote: "" });
       mutate(key);
     } catch (e: any) { setErr(e.message); }
   }
 
-  /** 拉取单条映射的币安实时报价，确认配对是否正确。 */
+  /** 拉取单条映射的报价（固定价直接展示，币安模式走接口）。 */
   async function testQuote(m: any) {
-    setTests((t) => ({ ...t, [m.id]: { status: "loading", text: "拉取中…" } }));
+    setTests((t) => ({ ...t, [m.id]: { status: "loading", text: "检测中…" } }));
     try {
+      // 固定价模式：直接用 fixed_price 展示，不需要请求币安
+      if (m.fixed_price !== null && m.fixed_price !== undefined && m.fixed_price > 0) {
+        const baseLabel = m.token_symbol || m.cex_symbol || "—";
+        const quoteLabel = (m.quote || "USD").toUpperCase();
+        setTests((t) => ({
+          ...t,
+          [m.id]: { status: "ok", text: `📌 固定价: 1 ${baseLabel} = ${fmtFull(m.fixed_price)} ${quoteLabel}` },
+        }));
+        return;
+      }
+      // 币安模式：走接口
       const r = await fetch(`/api/cex-quote?symbol=${encodeURIComponent(m.cex_symbol)}`);
       const j = await r.json();
       if (!j.ok) throw new Error(j.error || "拉取失败");
@@ -330,39 +351,69 @@ function CexMappingSection() {
       const quoteLabel = d.quote || "";
       setTests((t) => ({
         ...t,
-        [m.id]: { status: "ok", text: `✅ 1 ${baseLabel} = ${fmtFull(d.price)} ${quoteLabel}` },
+        [m.id]: { status: "ok", text: `✅ 币安: 1 ${baseLabel} = ${fmtFull(d.price)} ${quoteLabel}` },
       }));
     } catch (e: any) {
       setTests((t) => ({ ...t, [m.id]: { status: "error", text: `❌ ${e.message}` } }));
     }
   }
 
+  const isFixed = form.fixed_price.trim() && Number(form.fixed_price) > 0;
+
   return (
     <section className="card p-5">
       <h2 className="mb-1 text-base font-semibold">CEX 报价匹配</h2>
       <p className="mb-3 text-xs text-ink-soft">
-        为链上 token 配对币安交易对 symbol（如 W0G → <code>0GUSDT</code>、WETH → <code>ETHUSDT</code>）。
-        <strong>同一个 LP 的 token0、token1 都需映射，且映射到同一计价币种（如都映射到 USDT）</strong>，
-        系统据此算出 CEX 上的 token0/token1 汇率，与 DEX 池价（如 1 W0G = 0.000146 WETH）对比，
-        差价超阈值即告警。添加后点「测试报价」可验证配对是否正确。
+        为链上 token 配对币安交易对 symbol（如 W0G → <code>0GUSDT</code>、WETH → <code>ETHUSDT</code>），
+        或为稳定币设固定价（如 USDC.e 填固定价 <code>1</code>，计价币种填 <code>USDT</code>）。
+        <strong>同一个 LP 的 token0、token1 都需映射，且映射到同一计价币种</strong>，
+        系统据此算出 CEX 上的 token0/token1 汇率，与 DEX 池价对比，差价超阈值即告警。
+        添加后点「测试报价」可验证。
       </p>
       <div className="mb-3"><Field label="按链筛选"><select className="input" value={chainId} onChange={(e) => setChainId(e.target.value ? Number(e.target.value) : "")}><option value="">全部链</option>{(chains ?? []).map((c: any) => <option key={c.id} value={c.id}>{c.name}</option>)}</select></Field></div>
       <div className="mb-3 grid grid-cols-2 gap-3 md:grid-cols-3">
         <Field label="Token 地址"><input className="input" value={form.token_addr} onChange={(e) => setForm({ ...form, token_addr: e.target.value })} placeholder="0x…" /></Field>
         <Field label="Token 符号（可选）"><input className="input" value={form.token_symbol} onChange={(e) => setForm({ ...form, token_symbol: e.target.value })} placeholder="如 0G / WETH" /></Field>
-        <Field label="币安交易对"><input className="input" value={form.cex_symbol} onChange={(e) => setForm({ ...form, cex_symbol: e.target.value })} placeholder="如 0GUSDT" /></Field>
+        {isFixed ? (
+          <Field label="固定价">
+            <input className="input" value={form.fixed_price} onChange={(e) => setForm({ ...form, fixed_price: e.target.value })} placeholder="如 1" />
+          </Field>
+        ) : (
+          <Field label="币安交易对">
+            <input className="input" value={form.cex_symbol} onChange={(e) => setForm({ ...form, cex_symbol: e.target.value })} placeholder="如 0GUSDT" />
+          </Field>
+        )}
       </div>
-      <div className="mb-3 flex gap-2"><button className="btn-primary" onClick={add} disabled={!chainId || !form.token_addr || !form.cex_symbol}>添加匹配</button>{err && <span className="self-center text-sm text-warn">{err}</span>}</div>
+      <div className="mb-3 grid grid-cols-2 gap-3 md:grid-cols-3">
+        <Field label="计价币种（如 USDT）">
+          <input className="input" value={form.quote} onChange={(e) => setForm({ ...form, quote: e.target.value })} placeholder="USDT" />
+        </Field>
+        <label className="flex items-center gap-1 text-xs text-ink-soft">
+          <input type="checkbox" checked={!!isFixed} onChange={(e) => setForm({ ...form, fixed_price: e.target.checked ? "1" : "" })} />
+          固定价模式（稳定币专用，如 USDC.e = 1 USDT）
+        </label>
+      </div>
+      <div className="mb-3 flex gap-2">
+        <button className="btn-primary" onClick={add} disabled={!chainId || !form.token_addr || (!isFixed && !form.cex_symbol)}>添加匹配</button>
+        {err && <span className="self-center text-sm text-warn">{err}</span>}
+      </div>
       <div className="space-y-2">
         {(mappings ?? []).map((m: any) => {
           const t = tests[m.id];
+          const isFixedRow = m.fixed_price !== null && m.fixed_price !== undefined && m.fixed_price > 0;
           return (
             <div key={m.id} className="rounded-md border border-slate-200 px-3 py-2 text-sm">
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <div className="flex min-w-0 flex-1 items-center gap-2">
                   <span className="font-medium">{m.token_symbol || "(无符号)"}</span>
                   <span className="text-ink-soft">→</span>
-                  <span className="font-mono text-sm">{m.cex_symbol}</span>
+                  {isFixedRow ? (
+                    <span className="font-mono text-sm">
+                      <span className="tag-muted text-xs">固定</span> {fmtFull(m.fixed_price)} {(m.quote || "USD").toUpperCase()}
+                    </span>
+                  ) : (
+                    <span className="font-mono text-sm">{m.cex_symbol}</span>
+                  )}
                   <span className="text-ink-soft">{m.chain_name}</span>
                   <span className="font-mono text-xs text-ink-soft">{short(m.token_addr)}</span>
                 </div>

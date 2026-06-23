@@ -27,22 +27,49 @@ export async function GET(req: Request) {
 
 /**
  * POST: 新增一条 CEX 报价匹配。
- * body: { chain_id, token_addr, token_symbol?, cex_symbol }
+ * body: { chain_id, token_addr, token_symbol?, cex_symbol, fixed_price?, quote? }
  *  - token_addr: 链上 token 合约地址
- *  - cex_symbol: 币安交易对 symbol，如 '0GUSDT' / 'ETHUSDC'（用户自选计价货币）
+ *  - cex_symbol: 币安交易对 symbol，如 '0GUSDT'（走币安时必填）；固定价时仅展示用
+ *  - fixed_price: 固定价（如 USDC.e 填 1）。非空时走固定价，不查币安
+ *  - quote: 计价币种，如 'USDT'/'USDC'（固定价时必填；走币安时从 cex_symbol 自动推导）
  *  - token_symbol: 可选，缓存的 ERC20 symbol（展示用，可留空）
  */
 export async function POST(req: Request) {
-  const b = await getBody<{ chain_id?: number; token_addr?: string; token_symbol?: string; cex_symbol?: string }>(req);
-  if (!b.chain_id || !b.token_addr || !b.cex_symbol) return fail("chain_id/token_addr/cex_symbol 必填");
+  const b = await getBody<{
+    chain_id?: number;
+    token_addr?: string;
+    token_symbol?: string;
+    cex_symbol?: string;
+    fixed_price?: number | null;
+    quote?: string;
+  }>(req);
+  if (!b.chain_id || !b.token_addr) return fail("chain_id/token_addr 必填");
   if (!/^0x[a-fA-F0-9]{40}$/.test(b.token_addr)) return fail("token_addr 地址非法");
-  if (!/^[A-Z0-9]{2,20}$/.test(b.cex_symbol.toUpperCase())) return fail("cex_symbol 格式非法（应为如 0GUSDT 的大写字母数字）");
+
+  const fixedPrice = b.fixed_price !== null && b.fixed_price !== undefined && b.fixed_price > 0
+    ? Number(b.fixed_price) : null;
+  const quote = (b.quote || "").trim().toUpperCase();
+  const cexSymbol = (b.cex_symbol || "").trim().toUpperCase();
+
+  // 固定价模式：不需要 cex_symbol，但需要 quote
+  if (fixedPrice !== null && !quote) return fail("固定价模式需同时填写计价币种（如 USDT）");
+  // 币安模式：需要 cex_symbol
+  if (fixedPrice === null && !cexSymbol) return fail("币安模式需填写 cex_symbol（如 0GUSDT）");
+  if (fixedPrice === null && !/^[A-Z0-9]{2,20}$/.test(cexSymbol)) return fail("cex_symbol 格式非法");
+
   const db = getDb();
   try {
     const info = db.prepare(
-      `INSERT INTO token_symbols (chain_id_ref, token_addr, token_symbol, cex_symbol, enabled)
-       VALUES (?,?,?,?,1)`
-    ).run(b.chain_id, b.token_addr.toLowerCase(), b.token_symbol?.trim() ?? "", b.cex_symbol.toUpperCase());
+      `INSERT INTO token_symbols (chain_id_ref, token_addr, token_symbol, cex_symbol, fixed_price, quote, enabled)
+       VALUES (?,?,?,?,?,?,1)`
+    ).run(
+      b.chain_id,
+      b.token_addr.toLowerCase(),
+      b.token_symbol?.trim() ?? "",
+      cexSymbol,
+      fixedPrice,
+      quote
+    );
     return ok({ id: info.lastInsertRowid });
   } catch (e: any) {
     if (String(e?.message).includes("UNIQUE")) return fail("该链上已存在此 token 的匹配", 409);

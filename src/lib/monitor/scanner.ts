@@ -28,7 +28,7 @@ import { ownerOf } from "../adapters/v3-fork";
 import { notifyAll } from "../notify";
 import {
   loadAllMappings,
-  fetchQuotes,
+  buildQuotesByAddr,
   type CexMapping,
   type CexQuote,
 } from "../cex/binance";
@@ -92,16 +92,15 @@ export async function runScan(): Promise<ScanSummary> {
       const recovered = await recoverMissedPositions(client, w, dexes, staking, discovered);
 
       // ===== 预取本链 CEX 报价（开启 CEX 对比时）=====
-      // 本钱包本链上所有 token0/token1 命中 token_symbols 表的，一次性把需要的币安 symbol 去重批量拉价，
-      // 存进 cexQuoteByAddr 供后续仓位循环按地址查。已拉过的（跨钱包/跨仓位重复 symbol）直接复用缓存。
-      const pending = collectPendingCexSymbols(cexMappingsByChain, w.chain_id_ref);
-      if (cexEnabled && pending.length > 0) {
-        const fresh = await fetchQuotes(pending);
-        // 把刚拉到的报价回填进 byAddr（一个 cexSymbol 可能对应多个 token 地址）
-        for (const [sym, quote] of fresh) {
-          for (const m of cexMappingsByChain.get(w.chain_id_ref) ?? []) {
-            if (m.cexSymbol === sym) cexQuoteByAddr.set(m.tokenAddr, quote);
-          }
+      // 固定价直接构造，币安 symbol 批量拉取，统一按 token 地址存入 cexQuoteByAddr。
+      // 同一条链跨钱包时复用已拉过的报价（按 token 地址去重）。
+      const chainMappings = cexMappingsByChain.get(w.chain_id_ref) ?? [];
+      if (cexEnabled && chainMappings.length > 0) {
+        // 只拉本链还没有报价的 token：cexQuoteByAddr 里已存在的跨钱包复用
+        const needFetch = chainMappings.filter((m) => !cexQuoteByAddr.has(m.tokenAddr));
+        if (needFetch.length > 0) {
+          const byAddr = await buildQuotesByAddr(needFetch);
+          for (const [addr, quote] of byAddr) cexQuoteByAddr.set(addr, quote);
         }
       }
 
@@ -598,22 +597,6 @@ function computeCexPriceDiff(
   };
 
   return { exceedsThreshold: absDiff >= threshold, payload };
-}
-
-/**
- * 收集本链本批仓位里需要的币安 symbol（去重）。
- * 本链所有启用映射的 symbol 都纳入——真正的去重与短期复用在 binance.ts 内部完成
- * （同次扫描跨钱包/跨仓位复用进程缓存，避免重复打接口）。
- */
-function collectPendingCexSymbols(
-  mappingsByChain: Map<number, CexMapping[]>,
-  chainIdRef: number
-): string[] {
-  const mappings = mappingsByChain.get(chainIdRef);
-  if (!mappings || mappings.length === 0) return [];
-  const symbols = new Set<string>();
-  for (const m of mappings) symbols.add(m.cexSymbol);
-  return [...symbols];
 }
 
 /** CEX 价差告警文案。 */

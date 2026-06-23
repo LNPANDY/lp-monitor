@@ -3,14 +3,19 @@ import { ok, fail, getBody } from "@/lib/api";
 
 export const dynamic = "force-dynamic";
 
-/** PATCH: 更新一条 CEX 匹配（cex_symbol / token_symbol / enabled）。 */
+/** PATCH: 更新一条 CEX 匹配（cex_symbol / token_symbol / enabled / fixed_price / quote）。 */
 export async function PATCH(req: Request, { params }: { params: { id: string } }) {
-  const b = await getBody<{ cex_symbol?: string; token_symbol?: string; enabled?: number }>(req);
+  const b = await getBody<{
+    cex_symbol?: string;
+    token_symbol?: string;
+    enabled?: number;
+    fixed_price?: number | null;
+    quote?: string;
+  }>(req);
   const db = getDb();
   const sets: string[] = [];
   const args: any[] = [];
   if (b.cex_symbol !== undefined) {
-    if (!/^[A-Z0-9]{2,20}$/.test(b.cex_symbol.toUpperCase())) return fail("cex_symbol 格式非法");
     sets.push("cex_symbol=?");
     args.push(b.cex_symbol.toUpperCase());
   }
@@ -21,6 +26,15 @@ export async function PATCH(req: Request, { params }: { params: { id: string } }
   if (b.enabled !== undefined) {
     sets.push("enabled=?");
     args.push(b.enabled ? 1 : 0);
+  }
+  if (b.fixed_price !== undefined) {
+    const fp = b.fixed_price !== null && b.fixed_price > 0 ? Number(b.fixed_price) : null;
+    sets.push("fixed_price=?");
+    args.push(fp);
+  }
+  if (b.quote !== undefined) {
+    sets.push("quote=?");
+    args.push((b.quote || "").trim().toUpperCase());
   }
   if (sets.length === 0) return fail("无更新字段");
   args.push(params.id);

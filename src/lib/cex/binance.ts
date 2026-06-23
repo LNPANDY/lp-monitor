@@ -27,7 +27,11 @@ const CACHE_TTL_MS = 30_000;
 export interface CexMapping {
   chainIdRef: number;
   tokenAddr: string; // 小写
-  cexSymbol: string; // 大写，如 '0GUSDT'
+  cexSymbol: string; // 大写，如 '0GUSDT'。固定价时此字段仅用于展示，不查币安
+  /** 固定价。非 null 时走固定价（如 USDC.e=1），不再查币安接口 */
+  fixedPrice: number | null;
+  /** 计价币种，如 'USDT'/'USDC'。固定价时必填；走币安时从 cex_symbol 推导（留空则自动切分） */
+  quote: string;
 }
 
 /** 币安报价结果：1 base = price quote。 */
@@ -61,19 +65,32 @@ export function splitSymbol(symbol: string): { base: string; quote: string } {
 /**
  * 加载所有启用的 token→CEX 映射（按链分组返回，方便扫描时按 wallet.chain_id_ref 取）。
  * key = chainIdRef，value = 该链上 token_addr(小写) → CexMapping 列表。
+ * 固定价（fixedPrice 非空）的映射也会加载，扫描时直接用固定价不查币安。
  */
 export function loadAllMappings(): Map<number, CexMapping[]> {
   const db = getDb();
   const rows = db
     .prepare(
-      `SELECT chain_id_ref, token_addr, cex_symbol
+      `SELECT chain_id_ref, token_addr, cex_symbol, fixed_price, quote
        FROM token_symbols WHERE enabled=1`
     )
-    .all() as { chain_id_ref: number; token_addr: string; cex_symbol: string }[];
+    .all() as {
+      chain_id_ref: number;
+      token_addr: string;
+      cex_symbol: string;
+      fixed_price: number | null;
+      quote: string;
+    }[];
   const out = new Map<number, CexMapping[]>();
   for (const r of rows) {
     const arr = out.get(r.chain_id_ref) ?? [];
-    arr.push({ chainIdRef: r.chain_id_ref, tokenAddr: r.token_addr.toLowerCase(), cexSymbol: r.cex_symbol.toUpperCase() });
+    arr.push({
+      chainIdRef: r.chain_id_ref,
+      tokenAddr: r.token_addr.toLowerCase(),
+      cexSymbol: r.cex_symbol.toUpperCase(),
+      fixedPrice: r.fixed_price !== null ? r.fixed_price : null,
+      quote: (r.quote || "").toUpperCase(),
+    });
     out.set(r.chain_id_ref, arr);
   }
   return out;
@@ -130,6 +147,41 @@ export async function fetchQuotes(symbols: string[]): Promise<Map<string, CexQuo
 export async function fetchQuote(symbol: string): Promise<CexQuote | null> {
   const m = await fetchQuotes([symbol]);
   return m.get(symbol.toUpperCase()) ?? null;
+}
+
+/**
+ * 按一条链的映射构造 token_addr(小写) → CexQuote。
+ * 固定价映射（fixedPrice 非空）直接构造报价，不查币安；币安映射批量去拉。
+ * 用于扫描器：一次性拿到本链所有 token 的报价，无需区分固定/币安来源。
+ */
+export async function buildQuotesByAddr(mappings: CexMapping[]): Promise<Map<string, CexQuote>> {
+  const out = new Map<string, CexQuote>();
+  // 1) 固定价：直接构造，base 取 token_symbol（映射里没存，用 cex_symbol 切分兜底），quote 用 quote 字段
+  const binanceSymbols = new Set<string>();
+  for (const m of mappings) {
+    if (m.fixedPrice !== null && Number.isFinite(m.fixedPrice) && m.fixedPrice > 0) {
+      const { base } = splitSymbol(m.cexSymbol);
+      const q: CexQuote = {
+        symbol: m.cexSymbol, // 展示用
+        price: m.fixedPrice,
+        base,
+        quote: m.quote || "USD",
+      };
+      out.set(m.tokenAddr, q);
+    } else {
+      if (m.cexSymbol) binanceSymbols.add(m.cexSymbol);
+    }
+  }
+  // 2) 币安映射：批量拉价，回填到 byAddr
+  if (binanceSymbols.size > 0) {
+    const fresh = await fetchQuotes([...binanceSymbols]);
+    for (const m of mappings) {
+      if (m.fixedPrice !== null) continue;
+      const q = fresh.get(m.cexSymbol);
+      if (q) out.set(m.tokenAddr, q);
+    }
+  }
+  return out;
 }
 
 /** 清空报价缓存（配置变更/测试时调用）。 */
