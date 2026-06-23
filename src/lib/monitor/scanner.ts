@@ -29,7 +29,6 @@ import { notifyAll } from "../notify";
 import {
   loadAllMappings,
   fetchQuotes,
-  splitSymbol,
   type CexMapping,
   type CexQuote,
 } from "../cex/binance";
@@ -184,7 +183,9 @@ export async function runScan(): Promise<ScanSummary> {
                 r.token1.toLowerCase(),
                 r.status.price,
                 cexQuoteByAddr,
-                cexThreshold
+                cexThreshold,
+                sym0,
+                sym1
               )
             : null;
 
@@ -527,99 +528,71 @@ interface CexPriceInfo {
 
 /** 写入 positions.last_cex_price 的 JSON 结构（前端按相同结构解析展示）。 */
 export interface CexPricePayload {
-  /** 用作定价基准的 base token 地址（小写）：token0 或 token1 中有币安映射的那个 */
-  baseTokenAddr: string;
-  /** base 的链上 symbol（展示用，可能为空） */
-  baseSymbol: string;
-  /** 币安交易对 symbol，如 '0GUSDT' */
-  cexSymbol: string;
-  /** 计价币种，如 'USDT' */
+  /** 对比的口径：始终是「1 token0 = ? token1」的汇率（与 DEX 池价同口径）。 */
+  pairLabel: string; // 如 'W0G/WETH'，仅展示用
+  /** token0 的币安 symbol（计价币种可能与 token1 不同，但能换算成汇率） */
+  token0CexSymbol: string; // 如 '0GUSDT'
+  /** token1 的币安 symbol */
+  token1CexSymbol: string; // 如 'ETHUSDT'
+  /** 两者共同的计价币种，如 'USDT'（用于做汇率换算） */
   quote: string;
-  /** DEX 池里 1 base = ? quote（由 token1/token0 池价 + 两边 CEX 报价换算得出） */
-  dexPrice: number;
-  /** 币安 1 base = ? quote */
-  cexPrice: number;
-  /** (dexPrice - cexPrice) / cexPrice，带符号 */
+  /** DEX 池价：1 token0 = dexRate token1（来自 r.status.price） */
+  dexRate: number;
+  /** CEX 推算汇率：1 token0 = cexRate token1（= token0CexPrice / token1CexPrice） */
+  cexRate: number;
+  /** (dexRate - cexRate) / cexRate，带符号 */
   diff: number;
   /** diff 的绝对值（0~1），用于和阈值比较 */
   absDiff: number;
 }
 
 /**
- * 计算单仓位 token0/token1 与币安报价的价差。
+ * 计算单仓位 token0/token1 在 DEX 与 CEX 之间的汇率差价。
  *
- * 思路：池价是 token1/token0（1 token0 = price0 token1）。
- * 若 token0 有币安映射（如 0GUSDT），则「1 token0 的 CEX 价」= 币安报价（直接，币种对齐）；
- * 若只有 token1 有映射，则用 token1 的币安报价 × 池价反推出「1 token0 = ? quote」。
- * 任一 token 都没映射、或本次拉不到对应币安价 → 返回 null（不对比、不告警、写空）。
+ * 核心逻辑（以 W0G/WETH 为例）：
+ *   DEX 池价: 1 W0G = 0.00014678250 WETH          ← r.status.price（token1/token0）
+ *   CEX 汇率: 1 0G  = 0.24 USDT, 1 ETH = 1652 USDT
+ *            → 1 0G = 0.24/1652 = 0.0001452784504 ETH   ← 即 CEX 上的 0G/ETH 汇率
+ *   对比: 0.00014678250 vs 0.0001452784504 的差价
  *
- * 注意：CEX 上报的是裸币种（如 0G），链上多为 wrapped/桥接版本（同价近似成立才合理）。
- * 这是用户在配置页手动建立映射的前提条件，模块本身不做地址↔币种的自动猜测。
+ * 因此要求 token0、token1 **都有币安映射，且映射到同一计价币种**（如都映射到 USDT），
+ * 才能相除得到 CEX 汇率。任一缺失或计价币种不一致 → 返回 null（不对比、不告警）。
+ *
+ * 注意：CEX 报的是裸币种（如 0G），链上是 wrapped 版本（如 W0G），用户配置映射时
+ * 假定 1:1 等价。这是该功能成立的前提，模块不做地址↔币种的自动猜测。
  */
 function computeCexPriceDiff(
   token0Lower: string,
   token1Lower: string,
-  dexPrice0Str: string, // r.status.price: 1 token0 = ? token1
+  dexRateStr: string, // r.status.price: 1 token0 = ? token1
   quoteByAddr: Map<string, CexQuote>,
-  threshold: number
+  threshold: number,
+  sym0: string,
+  sym1: string
 ): CexPriceInfo | null {
-  const dexPrice0 = Number(dexPrice0Str); // 1 token0 = dexPrice0 token1
+  const dexRate = Number(dexRateStr); // 1 token0 = dexRate token1
   const q0 = quoteByAddr.get(token0Lower);
   const q1 = quoteByAddr.get(token1Lower);
 
-  let baseTokenAddr = "";
-  let baseSymbol = "";
-  let cexSymbol = "";
-  let quote = "";
-  let dexPrice = NaN; // 1 base = ? quote（同计价口径）
-  let cexPrice = NaN;
+  // 必须两边都有报价，且计价币种一致，才能相除得到 token0/token1 汇率
+  if (!q0 || !q1 || !Number.isFinite(dexRate) || dexRate <= 0) return null;
+  if (q0.quote !== q1.quote || q1.price <= 0) return null;
 
-  if (q0 && Number.isFinite(dexPrice0)) {
-    // token0 直接有币安报价：DEX 价口径需统一成 token0 的计价币种。
-    // 池里是 1 token0 = dexPrice0 token1；若 token1 也有币安报价 q1，可把 token1 换算成 quote，
-    // 得到「1 token0 = dexPrice0 × q1.price  quote」（计价币种与 q1.quote 一致）。
-    if (q1 && Number.isFinite(dexPrice0)) {
-      baseTokenAddr = token0Lower;
-      baseSymbol = splitSymbol(q0.symbol).base;
-      cexSymbol = q0.symbol;
-      quote = q1.quote;
-      dexPrice = dexPrice0 * q1.price;
-      cexPrice = q0.price;
-    } else {
-      // 只有 token0 有报价：直接用币安价当 DEX 参考近似（口径不完全一致，仅作粗略提示）
-      baseTokenAddr = token0Lower;
-      baseSymbol = splitSymbol(q0.symbol).base;
-      cexSymbol = q0.symbol;
-      quote = q0.quote;
-      dexPrice = dexPrice0; // 口径不一致，仅粗略
-      cexPrice = q0.price;
-    }
-  } else if (q1) {
-    // 只有 token1 有报价：以 token1 为 base。
-    // 池里 1 token0 = dexPrice0 token1，即 1 token1 = 1/dexPrice0 token0；
-    // DEX「1 token1 的 quote 价」需要 token0 的币安价，但 token0 无映射 → 只能用币安价近似 DEX 价。
-    baseTokenAddr = token1Lower;
-    baseSymbol = splitSymbol(q1.symbol).base;
-    cexSymbol = q1.symbol;
-    quote = q1.quote;
-    dexPrice = dexPrice0 > 0 ? 1 / dexPrice0 : NaN; // token1 相对 token0 的池价（口径不齐，粗略）
-    cexPrice = q1.price;
-  }
+  // CEX 上 1 token0 = (q0.price / q1.price) 个 token1
+  // 例：0G=0.24 USDT, ETH=1652 USDT → 1 0G = 0.24/1652 ETH
+  const cexRate = q0.price / q1.price;
+  if (!Number.isFinite(cexRate) || cexRate <= 0) return null;
 
-  if (!baseTokenAddr || !Number.isFinite(dexPrice) || !Number.isFinite(cexPrice) || cexPrice <= 0) {
-    return null;
-  }
-
-  const diff = (dexPrice - cexPrice) / cexPrice;
+  const diff = (dexRate - cexRate) / cexRate;
   const absDiff = Math.abs(diff);
 
   const payload: CexPricePayload = {
-    baseTokenAddr,
-    baseSymbol,
-    cexSymbol,
-    quote,
-    dexPrice,
-    cexPrice,
+    pairLabel: `${sym0}/${sym1}`,
+    token0CexSymbol: q0.symbol,
+    token1CexSymbol: q1.symbol,
+    quote: q0.quote,
+    dexRate,
+    cexRate,
     diff,
     absDiff,
   };
@@ -660,13 +633,11 @@ function buildCexPriceNotification(
   const label1 = sym1 || short(r.token1);
   const pair = `${label0}/${label1}`;
   const pctSigned = (x: number) => `${x >= 0 ? "+" : ""}${(x * 100).toFixed(2)}%`;
-  const baseLabel = p.baseSymbol || short(p.baseTokenAddr);
-  const title = `💱 CEX 价差 ${tag} ${pair} · ${chainName}/${dexName}`;
+  const title = `💱 CEX 价差 ${tag} ${p.pairLabel} · ${chainName}/${dexName}`;
   const body =
-    `仓位 #${dp.tokenId}（${pair}）${baseLabel} 的 DEX 池价与币安报价偏差较大\n` +
-    `对比基准: ${baseLabel}（${p.cexSymbol}）\n` +
-    `DEX 价: 1 ${baseLabel} ≈ ${fmt(p.dexPrice)} ${p.quote}\n` +
-    `币安价: 1 ${baseLabel} ≈ ${fmt(p.cexPrice)} ${p.quote}\n` +
+    `仓位 #${dp.tokenId}（${p.pairLabel}）DEX 池价与 CEX 汇率偏差较大\n` +
+    `DEX 池价: 1 ${sym0} = ${fmt(p.dexRate)} ${sym1}\n` +
+    `CEX 汇率: 1 ${sym0} = ${fmt(p.cexRate)} ${sym1}（${p.token0CexSymbol} ÷ ${p.token1CexSymbol}，均以 ${p.quote} 计价）\n` +
     `价差: ${pctSigned(p.diff)}（阈值 ${(Math.abs(p.absDiff) * 100).toFixed(2)}%）\n` +
     `当前 tick: ${r.status.currentTick}\n` +
     `区间: [${r.tickLower}, ${r.tickUpper}]\n` +

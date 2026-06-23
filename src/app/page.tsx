@@ -383,16 +383,16 @@ function PositionCard({ p, highlight, closed }: { p: Position; highlight?: boole
         <Row label="区间">[{p.tick_lower}, {p.tick_upper}]</Row>
         <Row label="价格">1 {sym0} ≈ {p.last_price0} {sym1}</Row>
         {cexInfo && (
-          <Row label={`币安报价 (${cexInfo.cexSymbol})`}>
-            <span>1 {cexInfo.baseSymbol || "—"} = {fmtFull(cexInfo.cexPrice)} {cexInfo.quote}</span>
+          <Row label={`CEX 汇率 (${cexInfo.token0CexSymbol}÷${cexInfo.token1CexSymbol})`}>
+            <span>1 {sym0} = {fmtFull(cexInfo.cexRate)} {sym1}</span>
           </Row>
         )}
         {cexInfo && (
-          <Row label="DEX vs 币安">
+          <Row label="DEX vs CEX">
             <span className={cexInfo.absDiff >= cexWarnThresh ? "text-warn font-semibold" : ""}>
               差 {pctSigned(cexInfo.diff)}
             </span>
-            <span className="ml-1 text-ink-soft">（DEX {fmtFull(cexInfo.dexPrice)} / 币安 {fmtFull(cexInfo.cexPrice)}）</span>
+            <span className="ml-1 text-ink-soft">（DEX {fmtFull(cexInfo.dexRate)} / CEX {fmtFull(cexInfo.cexRate)}）</span>
           </Row>
         )}
 
@@ -446,12 +446,12 @@ function Row({ label, children }: { label: string; children: React.ReactNode }) 
 
 /** positions.last_cex_price 的前端结构（与 scanner 写入的 CexPricePayload 对齐）。 */
 interface CexPricePayload {
-  baseTokenAddr: string;
-  baseSymbol: string;
-  cexSymbol: string;
-  quote: string;
-  dexPrice: number;
-  cexPrice: number;
+  pairLabel: string; // 如 'W0G/WETH'
+  token0CexSymbol: string; // 如 '0GUSDT'
+  token1CexSymbol: string; // 如 'ETHUSDT'
+  quote: string; // 共同计价币种，如 'USDT'
+  dexRate: number; // DEX: 1 token0 = ? token1
+  cexRate: number; // CEX: 1 token0 = ? token1
   diff: number;
   absDiff: number;
 }
@@ -462,8 +462,8 @@ function parseCexPrice(raw?: string): CexPricePayload | null {
   try {
     const o = JSON.parse(raw);
     if (
-      typeof o.dexPrice === "number" &&
-      typeof o.cexPrice === "number" &&
+      typeof o.dexRate === "number" &&
+      typeof o.cexRate === "number" &&
       typeof o.diff === "number"
     ) {
       return o as CexPricePayload;

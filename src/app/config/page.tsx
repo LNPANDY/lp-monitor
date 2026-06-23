@@ -341,7 +341,10 @@ function CexMappingSection() {
     <section className="card p-5">
       <h2 className="mb-1 text-base font-semibold">CEX 报价匹配</h2>
       <p className="mb-3 text-xs text-ink-soft">
-        为链上 token 配对币安交易对 symbol（如 0G token → <code>0GUSDT</code>）。配置后扫描时拉取币安实时报价，与 DEX 价格对比，价差超过阈值即告警。计价货币（USDT/USDC）每个币种自选。添加后可点「测试报价」确认配对是否正确。
+        为链上 token 配对币安交易对 symbol（如 W0G → <code>0GUSDT</code>、WETH → <code>ETHUSDT</code>）。
+        <strong>同一个 LP 的 token0、token1 都需映射，且映射到同一计价币种（如都映射到 USDT）</strong>，
+        系统据此算出 CEX 上的 token0/token1 汇率，与 DEX 池价（如 1 W0G = 0.000146 WETH）对比，
+        差价超阈值即告警。添加后点「测试报价」可验证配对是否正确。
       </p>
       <div className="mb-3"><Field label="按链筛选"><select className="input" value={chainId} onChange={(e) => setChainId(e.target.value ? Number(e.target.value) : "")}><option value="">全部链</option>{(chains ?? []).map((c: any) => <option key={c.id} value={c.id}>{c.name}</option>)}</select></Field></div>
       <div className="mb-3 grid grid-cols-2 gap-3 md:grid-cols-3">
