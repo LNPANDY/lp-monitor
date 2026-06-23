@@ -14,6 +14,7 @@ export default function ConfigPage() {
       <ChainsSection />
       <DexesSection />
       <StakingSection />
+      <CexMappingSection />
       <NotifySection />
     </div>
   );
@@ -297,6 +298,68 @@ function StakingSection() {
   );
 }
 
+/* ============ CEX 报价匹配 ============ */
+function CexMappingSection() {
+  const { data: chains } = useSWR<any[]>("/api/chains", fetcher);
+  const [chainId, setChainId] = useState<number | "">("");
+  const key = chainId ? `/api/cex-mapping?chain_id=${chainId}` : "/api/cex-mapping";
+  const { data: mappings } = useSWR<any[]>(key, fetcher);
+  const [form, setForm] = useState({ token_addr: "", token_symbol: "", cex_symbol: "" });
+  const [err, setErr] = useState("");
+
+  async function add() {
+    setErr("");
+    try {
+      await api("/api/cex-mapping", "POST", { chain_id: Number(chainId), ...form });
+      setForm({ token_addr: "", token_symbol: "", cex_symbol: "" });
+      mutate(key);
+    } catch (e: any) { setErr(e.message); }
+  }
+
+  return (
+    <section className="card p-5">
+      <h2 className="mb-1 text-base font-semibold">CEX 报价匹配</h2>
+      <p className="mb-3 text-xs text-ink-soft">
+        为链上 token 配对币安交易对 symbol（如 0G token → <code>0GUSDT</code>）。配置后扫描时拉取币安实时报价，与 DEX 价格对比，价差超过阈值即告警。计价货币（USDT/USDC）每个币种自选。
+      </p>
+      <div className="mb-3"><Field label="按链筛选"><select className="input" value={chainId} onChange={(e) => setChainId(e.target.value ? Number(e.target.value) : "")}><option value="">全部链</option>{(chains ?? []).map((c: any) => <option key={c.id} value={c.id}>{c.name}</option>)}</select></Field></div>
+      <div className="mb-3 grid grid-cols-2 gap-3 md:grid-cols-3">
+        <Field label="Token 地址"><input className="input" value={form.token_addr} onChange={(e) => setForm({ ...form, token_addr: e.target.value })} placeholder="0x…" /></Field>
+        <Field label="Token 符号（可选）"><input className="input" value={form.token_symbol} onChange={(e) => setForm({ ...form, token_symbol: e.target.value })} placeholder="如 0G / WETH" /></Field>
+        <Field label="币安交易对"><input className="input" value={form.cex_symbol} onChange={(e) => setForm({ ...form, cex_symbol: e.target.value })} placeholder="如 0GUSDT" /></Field>
+      </div>
+      <div className="mb-3 flex gap-2"><button className="btn-primary" onClick={add} disabled={!chainId || !form.token_addr || !form.cex_symbol}>添加匹配</button>{err && <span className="self-center text-sm text-warn">{err}</span>}</div>
+      <div className="space-y-2">
+        {(mappings ?? []).map((m: any) => (
+          <EditableRow
+            key={m.id}
+            fields={[
+              { key: "token_addr", label: "Token 地址" },
+              { key: "token_symbol", label: "Token 符号" },
+              { key: "cex_symbol", label: "币安交易对" },
+            ]}
+            values={m}
+            onSave={async (u) => { await api(`/api/cex-mapping/${m.id}`, "PATCH", u); mutate(key); }}
+            display={
+              <div className="flex items-center gap-2">
+                <span className="font-medium">{m.token_symbol || "(无符号)"}</span>
+                <span className="text-ink-soft">→</span>
+                <span className="font-mono text-sm">{m.cex_symbol}</span>
+                <span className="text-ink-soft">{m.chain_name}</span>
+                <span className="font-mono text-xs text-ink-soft">{short(m.token_addr)}</span>
+              </div>
+            }
+            actions={<>
+              <Toggle id={m.id} enabled={!!m.enabled} kind="cex-mapping" />
+              <button className="btn-ghost" onClick={async () => { await api(`/api/cex-mapping/${m.id}`, "DELETE"); mutate(key); }}>删除</button>
+            </>}
+          />
+        ))}
+      </div>
+    </section>
+  );
+}
+
 /* ============ 通知渠道 ============ */
 function NotifySection() {
   const { data: channels, mutate } = useSWR<any[]>("/api/notify-test", fetcher);
@@ -332,7 +395,7 @@ function NotifySection() {
 }
 
 /* ============ 通用开关 ============ */
-function Toggle({ id, enabled, kind, disabled }: { id: number; enabled: boolean; kind: "wallets" | "chains" | "dexes" | "staking"; disabled?: boolean }) {
+function Toggle({ id, enabled, kind, disabled }: { id: number; enabled: boolean; kind: "wallets" | "chains" | "dexes" | "staking" | "cex-mapping"; disabled?: boolean }) {
   async function toggle() {
     try {
       await api(`/api/${kind}/${id}`, "PATCH", { enabled: enabled ? 0 : 1 });
