@@ -1,7 +1,7 @@
 "use client";
 import { useState } from "react";
 import useSWR, { mutate } from "swr";
-import { fetcher, short } from "@/components/util";
+import { fetcher, short, fmtFull } from "@/components/util";
 import { api, Field } from "@/components/form";
 import { EditableRow } from "@/components/editable-row";
 
@@ -306,6 +306,8 @@ function CexMappingSection() {
   const { data: mappings } = useSWR<any[]>(key, fetcher);
   const [form, setForm] = useState({ token_addr: "", token_symbol: "", cex_symbol: "" });
   const [err, setErr] = useState("");
+  // 测试报价的行内结果：id → { status:'loading'|'ok'|'error', text }
+  const [tests, setTests] = useState<Record<number, { status: string; text: string }>>({});
 
   async function add() {
     setErr("");
@@ -316,11 +318,30 @@ function CexMappingSection() {
     } catch (e: any) { setErr(e.message); }
   }
 
+  /** 拉取单条映射的币安实时报价，确认配对是否正确。 */
+  async function testQuote(m: any) {
+    setTests((t) => ({ ...t, [m.id]: { status: "loading", text: "拉取中…" } }));
+    try {
+      const r = await fetch(`/api/cex-quote?symbol=${encodeURIComponent(m.cex_symbol)}`);
+      const j = await r.json();
+      if (!j.ok) throw new Error(j.error || "拉取失败");
+      const d = j.data;
+      const baseLabel = d.base || m.cex_symbol;
+      const quoteLabel = d.quote || "";
+      setTests((t) => ({
+        ...t,
+        [m.id]: { status: "ok", text: `✅ 1 ${baseLabel} = ${fmtFull(d.price)} ${quoteLabel}` },
+      }));
+    } catch (e: any) {
+      setTests((t) => ({ ...t, [m.id]: { status: "error", text: `❌ ${e.message}` } }));
+    }
+  }
+
   return (
     <section className="card p-5">
       <h2 className="mb-1 text-base font-semibold">CEX 报价匹配</h2>
       <p className="mb-3 text-xs text-ink-soft">
-        为链上 token 配对币安交易对 symbol（如 0G token → <code>0GUSDT</code>）。配置后扫描时拉取币安实时报价，与 DEX 价格对比，价差超过阈值即告警。计价货币（USDT/USDC）每个币种自选。
+        为链上 token 配对币安交易对 symbol（如 0G token → <code>0GUSDT</code>）。配置后扫描时拉取币安实时报价，与 DEX 价格对比，价差超过阈值即告警。计价货币（USDT/USDC）每个币种自选。添加后可点「测试报价」确认配对是否正确。
       </p>
       <div className="mb-3"><Field label="按链筛选"><select className="input" value={chainId} onChange={(e) => setChainId(e.target.value ? Number(e.target.value) : "")}><option value="">全部链</option>{(chains ?? []).map((c: any) => <option key={c.id} value={c.id}>{c.name}</option>)}</select></Field></div>
       <div className="mb-3 grid grid-cols-2 gap-3 md:grid-cols-3">
@@ -330,31 +351,36 @@ function CexMappingSection() {
       </div>
       <div className="mb-3 flex gap-2"><button className="btn-primary" onClick={add} disabled={!chainId || !form.token_addr || !form.cex_symbol}>添加匹配</button>{err && <span className="self-center text-sm text-warn">{err}</span>}</div>
       <div className="space-y-2">
-        {(mappings ?? []).map((m: any) => (
-          <EditableRow
-            key={m.id}
-            fields={[
-              { key: "token_addr", label: "Token 地址" },
-              { key: "token_symbol", label: "Token 符号" },
-              { key: "cex_symbol", label: "币安交易对" },
-            ]}
-            values={m}
-            onSave={async (u) => { await api(`/api/cex-mapping/${m.id}`, "PATCH", u); mutate(key); }}
-            display={
-              <div className="flex items-center gap-2">
-                <span className="font-medium">{m.token_symbol || "(无符号)"}</span>
-                <span className="text-ink-soft">→</span>
-                <span className="font-mono text-sm">{m.cex_symbol}</span>
-                <span className="text-ink-soft">{m.chain_name}</span>
-                <span className="font-mono text-xs text-ink-soft">{short(m.token_addr)}</span>
+        {(mappings ?? []).map((m: any) => {
+          const t = tests[m.id];
+          return (
+            <div key={m.id} className="rounded-md border border-slate-200 px-3 py-2 text-sm">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="flex min-w-0 flex-1 items-center gap-2">
+                  <span className="font-medium">{m.token_symbol || "(无符号)"}</span>
+                  <span className="text-ink-soft">→</span>
+                  <span className="font-mono text-sm">{m.cex_symbol}</span>
+                  <span className="text-ink-soft">{m.chain_name}</span>
+                  <span className="font-mono text-xs text-ink-soft">{short(m.token_addr)}</span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <button
+                    className="btn-ghost text-xs"
+                    disabled={t?.status === "loading"}
+                    onClick={() => testQuote(m)}
+                  >
+                    {t?.status === "loading" ? "测试中…" : "测试报价"}
+                  </button>
+                  <Toggle id={m.id} enabled={!!m.enabled} kind="cex-mapping" />
+                  <button className="btn-ghost text-xs" onClick={async () => { await api(`/api/cex-mapping/${m.id}`, "DELETE"); mutate(key); }}>删除</button>
+                </div>
               </div>
-            }
-            actions={<>
-              <Toggle id={m.id} enabled={!!m.enabled} kind="cex-mapping" />
-              <button className="btn-ghost" onClick={async () => { await api(`/api/cex-mapping/${m.id}`, "DELETE"); mutate(key); }}>删除</button>
-            </>}
-          />
-        ))}
+              {t && (
+                <div className={`mt-1 text-xs ${t.status === "error" ? "text-warn" : "text-ink-soft"}`}>{t.text}</div>
+              )}
+            </div>
+          );
+        })}
       </div>
     </section>
   );

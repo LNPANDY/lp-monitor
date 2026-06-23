@@ -35,3 +35,41 @@ export function useInterval(cb: () => void, ms: number) {
     return () => clearInterval(id);
   }, [ms]);
 }
+
+/**
+ * 价格展示：完全展开小数，绝不使用科学计数法（如 2.3815542e+15 → 2381554200000000）。
+ * 小数尾部无意义的 0 会被 trim 掉。
+ */
+export function fmtFull(n: number): string {
+  if (!Number.isFinite(n)) return "—";
+  // 先用足够多的小数位展开，再 trim 末尾 0
+  let s = Math.abs(n) < 1 && n !== 0 ? n.toFixed(18) : n.toFixed(8);
+  if (s.indexOf(".") >= 0) s = s.replace(/0+$/, "").replace(/\.$/, "");
+  // 防御性：万一仍含 e/E，转成全数字
+  if (/[eE]/.test(s)) s = numberToString(n);
+  return s === "" || s === "-" ? "0" : s;
+}
+
+/**
+ * 任意 number 转成不含科学计数法的字符串。
+ * 原生 toString 对极大/极小数会用科学计数法，这里手动按小数点移位展开。
+ */
+export function numberToString(num: number): string {
+  if (!Number.isFinite(num)) return "—";
+  if (num === 0) return "0";
+  const sign = num < 0 ? "-" : "";
+  const str = Math.abs(num).toString();
+  if (!/[eE]/.test(str)) return sign + str;
+  const [mantissa, expStr] = str.split(/[eE]/);
+  const exp = Number(expStr);
+  const [intPart, decPart = ""] = mantissa.split(".");
+  const digits = intPart + decPart;
+  const point = intPart.length + exp;
+  if (point <= 0) {
+    return sign + "0." + "0".repeat(-point) + digits;
+  } else if (point >= digits.length) {
+    return sign + digits + "0".repeat(point - digits.length);
+  } else {
+    return sign + digits.slice(0, point) + "." + digits.slice(point);
+  }
+}

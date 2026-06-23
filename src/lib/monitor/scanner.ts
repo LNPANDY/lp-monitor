@@ -675,10 +675,38 @@ function buildCexPriceNotification(
   return { title, body };
 }
 
-/** 价格展示：去掉无意义尾零。 */
+/**
+ * 价格展示：完全展开小数，绝不使用科学计数法。
+ * 如 2.3815542e+15 → 2381554200000000；0.00000123 → 0.00000123。
+ * 告警文案里出现科学计数法很难读，统一展开。
+ */
 function fmt(n: number): string {
   if (!Number.isFinite(n)) return "—";
-  // 极小价格用更多小数位，普通价格 6 位足够
-  if (n !== 0 && Math.abs(n) < 1) return n.toPrecision(6);
-  return n.toLocaleString("en-US", { maximumFractionDigits: 6 });
+  if (n === 0) return "0";
+  let s = Math.abs(n) < 1 ? n.toFixed(18) : n.toFixed(8);
+  if (s.indexOf(".") >= 0) s = s.replace(/0+$/, "").replace(/\.$/, "");
+  // 防御性：万一仍含 e/E，手动按小数点移位展开
+  if (/[eE]/.test(s)) s = numberToFullString(n);
+  return s === "" || s === "-" ? "0" : s;
+}
+
+/** 任意 number 转成不含科学计数法的字符串（大数/极小数都展开）。 */
+function numberToFullString(num: number): string {
+  if (!Number.isFinite(num)) return "—";
+  if (num === 0) return "0";
+  const sign = num < 0 ? "-" : "";
+  const str = Math.abs(num).toString();
+  if (!/[eE]/.test(str)) return sign + str;
+  const [mantissa, expStr] = str.split(/[eE]/);
+  const exp = Number(expStr);
+  const [intPart, decPart = ""] = mantissa.split(".");
+  const digits = intPart + decPart;
+  const point = intPart.length + exp;
+  if (point <= 0) {
+    return sign + "0." + "0".repeat(-point) + digits;
+  } else if (point >= digits.length) {
+    return sign + digits + "0".repeat(point - digits.length);
+  } else {
+    return sign + digits.slice(0, point) + "." + digits.slice(point);
+  }
 }

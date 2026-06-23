@@ -1,7 +1,7 @@
 "use client";
 import { useState } from "react";
 import useSWR from "swr";
-import { fetcher, short, timeAgo } from "@/components/util";
+import { fetcher, short, timeAgo, fmtFull } from "@/components/util";
 
 interface Position {
   id: number;
@@ -383,11 +383,16 @@ function PositionCard({ p, highlight, closed }: { p: Position; highlight?: boole
         <Row label="区间">[{p.tick_lower}, {p.tick_upper}]</Row>
         <Row label="价格">1 {sym0} ≈ {p.last_price0} {sym1}</Row>
         {cexInfo && (
-          <Row label={`CEX 对比 (${cexInfo.baseSymbol || "—"})`}>
+          <Row label={`币安报价 (${cexInfo.cexSymbol})`}>
+            <span>1 {cexInfo.baseSymbol || "—"} = {fmtFull(cexInfo.cexPrice)} {cexInfo.quote}</span>
+          </Row>
+        )}
+        {cexInfo && (
+          <Row label="DEX vs 币安">
             <span className={cexInfo.absDiff >= cexWarnThresh ? "text-warn font-semibold" : ""}>
               差 {pctSigned(cexInfo.diff)}
             </span>
-            <span className="ml-1 text-ink-soft">（{fmtCex(cexInfo.dexPrice)} vs 币安 {fmtCex(cexInfo.cexPrice)} {cexInfo.quote}）</span>
+            <span className="ml-1 text-ink-soft">（DEX {fmtFull(cexInfo.dexPrice)} / 币安 {fmtFull(cexInfo.cexPrice)}）</span>
           </Row>
         )}
 
@@ -472,11 +477,4 @@ function parseCexPrice(raw?: string): CexPricePayload | null {
 /** 带符号百分比，如 +2.30% / -1.50%。 */
 function pctSigned(x: number): string {
   return `${x >= 0 ? "+" : ""}${(x * 100).toFixed(2)}%`;
-}
-
-/** 价格展示：极小价格多保留有效位，普通价格 6 位小数。 */
-function fmtCex(n: number): string {
-  if (!Number.isFinite(n)) return "—";
-  if (n !== 0 && Math.abs(n) < 1) return n.toPrecision(6);
-  return n.toLocaleString("en-US", { maximumFractionDigits: 6 });
 }
