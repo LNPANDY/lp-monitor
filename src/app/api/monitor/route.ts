@@ -1,10 +1,12 @@
-import { tick, isRunning, lastSummary, currentCron, reschedule } from "@/lib/monitor/scheduler";
+import { tick, isRunning, lastSummary, currentCron, reschedule, ensureScheduler } from "@/lib/monitor/scheduler";
 import { ok, fail, getBody } from "@/lib/api";
 
 export const dynamic = "force-dynamic";
 
 /** 返回当前调度状态与上次扫描摘要。 */
 export async function GET() {
+  // 自愈：万一 instrumentation 没跑或进程回收导致 scheduler 丢了，访问监控页时重建
+  ensureScheduler();
   return ok({
     running: isRunning(),
     cron: currentCron(),

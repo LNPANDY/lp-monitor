@@ -30,6 +30,23 @@ export function startScheduler() {
 }
 
 /**
+ * 自愈：确保 scheduler 处于运行态。
+ *
+ * 背景：cron 任务存在进程内存里。Next.js 生产模式下进程可能被回收/重启，
+ * 或 instrumentation hook 因配置问题未执行，导致内存里的 _scheduled 丢失，
+ * 表现为「DB 里 scan_cron 还在，但就是不自动扫描」。
+ *
+ * 策略：在每次 /api/monitor 请求进来时调用一次，发现 _scheduled 为空就重建。
+ * 这样即使启动时 instrumentation 没跑，第一次访问监控页也能恢复定时扫描。
+ * 幂等：已运行时直接返回。
+ */
+export function ensureScheduler() {
+  if (_scheduled) return _scheduled;
+  console.warn("[scheduler] _scheduled missing, self-healing...");
+  return startScheduler();
+}
+
+/**
  * 用新的 cron 表达式重启调度器（运行时动态修改扫描频率）。
  * 写入 DB 后重建任务。表达式非法时抛错。
  */
