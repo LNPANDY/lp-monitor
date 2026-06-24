@@ -50,8 +50,8 @@ function IoSection() {
         const r = await fetch("/api/config", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(bundle) });
         const j = await r.json(); if (!j.ok) throw new Error(j.error);
         const d = j.data;
-        setMsg(`✅ 导入完成：链 +${d.chains.added}/~${d.chains.updated}，DEX +${d.dexes.added}/~${d.dexes.updated}，质押 +${d.staking.added}/~${d.staking.updated}，钱包 +${d.wallets.added}/~${d.wallets.updated}`);
-        mutate((k: string) => typeof k === "string" && (k.includes("/api/chains") || k.includes("/api/dexes") || k.includes("/api/staking") || k.includes("/api/wallets")), undefined, { revalidate: true });
+        setMsg(`✅ 导入完成：链 +${d.chains.added}/~${d.chains.updated}，DEX +${d.dexes.added}/~${d.dexes.updated}，质押 +${d.staking.added}/~${d.staking.updated}，钱包 +${d.wallets.added}/~${d.wallets.updated}，CEX +${d.cex_mappings.added}/~${d.cex_mappings.updated}`);
+        mutate((k: string) => typeof k === "string" && (k.includes("/api/chains") || k.includes("/api/dexes") || k.includes("/api/staking") || k.includes("/api/wallets") || k.includes("/api/cex-mapping")), undefined, { revalidate: true });
       } catch (e: any) { setMsg(`❌ 导入失败：${e.message}`); }
       finally { setBusy(false); }
     };
@@ -61,7 +61,7 @@ function IoSection() {
   return (
     <section className="card p-5">
       <h2 className="mb-1 text-base font-semibold">配置导入 / 导出</h2>
-      <p className="mb-3 text-xs text-ink-soft">把链、DEX、质押合约、监控钱包打包成 JSON 文件，方便多机部署、备份。导入时按唯一键 upsert，重复导入安全。</p>
+      <p className="mb-3 text-xs text-ink-soft">把链、DEX、质押合约、监控钱包、CEX 报价匹配打包成 JSON 文件，方便多机部署、备份。导入时按唯一键 upsert，重复导入安全。</p>
       <div className="flex flex-wrap items-center gap-3">
         <button className="btn-primary" onClick={doExport} disabled={busy}>导出配置</button>
         <label className="btn-ghost cursor-pointer">导入配置
@@ -365,7 +365,7 @@ function CexMappingSection() {
       <h2 className="mb-1 text-base font-semibold">CEX 报价匹配</h2>
       <p className="mb-3 text-xs text-ink-soft">
         为链上 token 配对币安交易对 symbol（如 W0G → <code>0GUSDT</code>、WETH → <code>ETHUSDT</code>），
-        或为稳定币设固定价（如 USDC.e 填固定价 <code>1</code>，计价币种填 <code>USDT</code>）。
+        或为稳定币设固定价（如 USDC.e 填固定价 <code>1</code>，计价币种填 <code>USDC</code>）。
         <strong>同一个 LP 的 token0、token1 都需映射，且映射到同一计价币种</strong>，
         系统据此算出 CEX 上的 token0/token1 汇率，与 DEX 池价对比，差价超阈值即告警。
         添加后点「测试报价」可验证。
@@ -385,8 +385,8 @@ function CexMappingSection() {
         )}
       </div>
       <div className="mb-3 grid grid-cols-2 gap-3 md:grid-cols-3">
-        <Field label="计价币种（如 USDT）">
-          <input className="input" value={form.quote} onChange={(e) => setForm({ ...form, quote: e.target.value })} placeholder="USDT" />
+        <Field label="计价币种（如 USDC）">
+          <input className="input" value={form.quote} onChange={(e) => setForm({ ...form, quote: e.target.value })} placeholder="USDC" />
         </Field>
         <label className="flex items-center gap-1 text-xs text-ink-soft">
           <input type="checkbox" checked={!!isFixed} onChange={(e) => setForm({ ...form, fixed_price: e.target.checked ? "1" : "" })} />

@@ -173,9 +173,12 @@ export async function runScan(): Promise<ScanSummary> {
           }
 
           // ===== CEX 价差判定 =====
-          // DEX 池价（token1/token0）按本链 token→CEX 映射换算成「token0 的 CEX 参考价」，
+          // DEX 池价（raw 单位 token1/token0）按本链 token→CEX 映射换算成「token0 的 CEX 参考价」，
           // 再与币安报价对比。仅当 token0 与 token1 中至少一个在 token_symbols 表里有映射、
           // 且映射出的币安报价本次能拉到时才计算；否则 cexPriceInfo 为 null（不对比、不告警）。
+          // decimals 取自 tokenMap（缺失兜底 18），用于把 raw 价换算成整币单位后再与 CEX 同口径对比。
+          const dec0 = tokenMap.get(r.token0.toLowerCase())?.decimals ?? 18;
+          const dec1 = tokenMap.get(r.token1.toLowerCase())?.decimals ?? 18;
           const cexPriceInfo = cexEnabled
             ? computeCexPriceDiff(
                 r.token0.toLowerCase(),
@@ -184,7 +187,9 @@ export async function runScan(): Promise<ScanSummary> {
                 cexQuoteByAddr,
                 cexThreshold,
                 sym0,
-                sym1
+                sym1,
+                dec0,
+                dec1
               )
             : null;
 
@@ -533,9 +538,9 @@ export interface CexPricePayload {
   token0CexSymbol: string; // 如 '0GUSDT'
   /** token1 的币安 symbol */
   token1CexSymbol: string; // 如 'ETHUSDT'
-  /** 两者共同的计价币种，如 'USDT'（用于做汇率换算） */
+  /** 展示用：两侧计价币种，如 'USDT' 或 'USDT/USDC'（不再参与汇率判定） */
   quote: string;
-  /** DEX 池价：1 token0 = dexRate token1（来自 r.status.price） */
+  /** DEX 池价：1 token0 = dexRate token1（整币单位，已按 decimals 换算） */
   dexRate: number;
   /** CEX 推算汇率：1 token0 = cexRate token1（= token0CexPrice / token1CexPrice） */
   cexRate: number;
@@ -549,13 +554,22 @@ export interface CexPricePayload {
  * 计算单仓位 token0/token1 在 DEX 与 CEX 之间的汇率差价。
  *
  * 核心逻辑（以 W0G/WETH 为例）：
- *   DEX 池价: 1 W0G = 0.00014678250 WETH          ← r.status.price（token1/token0）
+ *   DEX 池价: 1 W0G = 0.00014678250 WETH          ← r.status.price 经 decimals 换算后
  *   CEX 汇率: 1 0G  = 0.24 USDT, 1 ETH = 1652 USDT
  *            → 1 0G = 0.24/1652 = 0.0001452784504 ETH   ← 即 CEX 上的 0G/ETH 汇率
  *   对比: 0.00014678250 vs 0.0001452784504 的差价
  *
- * 因此要求 token0、token1 **都有币安映射，且映射到同一计价币种**（如都映射到 USDT），
- * 才能相除得到 CEX 汇率。任一缺失或计价币种不一致 → 返回 null（不对比、不告警）。
+ * 两个关键点：
+ *  1) decimals 换算：r.status.price = 1.0001^tick 是 **raw 单位** 的 token1/token0
+ *     （最小单位 wei 之间的比），而 CEX 报价是 **整币单位**。两者差 10^(dec1−dec0) 倍。
+ *     必须把 raw 价 × 10^(dec0−dec1) 换算成「1 整币 token0 = ? 整币 token1」，
+ *     才能与 CEX 汇率同口径对比。例：USDC.e(6dec)/SOL(9dec) 不换算会差 1000 倍。
+ *  2) quote 不强校验：用户手动配的映射即认可读数，token0/token1 的计价币种不同
+ *     （如 USDT vs USDC）也直接用 q0.price/q1.price 算汇率。这样既不误伤
+ *     USDT/USDC 这种两边都是稳定币的池子，也能让跨计价币种的对比（如
+ *     WBTC(USDT)↔W0G(USDC)）正常工作。
+ *
+ * 只要 token0、token1 都有映射且报价有效即可计算；任一缺失/非法 → 返回 null。
  *
  * 注意：CEX 报的是裸币种（如 0G），链上是 wrapped 版本（如 W0G），用户配置映射时
  * 假定 1:1 等价。这是该功能成立的前提，模块不做地址↔币种的自动猜测。
@@ -563,21 +577,26 @@ export interface CexPricePayload {
 function computeCexPriceDiff(
   token0Lower: string,
   token1Lower: string,
-  dexRateStr: string, // r.status.price: 1 token0 = ? token1
+  dexRateStr: string, // r.status.price: raw 单位的 token1/token0（1.0001^tick）
   quoteByAddr: Map<string, CexQuote>,
   threshold: number,
   sym0: string,
-  sym1: string
+  sym1: string,
+  dec0: number, // token0 decimals，raw→整币换算用
+  dec1: number // token1 decimals，raw→整币换算用
 ): CexPriceInfo | null {
-  const dexRate = Number(dexRateStr); // 1 token0 = dexRate token1
+  const rawRate = Number(dexRateStr); // raw: 1 raw-token0 = rawRate raw-token1
   const q0 = quoteByAddr.get(token0Lower);
   const q1 = quoteByAddr.get(token1Lower);
 
-  // 必须两边都有报价，且计价币种一致，才能相除得到 token0/token1 汇率
-  if (!q0 || !q1 || !Number.isFinite(dexRate) || dexRate <= 0) return null;
-  if (q0.quote !== q1.quote || q1.price <= 0) return null;
+  // 两边都必须有报价、raw 价合法
+  if (!q0 || !q1 || !Number.isFinite(rawRate) || rawRate <= 0 || q1.price <= 0) return null;
 
-  // CEX 上 1 token0 = (q0.price / q1.price) 个 token1
+  // decimals 换算：1 整币 token0 = rawRate × 10^(dec0−dec1) 整币 token1
+  const dexRate = rawRate * Math.pow(10, dec0 - dec1);
+  if (!Number.isFinite(dexRate) || dexRate <= 0) return null;
+
+  // CEX 上 1 token0 = (q0.price / q1.price) 个 token1（整币单位，天然同口径）
   // 例：0G=0.24 USDT, ETH=1652 USDT → 1 0G = 0.24/1652 ETH
   const cexRate = q0.price / q1.price;
   if (!Number.isFinite(cexRate) || cexRate <= 0) return null;
@@ -585,11 +604,14 @@ function computeCexPriceDiff(
   const diff = (dexRate - cexRate) / cexRate;
   const absDiff = Math.abs(diff);
 
+  // quote 仅展示用：两侧计价币种相同时取其一，不同时拼成 'USDT/USDC'
+  const quote = q0.quote === q1.quote ? q0.quote || "USD" : `${q0.quote}/${q1.quote}`;
+
   const payload: CexPricePayload = {
     pairLabel: `${sym0}/${sym1}`,
     token0CexSymbol: q0.symbol,
     token1CexSymbol: q1.symbol,
-    quote: q0.quote,
+    quote,
     dexRate,
     cexRate,
     diff,
