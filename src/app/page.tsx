@@ -2,6 +2,8 @@
 import { useState } from "react";
 import useSWR from "swr";
 import { fetcher, short, timeAgo, fmtFull } from "@/components/util";
+import { LiquidityButton } from "@/components/liquidity-button";
+import { LiquidityProbe } from "@/components/liquidity-probe";
 
 interface Position {
   id: number;
@@ -83,6 +85,9 @@ export default function DashboardPage() {
 
       {/* 告警阈值设置 */}
       <AlertThreshold />
+
+      {/* 流动性探针（场景C + 收藏） */}
+      <LiquidityProbe />
 
       {/* 越界告警区（如有） */}
       {outOfRange.length > 0 && (
@@ -431,6 +436,8 @@ function PositionCard({ p, highlight, closed }: { p: Position; highlight?: boole
           <a className="btn-ghost" href={`${explorer}/token/${p.dex_display_name ? "" : ""}`} target="_blank" rel="noreferrer" aria-disabled style={{ display: "none" }}>NFT</a>
         )}
       </div>
+
+      {!closed && <LiquidityButton positionId={p.id} staking={p.source === "staking"} />}
     </div>
   );
 }

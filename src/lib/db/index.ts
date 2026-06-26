@@ -160,6 +160,48 @@ function migrate(db: DB) {
       created_at    TEXT    NOT NULL DEFAULT (datetime('now')),
       UNIQUE(chain_id_ref, token_addr)
     );
+
+    -- 流动性快照缓存：手动触发「流动性分析」时写入，10 天过期，避免重复打 RPC
+    CREATE TABLE IF NOT EXISTS liquidity_snapshots (
+      id              INTEGER PRIMARY KEY AUTOINCREMENT,
+      position_id     INTEGER REFERENCES positions(id) ON DELETE CASCADE,  -- 功能1用（可为空）
+      chain_id_ref    INTEGER NOT NULL REFERENCES chains(id) ON DELETE CASCADE,
+      pool_addr       TEXT    NOT NULL DEFAULT '',
+      staker_addr     TEXT    NOT NULL DEFAULT '',     -- 场景B/probe 用
+      token0_symbol   TEXT    NOT NULL DEFAULT '',
+      token1_symbol   TEXT    NOT NULL DEFAULT '',
+      total_token0    TEXT    NOT NULL DEFAULT '',     -- 区间内总流动性 token0 数量（可读字符串）
+      total_token1    TEXT    NOT NULL DEFAULT '',
+      mine_token0     TEXT    NOT NULL DEFAULT '',     -- 你自己的（场景A）
+      mine_token1     TEXT    NOT NULL DEFAULT '',
+      share           REAL    NOT NULL DEFAULT 0,      -- 你的占比 0~1
+      price_low       TEXT    NOT NULL DEFAULT '',
+      price_high      TEXT    NOT NULL DEFAULT '',
+      price_label     TEXT    NOT NULL DEFAULT '',
+      tick_lower      INTEGER NOT NULL DEFAULT 0,
+      tick_upper      INTEGER NOT NULL DEFAULT 0,
+      current_tick    INTEGER NOT NULL DEFAULT 0,
+      position_count  INTEGER NOT NULL DEFAULT 0,
+      payload         TEXT    NOT NULL DEFAULT '',     -- 完整 JSON 结果，前端直接渲染
+      sampled_at      TEXT    NOT NULL DEFAULT '',
+      expires_at      TEXT    NOT NULL DEFAULT ''      -- sampled_at + 10天
+    );
+    CREATE INDEX IF NOT EXISTS idx_liq_snap_pos ON liquidity_snapshots(position_id);
+    CREATE INDEX IF NOT EXISTS idx_liq_snap_pool ON liquidity_snapshots(chain_id_ref, pool_addr, staker_addr);
+
+    -- 流动性探针收藏：用户把常用的 chain+pool+staker 组合存下来，方便一键查询。
+    CREATE TABLE IF NOT EXISTS liquidity_favorites (
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      chain_id_ref  INTEGER NOT NULL REFERENCES chains(id) ON DELETE CASCADE,
+      label         TEXT    NOT NULL DEFAULT '',   -- 自定义备注，如 '0G/WETH 0.3% 主池'
+      pool_addr     TEXT    NOT NULL,             -- V3 池子地址（小写）
+      staker_addr   TEXT    NOT NULL DEFAULT '',  -- 可选 vault/质押地址（小写）
+      npm_addr      TEXT    NOT NULL DEFAULT '',  -- 可选 NPM 地址（留空则按链取第一个 v3-fork）
+      sort_order    INTEGER NOT NULL DEFAULT 0,   -- 排序权重，越大越靠前
+      created_at    TEXT    NOT NULL DEFAULT (datetime('now')),
+      UNIQUE(chain_id_ref, pool_addr, staker_addr)
+    );
+    CREATE INDEX IF NOT EXISTS idx_liq_fav_chain ON liquidity_favorites(chain_id_ref);
   `);
 
   // 兼容已有数据库：新增列用 ADD COLUMN（忽略已存在的错误）
