@@ -215,19 +215,23 @@ export async function analyzeDirect(
 // ==================== 场景 B：已质押 ====================
 
 /**
- * 场景B：枚举 vault 在 NPM 上持有的全部 LP，筛同池子（token0+token1+fee）累加流动性。
+ * 场景B：枚举 vault 在 NPM 上持有的全部 LP，筛同池子（token0+token1+fee）且 tick 区间覆盖
+ * 目标窗口的 LP，累加流动性。
  *
  * 策略（已验证可行）：
  *   1. vault 合约持有 LP NFT（NFT 的 owner 是 vault）
  *   2. NPM.balanceOf(vault) + NPM.tokenOfOwnerByIndex(vault, i) 枚举全部 tokenId
  *   3. 逐个 NPM.positions(tokenId) 取 token0/token1/fee/liquidity/tick
- *   4. 筛同池子的（positions 返回的 token0/token1 已排序，同池子必然一致）
- *   5. 累加 liquidity，用 getAmountsForLiquidity 换算 token0/token1
+ *   4. 筛同池子（positions 返回的 token0/token1 已排序，同池子必然一致）
+ *   5. 再筛 tick 区间覆盖目标窗口 [tickLower, tickUpper] 的（L 是针对各自区间定义的，
+ *      跨区间不可相加——见下文累加处注释）
+ *   6. 累加 liquidity，用 getAmountsForLiquidity 换算 token0/token1
  *
  * @param npm            NFT Position Manager 地址
  * @param vault          质押合约（vault）地址，作为 NFT 的 owner
  * @param pool           目标池子地址
  * @param decimals0/1    token 精度
+ * @param tickLower/Upper 目标 tick 窗口（用于覆盖判定）
  * @param myLiquidity    你自己的流动性（用于算占比，可为 0n）
  */
 export async function analyzeStaked(
@@ -254,9 +258,15 @@ export async function analyzeStaked(
   const poolInfo = await readPoolInfo(client, pool);
   const poolKey = `${poolInfo.token0.toLowerCase()}-${poolInfo.token1.toLowerCase()}-${poolInfo.fee}`;
 
-  // 逐个读 positions，筛同池子，累加 liquidity
-  // 注意：不能 Promise.all 全部并发——viem multicall 会把它们合并成一个巨型 eth_call
-  // 超出节点上限而挂起。用 mapWithConcurrency 控制同时进行的 RPC 数。
+  // 逐个读 positions，筛同池子 + tick 区间覆盖目标窗口，再累加 liquidity。
+  // 注意1：不能 Promise.all 全部并发——viem multicall 会把它们合并成一个巨型 eth_call
+  //        超出节点上限而挂起。用 mapWithConcurrency 控制同时进行的 RPC 数。
+  // 注意2：必须同时按 tick 区间过滤。LP 的 liquidity L 是针对「其自身的 tick 区间」定义的，
+  //        不同区间的 L 不可直接相加。例如同一池子里 tick 相距甚远的宽区间 LP，其 L 可能
+  //        高达 1e33，但它在你目标窗口内的活跃流动性近乎 0；若不过滤就会把这种巨型 L
+  //        累加进来，导致 total 被 ~1e14 放大、share 归零（精度完全失真）。
+  //        正确语义：只累加 tick 区间「覆盖目标窗口」的 LP（与 POOL.liquidity() 语义一致，
+  //        即活跃流动性贯穿你所在区间），与场景C probeMinRange 的判定保持统一。
   let aggregatedLiquidity = 0n;
   let matchedCount = 0;
   await mapWithConcurrency(tokenIds, 8, async (tokenId) => {
@@ -264,6 +274,8 @@ export async function analyzeStaked(
     if (!meta || meta.liquidity === 0n) return;
     const lpPoolKey = `${meta.token0.toLowerCase()}-${meta.token1.toLowerCase()}-${meta.fee}`;
     if (lpPoolKey !== poolKey) return;
+    // tick 区间必须完整覆盖目标窗口 [tickLower, tickUpper]，L 才在窗口内有效
+    if (meta.tickLower > tickLower || meta.tickUpper < tickUpper) return;
     aggregatedLiquidity += meta.liquidity;
     matchedCount++;
   });
