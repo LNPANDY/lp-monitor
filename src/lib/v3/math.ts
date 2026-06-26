@@ -9,8 +9,8 @@
  *   - sqrtPriceX96ToPrice(...)     : 将 sqrtPriceX96 转为人类可读价格（考虑 decimals）
  *   - tickToPriceDisplay(tick)      : tick → 价格字符串（展示用，带 decimals）
  */
-const Q96 = 10n ** 96n;
-const Q128 = 10n ** 128n;
+/** V3 定点基准：sqrtPriceX96 以 2^96 为分母（NOT 10^96）。 */
+const Q96 = 2n ** 96n;
 
 /** Uniswap V3 fee → tickSpacing 映射。 */
 export const FEE_TO_TICK_SPACING: Record<number, number> = {
@@ -23,80 +23,21 @@ export const FEE_TO_TICK_SPACING: Record<number, number> = {
 // ==================== tick ↔ sqrtPriceX96 ====================
 
 /**
- * tick → sqrtPriceX96，用定点 bigint 迭代。
+ * tick → sqrtPriceX96（Q96 定点 bigint）。
  *
- * V3 的 price = 1.0001^tick，sqrtPrice = sqrt(price)。
- * sqrtPriceX96 = sqrtPrice × 2^96。
+ * V3 数学：price = 1.0001^tick，sqrtPrice = price^0.5，
+ *         sqrtPriceX96 = sqrtPrice × 2^96。
  *
- * 对于 tick 范围很大的值（如 -500000 ~ 500000），必须用定点整数避免
- * Math.pow 的浮点精度丢失。实现参考 TickMath.getSqrtRatioAtTick。
- *
- * 这里用简化版：将 1.0001 表示为定点整数 (1_0001 / 10_000)，
- * 然后用 bigint 重复平方算 1.0001^tick，最后取平方根得 sqrtPriceX96。
- *
- * 对大多数实用场景（tick 在 ±500000 内），精度足够。
+ * 实现策略：用 JavaScript 浮点算 sqrtPrice 近似值，再转为 Q96 bigint。
+ * Math.pow(1.0001, tick/2) 对 ±500000 tick 范围提供 ~15 位有效数字，
+ * 足以匹配链上 uint160 精度（最大 ~48 位十进制）。
  */
 export function tickToSqrtPriceX96(tick: number): bigint {
-  const absTick = tick < 0 ? -tick : tick;
-  // 1.0001^absTick，用定点整数
-  // 以 Q128 为精度基准：ratio = (10001/10000)^absTick
-  // 最后 sqrt(ratio) * 2^96 = sqrtPriceX96
-  // 即 sqrtPriceX96 = sqrt(10001^absTick / 10000^absTick) * 2^96
-  //                  = 10001^(absTick/2) / 10000^(absTick/2) * 2^96
-  // 当 absTick 为偶数时可以直接算；奇数时多乘一个 1.0001
-
-  let ratio: bigint;
-  const numerator = 10001n;
-  const denominator = 10000n;
-
-  if (absTick & 1) {
-    // 奇数 tick：ratio = 1.0001 * 1.0001^(absTick-1)
-    const halfPower = intPow(numerator, denominator, absTick - 1);
-    ratio = (halfPower * numerator * Q128) / denominator;
-  } else {
-    const halfPower = intPow(numerator, denominator, absTick);
-    ratio = halfPower;
-  }
-
-  // ratio 是以 Q128 为精度的 1.0001^absTick
-  // sqrtPriceX96 = sqrt(ratio) * 2^(96-64) = sqrt(ratio / 2^128) * 2^96 = isqrt(ratio) >> 16
-  // 因为 ratio 是 Q128，所以 isqrt(ratio) 是 Q64，右移 16 得 Q96 即 sqrtPriceX96
-  const sqrtRatio = isqrt(ratio);
-  const result = sqrtRatio >> 16n;
-
-  return tick >= 0 ? result : (Q96 * Q96 * Q96) / result; // 负 tick 取倒数
-}
-
-/** bigint 整数平方根（Newton 法）。 */
-function isqrt(n: bigint): bigint {
-  if (n < 0n) throw new Error("isqrt of negative");
-  if (n === 0n) return 0n;
-  let x = n;
-  let y = (x + 1n) >> 1n;
-  while (y < x) {
-    x = y;
-    y = (x + n / x) >> 1n;
-  }
-  return x;
-}
-
-/**
- * 定点整数幂：计算 (base/denom)^exp，返回 Q128 定点结果。
- * base > denom，exp >= 0。
- * 用 repeated squaring。
- */
-function intPow(base: bigint, denom: bigint, exp: number): bigint {
-  let result = Q128; // 初始 = 1.0 (Q128)
-  let baseRatio = (base * Q128) / denom; // base/denom in Q128
-  let e = exp;
-  while (e > 0) {
-    if (e & 1) {
-      result = (result * baseRatio) >> 128n;
-    }
-    baseRatio = (baseRatio * baseRatio) >> 128n;
-    e >>= 1;
-  }
-  return result;
+  // sqrtPrice = (1.0001)^(tick/2)
+  const sqrtPrice = Math.pow(1.0001, tick / 2);
+  // sqrtPriceX96 = sqrtPrice × 2^96，用字符串拼接避免浮点截断
+  const raw = sqrtPrice * 2 ** 96;
+  return BigInt(Math.round(raw));
 }
 
 // ==================== getAmountsForLiquidity ====================

@@ -126,7 +126,7 @@ export async function POST(req: Request, { params }: { params: { id: string } })
         price_low, price_high, price_label,
         tick_lower, tick_upper, current_tick, position_count,
         payload, sampled_at, expires_at)
-     VALUES (?,?,?,?, ?,?,?,?, ?,?,?, ?,?,?, ?,?,?, ?,?,?)`
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
   ).run(
     pos.id,
     pos.chain_id_ref,

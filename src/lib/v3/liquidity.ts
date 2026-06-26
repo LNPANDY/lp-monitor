@@ -72,6 +72,30 @@ export interface LiquidityResult {
 
 // ==================== 读取链上数据 ====================
 
+/**
+ * 受控并发地映射数组。viem 的 multicall 批处理会把同一批次多个 readContract 合并成
+ * 一个 eth_call；若对上百个 tokenId 一次性 Promise.all，会产生一个超大 payload 的
+ * multicall，超出节点 gas/size 上限 → 挂起或报错 → API 502/空响应。
+ * 这里限制同时进行的 RPC 读数量，避免触发巨型 multicall。
+ */
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  limit: number,
+  fn: (item: T, index: number) => Promise<R>
+): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let cursor = 0;
+  async function worker() {
+    while (cursor < items.length) {
+      const i = cursor++;
+      results[i] = await fn(items[i], i);
+    }
+  }
+  const workers = Array.from({ length: Math.min(limit, items.length) }, () => worker());
+  await Promise.all(workers);
+  return results;
+}
+
 /** 读取 pool 的 slot0（sqrtPriceX96 + tick）和当前流动性 L。 */
 async function readPoolState(client: PublicClient, pool: `0x${string}`) {
   const [slot0, liquidity] = await Promise.all([
@@ -231,18 +255,18 @@ export async function analyzeStaked(
   const poolKey = `${poolInfo.token0.toLowerCase()}-${poolInfo.token1.toLowerCase()}-${poolInfo.fee}`;
 
   // 逐个读 positions，筛同池子，累加 liquidity
+  // 注意：不能 Promise.all 全部并发——viem multicall 会把它们合并成一个巨型 eth_call
+  // 超出节点上限而挂起。用 mapWithConcurrency 控制同时进行的 RPC 数。
   let aggregatedLiquidity = 0n;
   let matchedCount = 0;
-  await Promise.all(
-    tokenIds.map(async (tokenId) => {
-      const meta = await readPositionMeta(client, npm, tokenId);
-      if (!meta || meta.liquidity === 0n) return;
-      const lpPoolKey = `${meta.token0.toLowerCase()}-${meta.token1.toLowerCase()}-${meta.fee}`;
-      if (lpPoolKey !== poolKey) return;
-      aggregatedLiquidity += meta.liquidity;
-      matchedCount++;
-    })
-  );
+  await mapWithConcurrency(tokenIds, 8, async (tokenId) => {
+    const meta = await readPositionMeta(client, npm, tokenId);
+    if (!meta || meta.liquidity === 0n) return;
+    const lpPoolKey = `${meta.token0.toLowerCase()}-${meta.token1.toLowerCase()}-${meta.fee}`;
+    if (lpPoolKey !== poolKey) return;
+    aggregatedLiquidity += meta.liquidity;
+    matchedCount++;
+  });
 
   const total = getAmountsForLiquidity(sqrtPriceX96, sqrtA, sqrtB, aggregatedLiquidity, decimals0, decimals1);
   const mine = getAmountsForLiquidity(sqrtPriceX96, sqrtA, sqrtB, myLiquidity, decimals0, decimals1);
@@ -322,18 +346,16 @@ export async function probeMinRange(
     const tokenIds = await enumerateOwnedTokenIds(client, npm, stakerAddr);
     const poolKey = `${info.token0.toLowerCase()}-${info.token1.toLowerCase()}-${info.fee}`;
     let agg = 0n;
-    await Promise.all(
-      tokenIds.map(async (tokenId) => {
-        const meta = await readPositionMeta(client, npm, tokenId);
-        if (!meta || meta.liquidity === 0n) return;
-        const lpPoolKey = `${meta.token0.toLowerCase()}-${meta.token1.toLowerCase()}-${meta.fee}`;
-        if (lpPoolKey !== poolKey) return;
-        // 只统计落在该最小窗口内的（tick 范围被当前最小窗口完全包含）
-        if (meta.tickLower <= tickLower && meta.tickUpper >= tickUpper) {
-          agg += meta.liquidity;
-        }
-      })
-    );
+    await mapWithConcurrency(tokenIds, 8, async (tokenId) => {
+      const meta = await readPositionMeta(client, npm, tokenId);
+      if (!meta || meta.liquidity === 0n) return;
+      const lpPoolKey = `${meta.token0.toLowerCase()}-${meta.token1.toLowerCase()}-${meta.fee}`;
+      if (lpPoolKey !== poolKey) return;
+      // 只统计落在该最小窗口内的（tick 范围被当前最小窗口完全包含）
+      if (meta.tickLower <= tickLower && meta.tickUpper >= tickUpper) {
+        agg += meta.liquidity;
+      }
+    });
     if (agg > 0n) effectiveLiquidity = agg;
   }
 
