@@ -37,6 +37,7 @@ interface ProbeBody {
  *   5. 写缓存，返回结果
  */
 export async function POST(req: Request) {
+  try {
   const b = await getBody<ProbeBody>(req);
   if (!b.chainId) return fail("缺少 chainId");
   if (!b.pool) return fail("缺少 pool 地址");
@@ -126,7 +127,7 @@ export async function POST(req: Request) {
         price_low, price_high, price_label,
         tick_lower, tick_upper, current_tick, position_count,
         payload, sampled_at, expires_at)
-     VALUES (NULL,?,?,?,?, ?,?, '','','','',
+     VALUES (NULL,?,?,?,?, ?,?, ?,?, ?,?,
              ?,?,?, ?,?,?,?,
              ?,?,?)`
   ).run(
@@ -135,6 +136,11 @@ export async function POST(req: Request) {
     staker,
     sym0,
     sym1,
+    result.liquidity.amount0,
+    result.liquidity.amount1,
+    '', // mine_token0 (探针场景为空)
+    '', // mine_token1 (探针场景为空)
+    0,  // share (探针场景为0)
     result.priceLow,
     result.priceHigh,
     result.priceLabel,
@@ -148,4 +154,8 @@ export async function POST(req: Request) {
   );
 
   return ok({ ...result, cached: false });
+  } catch (e) {
+    console.error("[liquidity-probe] UNCAUGHT:", e);
+    return fail(`未捕获异常：${(e as Error).message}`, 500);
+  }
 }

@@ -80,11 +80,8 @@ export default function DashboardPage() {
         </div>
       </div>
 
-      {/* 扫描频率设置 */}
-      <ScanInterval currentCron={mon?.cron ?? ""} onChanged={() => reloadMon()} />
-
-      {/* 告警阈值设置 */}
-      <AlertThreshold />
+      {/* 扫描频率和告警阈值设置 */}
+      <ScanIntervalAndAlerts currentCron={mon?.cron ?? ""} onChanged={() => reloadMon()} />
 
       {/* 流动性探针（场景C + 收藏） */}
       <LiquidityProbe />
@@ -148,75 +145,32 @@ function Stat({ label, value, danger }: { label: string; value: number; danger?:
   );
 }
 
-function ScanInterval({ currentCron, onChanged }: { currentCron: string; onChanged: () => void }) {
+function ScanIntervalAndAlerts({ currentCron, onChanged }: { currentCron: string; onChanged: () => void }) {
   const [preset, setPreset] = useState("");
-  const [custom, setCustom] = useState("");
   const [msg, setMsg] = useState("");
   const [busy, setBusy] = useState(false);
+  const { data: alertData, mutate: mutateAlerts } = useSWR<any>("/api/alert-settings", fetcher);
+  const [tickThreshold, setTickThreshold] = useState("");
+  const [cexThreshold, setCexThreshold] = useState("");
 
   // 从 cron 反推分钟数用于默认显示
   const m = currentCron.match(/^\*\/(\d+) \* \* \* \*$/);
   const curMin = m ? Number(m[1]) : 0;
 
-  async function apply(intervalMin?: number, cron?: string) {
+  async function applyScanInterval(intervalMin: number) {
     setBusy(true); setMsg("");
     try {
-      const body = cron ? { cron } : { intervalMin };
+      const body = { intervalMin };
       const r = await fetch("/api/monitor", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
       const j = await r.json();
       if (!j.ok) throw new Error(j.error);
-      setMsg(`✅ 已更新扫描频率：${j.data.cron}`);
-      setPreset(""); setCustom("");
+      setMsg(`✅ 已更新扫描频率`);
+      setPreset("");
       onChanged();
     } catch (e: any) {
       setMsg(`❌ ${e.message}`);
     } finally { setBusy(false); }
   }
-
-  return (
-    <div className="card flex flex-wrap items-center gap-3 p-4">
-      <div className="text-sm font-medium">扫描频率：</div>
-      <div className="text-sm text-ink-soft">当前 {currentCron || "—"} {curMin > 0 && <span className="tag-muted ml-1">约每 {curMin} 分钟</span>}</div>
-      <div className="ml-auto flex flex-wrap items-center gap-2">
-        <select
-          className="input max-w-[140px]"
-          value={preset}
-          onChange={(e) => setPreset(e.target.value)}
-        >
-          <option value="">常用预设…</option>
-          <option value="1">每 1 分钟</option>
-          <option value="2">每 2 分钟</option>
-          <option value="3">每 3 分钟</option>
-          <option value="5">每 5 分钟</option>
-          <option value="10">每 10 分钟</option>
-          <option value="15">每 15 分钟</option>
-          <option value="30">每 30 分钟</option>
-          <option value="60">每 1 小时</option>
-        </select>
-        <button className="btn-ghost text-xs" disabled={!preset || busy} onClick={() => apply(Number(preset))}>应用预设</button>
-
-        <span className="mx-1 text-ink-soft">|</span>
-
-        <input
-          className="input max-w-[200px]"
-          value={custom}
-          onChange={(e) => setCustom(e.target.value)}
-          placeholder="自定义 cron，如 */7 * * * *"
-        />
-        <button className="btn-ghost text-xs" disabled={!custom || busy} onClick={() => apply(undefined, custom)}>应用自定义</button>
-      </div>
-      {busy && <span className="text-xs text-ink-soft">处理中…</span>}
-      {msg && <span className="text-xs">{msg}</span>}
-    </div>
-  );
-}
-
-function AlertThreshold() {
-  const { data, mutate } = useSWR<any>("/api/alert-settings", fetcher);
-  const [tickThreshold, setTickThreshold] = useState("");
-  const [cexThreshold, setCexThreshold] = useState("");
-  const [msg, setMsg] = useState("");
-  const [busy, setBusy] = useState(false);
 
   async function toggleTick() {
     setBusy(true); setMsg("");
@@ -224,11 +178,11 @@ function AlertThreshold() {
       const r = await fetch("/api/alert-settings", {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ tick_move_enabled: data?.tick_move_enabled ? "0" : "1" }),
+        body: JSON.stringify({ tick_move_enabled: alertData?.tick_move_enabled ? "0" : "1" }),
       });
       const j = await r.json();
       if (!j.ok) throw new Error(j.error);
-      mutate();
+      mutateAlerts();
     } catch (e: any) {
       setMsg(`❌ ${e.message}`);
     } finally { setBusy(false); }
@@ -240,15 +194,15 @@ function AlertThreshold() {
       const r = await fetch("/api/alert-settings", {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ cex_price_enabled: data?.cex_price_enabled ? "0" : "1" }),
+        body: JSON.stringify({ cex_price_enabled: alertData?.cex_price_enabled ? "0" : "1" }),
       });
       const j = await r.json();
       if (!j.ok) throw new Error(j.error);
-      mutate();
+      mutateAlerts();
     } catch (e: any) {
       setMsg(`❌ ${e.message}`);
     } finally { setBusy(false); }
-    }
+  }
 
   async function applyThreshold() {
     setBusy(true); setMsg("");
@@ -265,7 +219,7 @@ function AlertThreshold() {
       if (!j.ok) throw new Error(j.error);
       setMsg("✅ 阈值已更新");
       setTickThreshold(""); setCexThreshold("");
-      mutate();
+      mutateAlerts();
     } catch (e: any) {
       setMsg(`❌ ${e.message}`);
     } finally { setBusy(false); }
@@ -273,60 +227,91 @@ function AlertThreshold() {
 
   return (
     <div className="card p-4">
-      <div className="mb-2 text-sm font-medium">告警阈值</div>
-      <div className="flex flex-wrap items-center gap-4 text-sm">
-        {/* tick 波动开关 */}
-        <div className="flex items-center gap-2">
+      <div className="flex flex-wrap items-center gap-4">
+        {/* 扫描频率 */}
+        <div className="flex items-center gap-2 border-r border-slate-200 pr-4">
+          <span className="text-sm font-medium">扫描频率：</span>
+          <span className="text-sm text-ink-soft">
+            {currentCron || "—"} {curMin > 0 && <span className="tag-muted ml-1">约每 {curMin} 分钟</span>}
+          </span>
+          <select
+            className="input max-w-[120px] text-xs"
+            value={preset}
+            onChange={(e) => setPreset(e.target.value)}
+          >
+            <option value="">设置频率…</option>
+            <option value="1">每 1 分钟</option>
+            <option value="2">每 2 分钟</option>
+            <option value="3">每 3 分钟</option>
+            <option value="5">每 5 分钟</option>
+            <option value="10">每 10 分钟</option>
+            <option value="15">每 15 分钟</option>
+            <option value="30">每 30 分钟</option>
+            <option value="60">每 1 小时</option>
+          </select>
           <button
-            className={data?.tick_move_enabled ? "btn-primary text-xs" : "btn-ghost text-xs"}
+            className="btn-ghost text-xs"
+            disabled={!preset || busy}
+            onClick={() => applyScanInterval(Number(preset))}
+          >
+            应用
+          </button>
+        </div>
+
+        {/* 告警阈值 */}
+        <div className="flex items-center gap-2">
+          <span className="text-sm font-medium">告警阈值：</span>
+
+          {/* tick 波动开关 */}
+          <button
+            className={alertData?.tick_move_enabled ? "btn-primary text-xs" : "btn-ghost text-xs"}
             disabled={busy}
             onClick={toggleTick}
           >
-            {data?.tick_move_enabled ? "波动预警：开" : "波动预警：关"}
+            {alertData?.tick_move_enabled ? "波动预警：开" : "波动预警：关"}
           </button>
-          <span className="text-ink-soft">当前阈值 {data?.tick_move_threshold ?? 10}%</span>
-        </div>
+          <span className="text-xs text-ink-soft">阈值 {alertData?.tick_move_threshold ?? 10}%</span>
 
-        {/* CEX 对比开关 */}
-        <div className="flex items-center gap-2">
+          {/* CEX 对比开关 */}
           <button
-            className={data?.cex_price_enabled ? "btn-primary text-xs" : "btn-ghost text-xs"}
+            className={alertData?.cex_price_enabled ? "btn-primary text-xs" : "btn-ghost text-xs"}
             disabled={busy}
             onClick={toggleCex}
           >
-            {data?.cex_price_enabled ? "CEX 价差：开" : "CEX 价差：关"}
+            {alertData?.cex_price_enabled ? "CEX 价差：开" : "CEX 价差：关"}
           </button>
-          <span className="text-ink-soft">当前阈值 {data?.cex_price_threshold ?? 3}%</span>
+          <span className="text-xs text-ink-soft">阈值 {alertData?.cex_price_threshold ?? 3}%</span>
+
+          {/* 阈值设置 */}
+          <input
+            className="input max-w-[100px] text-xs"
+            type="number"
+            min={0}
+            max={100}
+            value={tickThreshold}
+            onChange={(e) => setTickThreshold(e.target.value)}
+            placeholder="波动阈值 %"
+          />
+          <input
+            className="input max-w-[100px] text-xs"
+            type="number"
+            min={0}
+            max={100}
+            value={cexThreshold}
+            onChange={(e) => setCexThreshold(e.target.value)}
+            placeholder="CEX 价差 %"
+          />
+          <button
+            className="btn-ghost text-xs"
+            disabled={busy || (tickThreshold === "" && cexThreshold === "")}
+            onClick={applyThreshold}
+          >
+            应用阈值
+          </button>
         </div>
-
-        <span className="mx-1 text-ink-soft">|</span>
-
-        <input
-          className="input max-w-[120px]"
-          type="number"
-          min={0}
-          max={100}
-          value={tickThreshold}
-          onChange={(e) => setTickThreshold(e.target.value)}
-          placeholder="波动阈值 %"
-        />
-        <input
-          className="input max-w-[120px]"
-          type="number"
-          min={0}
-          max={100}
-          value={cexThreshold}
-          onChange={(e) => setCexThreshold(e.target.value)}
-          placeholder="CEX 价差 %"
-        />
-        <button className="btn-ghost text-xs" disabled={busy || (tickThreshold === "" && cexThreshold === "")} onClick={applyThreshold}>
-          应用阈值
-        </button>
       </div>
-      {msg && <div className="mt-1 text-xs">{msg}</div>}
-      <div className="mt-1 text-xs text-ink-soft">
-        波动阈值：两次扫描间，仓位在区间内的相对位置变化超过该百分比就告警（如 75%→65% = 变动 10%）
-      </div>
+
+      {msg && <div className="mt-2 text-xs">{msg}</div>}
     </div>
   );
 }

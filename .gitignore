@@ -5,6 +5,10 @@ data/*.db
 data/*.db-journal
 data/*.db-shm
 data/*.db-wal
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
 .env.local
 .env*.local
 *.log

@@ -12,6 +12,9 @@ interface FavoriteRow {
   npm_addr: string;
   sort_order: number;
   created_at: string;
+  token0_symbol: string;
+  token1_symbol: string;
+  fee: number | null;
 }
 
 interface ChainInfo {
@@ -19,14 +22,27 @@ interface ChainInfo {
   name: string;
 }
 
-/** 列出所有收藏（带链名，按 sort_order 降序、created_at 降序）。 */
+/** 列出所有收藏（带链名，按 sort_order 降序、created_at 降序）。
+ *  额外关联最近一次快照的 token0/token1 symbol 与 fee，用于前端展示。 */
 export async function GET(req: Request) {
   const url = new URL(req.url);
   const chainId = url.searchParams.get("chain_id");
   const db = getDb();
-  let sql = `SELECT f.*, c.name AS chain_name
+  let sql = `SELECT f.*, c.name AS chain_name,
+                    ls.token0_symbol, ls.token1_symbol,
+                    json_extract(ls.payload, '$.fee') AS fee
              FROM liquidity_favorites f
              JOIN chains c ON c.id=f.chain_id_ref
+             LEFT JOIN (
+               SELECT chain_id_ref, pool_addr, staker_addr, token0_symbol, token1_symbol, payload
+               FROM liquidity_snapshots
+               WHERE id IN (
+                 SELECT MAX(id) FROM liquidity_snapshots
+                 GROUP BY chain_id_ref, pool_addr, staker_addr
+               )
+             ) ls ON ls.chain_id_ref=f.chain_id_ref
+                  AND ls.pool_addr=f.pool_addr
+                  AND ls.staker_addr=f.staker_addr
              WHERE 1=1`;
   const args: any[] = [];
   if (chainId) { sql += " AND f.chain_id_ref=?"; args.push(Number(chainId)); }
