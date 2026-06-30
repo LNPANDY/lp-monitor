@@ -17,7 +17,10 @@
    从钱包转入这些合约的 NFT 仓位仍归集到原钱包监控，并继续判断区间。
 7. **tick 波动预警**：两次扫描间仓位在区间内的相对位置变化超过阈值即告警（不依赖越界）。
 8. **CEX 价差预警**：为链上 token 配对币安交易对（如 0G → `0GUSDT`），扫描时拉币安实时报价
-   与 DEX 池价对比，价差超过阈值即告警，前端卡片实时展示对比。
+   与 DEX 池价对比，**价差超过该池子费率的 2 倍时告警**（如 1% fee 池阈值 2%、0.05% fee 池阈值 0.1%），前端卡片实时展示对比。
+9. **链上资产统计**：在仪表盘选择链 + 输入钱包地址，实时统计该钱包的 GAS 余额与 LP 仓位价值
+   （含直接持有与质押，按 CEX 报价折算成 USD），逐项展示资产明细与总价值；未配对报价的代币展示数量但不计价值。
+   GAS 原生代币（ETH/0G/BNB）无合约地址，在「CEX 报价匹配」中点「GAS 代币」快捷填入 `__native__` 即可为其配置报价。
 
 ## 快速开始（本地）
 
@@ -52,7 +55,7 @@ npm run dev
 | 渠道 | .env 变量 | 获取方式 |
 |---|---|---|
 | Telegram | `TELEGRAM_BOT_TOKEN`、`TELEGRAM_CHAT_ID` | [@BotFather](https://t.me/BotFather) 创建 Bot 拿 token；与 Bot 私聊后访问 `https://api.telegram.org/bot<TOKEN>/getUpdates` 取 chat_id |
-| Bark | `BARK_KEY`、（可选）`BARK_SERVER` | App Store 装 Bark，复制设备 key |
+| Bark | `BARK_KEY`、（可选）`BARK_SERVER` | App Store 装 Bark，复制设备 key；多设备用英文逗号分隔多个 key（如 `key1,key2`） |
 | Server酱 | `SERVERCHAN_KEY` | [sct.ftqq.com](https://sct.ftqq.com) 登录后获取 SCKEY |
 | 企业微信 | `WECOM_WEBHOOK_KEY` | 企业微信群 → 添加机器人 → 复制 webhook 中 `key=` 后的值 |
 
@@ -63,8 +66,10 @@ npm run dev
 - **从「越界」翻回「在区间内」** → 发送恢复通知。
 - **持续越界** → 每 `ALERT_COOLDOWN_MS`（默认 1 小时）重复提醒一次，避免漏报。
 - **tick 波动** → 两次扫描间区间内相对位置变化超阈值即告警（每次超阈值都发，无冷却）。
-- **CEX 价差** → DEX 池价与币安报价偏差超阈值即告警（每次超阈值都发，无冷却）。需先在配置页为 token 配对币安 symbol 并在仪表盘开启「CEX 价差」开关。
+- **CEX 价差** → DEX 池价与币安报价偏差超过**该池子费率的 2 倍**即告警（每次超阈值都发，无冷却）。阈值按各仓位 fee 自动计算（如 1% fee 池 → 2%，0.05% fee 池 → 0.1%），无需手动配置。需先在配置页为 token 配对币安 symbol 并在仪表盘开启「CEX 价差」开关。
 - 状态全部持久化在 SQLite，重启不丢。
+
+> **CEX 报价匹配补充**：ERC20 token 直接填合约地址；**GAS 原生代币**（ETH/0G/BNB）无合约地址，地址栏点「GAS 代币」填入 `__native__`，token 符号会自动取该链 symbol。资产统计与 CEX 价差都会用到 GAS 代币报价。
 
 ## 项目结构
 

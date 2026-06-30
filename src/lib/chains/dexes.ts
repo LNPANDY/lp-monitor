@@ -31,6 +31,7 @@ export interface StakingRow {
   pair_label: string;
   contract: string;
   read_type: string; // 'deposits_owner' | 'user_info_token'
+  dex_id: number | null;
   enabled: number;
 }
 

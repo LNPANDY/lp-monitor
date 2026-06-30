@@ -66,6 +66,7 @@ function migrate(db: DB) {
       read_type     TEXT    NOT NULL DEFAULT 'deposits_owner',
                       -- 'deposits_owner' : deposits(tokenId).owner
                       -- 'user_info_token' : userInfo/positions 映射，按合约自定义
+      dex_id        INTEGER REFERENCES dexes(id) ON DELETE SET NULL,
       enabled       INTEGER NOT NULL DEFAULT 1,
       created_at    TEXT    NOT NULL DEFAULT (datetime('now')),
       UNIQUE(chain_id_ref, contract)
@@ -104,7 +105,7 @@ function migrate(db: DB) {
       staking_id      INTEGER REFERENCES staking_contracts(id) ON DELETE SET NULL,
       last_current_tick INTEGER NOT NULL DEFAULT 0,
       last_in_range   INTEGER NOT NULL DEFAULT 1,   -- 1=在区间内 0=越界
-      last_price0     TEXT    NOT NULL DEFAULT '',  -- 由 tick 推算的价格（token1/token0），便于展示
+      last_price0     TEXT    NOT NULL DEFAULT '',  -- 整币单位价格（1 token0 = ? token1，已按 decimals 换算），便于展示
       last_liquidity  TEXT    NOT NULL DEFAULT '',  -- 当前 liquidity，0=已关闭
       last_checked_at TEXT    NOT NULL DEFAULT '',
       last_notified_at TEXT   NOT NULL DEFAULT '',  -- 上次告警时间，用于去重
@@ -156,6 +157,7 @@ function migrate(db: DB) {
       cex_symbol    TEXT    NOT NULL,               -- 币安交易对 symbol，如 '0GUSDT'；固定价时此字段仅用于确定计价币种
       fixed_price   REAL,                            -- 固定价（如 USDC.e 填 1，计价 USDT）。非空时走固定价
       quote         TEXT    NOT NULL DEFAULT '',    -- 计价币种，如 'USDT'。固定价时必填；走币安时从 cex_symbol 推导
+      inverted      INTEGER NOT NULL DEFAULT 0,     -- 翻转：1=取倒数（如币安只有 USDCUSDT，USDT token 配 USDCUSDT 并翻转）
       enabled       INTEGER NOT NULL DEFAULT 1,
       created_at    TEXT    NOT NULL DEFAULT (datetime('now')),
       UNIQUE(chain_id_ref, token_addr)
@@ -208,6 +210,8 @@ function migrate(db: DB) {
   safeAddColumn(db, "positions", "last_liquidity", "TEXT NOT NULL DEFAULT ''");
   safeAddColumn(db, "positions", "token0_symbol", "TEXT NOT NULL DEFAULT ''");
   safeAddColumn(db, "positions", "token1_symbol", "TEXT NOT NULL DEFAULT ''");
+  // pair_flip: 0=原始token0/token1, 1=用户翻转为token1/token0
+  safeAddColumn(db, "positions", "pair_flip", "INTEGER NOT NULL DEFAULT 0");
   // tick 波动预警：上次扫描时 tick 距区间边界的相对位置（百分比 0~1）
   safeAddColumn(db, "positions", "last_margin_lower", "REAL NOT NULL DEFAULT 0");
   safeAddColumn(db, "positions", "last_margin_upper", "REAL NOT NULL DEFAULT 0");
@@ -216,8 +220,30 @@ function migrate(db: DB) {
   // token_symbols 固定价支持：USDC.e 这类恒定价格 token（如 =1 USDT），不再查币安
   safeAddColumn(db, "token_symbols", "fixed_price", "REAL");
   safeAddColumn(db, "token_symbols", "quote", "TEXT NOT NULL DEFAULT ''");
+  // token_symbols 翻转支持：币安只有 USDCUSDT 没有 USDTUSDC，USDT token 配 USDCUSDT 并翻转取倒数
+  safeAddColumn(db, "token_symbols", "inverted", "INTEGER NOT NULL DEFAULT 0");
+  // staking_contracts 关联 DEX：合约直查时需要知道用哪个 DEX 的 NPM ABI
+  safeAddColumn(db, "staking_contracts", "dex_id", "INTEGER REFERENCES dexes(id) ON DELETE SET NULL");
 
   seedDefaults(db);
+}
+
+/** 初始化默认设置 */
+function seedDefaultSettings(db: DB) {
+  const defaultSettings = [
+    { key: "staking_scan_method", value: "transfer_scan" }, // 默认使用转账扫描方式
+    { key: "staking_scan_fallback_enabled", value: "true" }, // 启用兜底机制：转账扫描失败时尝试合约直查
+    { key: "staking_scan_contract_batch_size", value: "50" }, // 合约直查时的批量大小
+    { key: "staking_scan_concurrent_limit", value: "6" }, // 并发限制
+  ];
+  
+  for (const setting of defaultSettings) {
+    try {
+      db.prepare("INSERT OR IGNORE INTO app_settings (key, value) VALUES (?, ?)").run(setting.key, setting.value);
+    } catch {
+      // 设置已存在，忽略
+    }
+  }
 }
 
 /** 内置 Ethereum 主网作为默认链 + Uniswap V3 作为默认 DEX。用户可自行扩展。 */
@@ -241,6 +267,7 @@ function seedDefaults(db: DB) {
        VALUES (?, 'Uniswap V3', 'v3-fork', '0x1F98431c8aD98523631AE4a59f267346ea31F984', '0xC36442b4a4522E871399CD717aBDD847Ab11FE88', 1)`
     ).run(chainRow.id);
   }
+  seedDefaultSettings(db);
 }
 
 export function closeDb() {

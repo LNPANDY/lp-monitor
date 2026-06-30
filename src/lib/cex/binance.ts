@@ -32,6 +32,10 @@ export interface CexMapping {
   fixedPrice: number | null;
   /** 计价币种，如 'USDT'/'USDC'。固定价时必填；走币安时从 cex_symbol 推导（留空则自动切分） */
   quote: string;
+  /** 翻转：true 时对币安报价取倒数并交换 base/quote。
+   *  典型场景：币安只有 USDCUSDT（1 USDC = x USDT），而链上 token 是 USDT，
+   *  配 USDCUSDT 并翻转 → 1 USDT = 1/x USDC。 */
+  inverted: boolean;
 }
 
 /** 币安报价结果：1 base = price quote。 */
@@ -71,7 +75,7 @@ export function loadAllMappings(): Map<number, CexMapping[]> {
   const db = getDb();
   const rows = db
     .prepare(
-      `SELECT chain_id_ref, token_addr, cex_symbol, fixed_price, quote
+      `SELECT chain_id_ref, token_addr, cex_symbol, fixed_price, quote, inverted
        FROM token_symbols WHERE enabled=1`
     )
     .all() as {
@@ -80,6 +84,7 @@ export function loadAllMappings(): Map<number, CexMapping[]> {
       cex_symbol: string;
       fixed_price: number | null;
       quote: string;
+      inverted: number;
     }[];
   const out = new Map<number, CexMapping[]>();
   for (const r of rows) {
@@ -90,6 +95,7 @@ export function loadAllMappings(): Map<number, CexMapping[]> {
       cexSymbol: r.cex_symbol.toUpperCase(),
       fixedPrice: r.fixed_price !== null ? r.fixed_price : null,
       quote: (r.quote || "").toUpperCase(),
+      inverted: r.inverted === 1,
     });
     out.set(r.chain_id_ref, arr);
   }
@@ -152,7 +158,9 @@ export async function fetchQuote(symbol: string): Promise<CexQuote | null> {
 /**
  * 按一条链的映射构造 token_addr(小写) → CexQuote。
  * 固定价映射（fixedPrice 非空）直接构造报价，不查币安；币安映射批量去拉。
- * 用于扫描器：一次性拿到本链所有 token 的报价，无需区分固定/币安来源。
+ * 翻转映射（inverted=true）对拉到的报价取倒数并交换 base/quote：
+ *   原报价 1 USDC = 1.0001 USDT → 翻转后 1 USDT = 0.9999 USDC
+ * 用于扫描器：一次性拿到本链所有 token 的报价，无需区分固定/币安/翻转来源。
  */
 export async function buildQuotesByAddr(mappings: CexMapping[]): Promise<Map<string, CexQuote>> {
   const out = new Map<string, CexQuote>();
@@ -172,13 +180,24 @@ export async function buildQuotesByAddr(mappings: CexMapping[]): Promise<Map<str
       if (m.cexSymbol) binanceSymbols.add(m.cexSymbol);
     }
   }
-  // 2) 币安映射：批量拉价，回填到 byAddr
+  // 2) 币安映射：批量拉价，回填到 byAddr（翻转的取倒数）
   if (binanceSymbols.size > 0) {
     const fresh = await fetchQuotes([...binanceSymbols]);
     for (const m of mappings) {
       if (m.fixedPrice !== null) continue;
       const q = fresh.get(m.cexSymbol);
-      if (q) out.set(m.tokenAddr, q);
+      if (!q) continue;
+      if (m.inverted) {
+        // 翻转：原 1 base = price quote → 1 quote = 1/price base
+        out.set(m.tokenAddr, {
+          symbol: q.symbol,
+          price: 1 / q.price,
+          base: q.quote,
+          quote: q.base,
+        });
+      } else {
+        out.set(m.tokenAddr, q);
+      }
     }
   }
   return out;

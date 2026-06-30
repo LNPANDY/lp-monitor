@@ -42,9 +42,3 @@ export function isTickMoveEnabled(): boolean {
 export function isCexPriceEnabled(): boolean {
   return getSetting("cex_price_enabled", "0") === "1";
 }
-
-/** CEX 价差预警阈值：DEX 价 vs CEX 价 的百分比差超过该值即告警。默认 3。 */
-export function getCexPriceThreshold(): number {
-  const v = Number(getSetting("cex_price_threshold", ""));
-  return Number.isFinite(v) && v >= 0 ? v : 3;
-}

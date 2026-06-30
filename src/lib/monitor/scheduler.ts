@@ -13,7 +13,11 @@ export function currentCron(): string {
 
 /** 启动定时扫描。在 Next.js 服务端 instrumentation 或 dev ready 时调用，幂等。 */
 export function startScheduler() {
-  if (_scheduled) return _scheduled;
+  // 更严格的检查：防止重复启动
+  if (_scheduled) {
+    console.log("[scheduler] already running, skipping duplicate start");
+    return _scheduled;
+  }
   const expr = currentCron();
   if (!cron.validate(expr)) {
     console.warn(`[scheduler] invalid cron expression: ${expr}, fallback to */3 * * * *`);
@@ -41,9 +45,15 @@ export function startScheduler() {
  * 幂等：已运行时直接返回。
  */
 export function ensureScheduler() {
-  if (_scheduled) return _scheduled;
+  if (_scheduled) {
+    return _scheduled;
+  }
   console.warn("[scheduler] _scheduled missing, self-healing...");
-  return startScheduler();
+  const result = startScheduler();
+  if (!result) {
+    console.error("[scheduler] failed to start scheduler during self-healing");
+  }
+  return result;
 }
 
 /**

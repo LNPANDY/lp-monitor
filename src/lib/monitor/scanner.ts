@@ -17,13 +17,13 @@ import {
   getTickMoveThreshold,
   isTickMoveEnabled,
   isCexPriceEnabled,
-  getCexPriceThreshold,
 } from "../db/settings";
 import {
   findDirectPositions,
   findStakedPositions,
   type DiscoveredPosition,
 } from "../staking/discover";
+import { findStakedPositionsDirect } from "../staking/discover-direct";
 import { ownerOf } from "../adapters/v3-fork";
 import { notifyAll } from "../notify";
 import {
@@ -32,6 +32,7 @@ import {
   type CexMapping,
   type CexQuote,
 } from "../cex/binance";
+import { getStakingScanMethod, getStakingConcurrentLimit, getContractBatchSize, isStakingFallbackEnabled } from "../settings";
 
 export interface ScanSummary {
   wallets: number;
@@ -58,9 +59,8 @@ export async function runScan(): Promise<ScanSummary> {
   let alertsSent = 0;
   const db = getDb();
 
-  // CEX 对比开关 + 阈值：整次扫描共用一份。关闭时跳过所有报价拉取。
+  // CEX 对比开关：整次扫描共用一份。关闭时跳过所有报价拉取。
   const cexEnabled = isCexPriceEnabled();
-  const cexThreshold = getCexPriceThreshold() / 100; // 百分比 → 0~1
   // 所有链上的 token→CEX 映射（按 chain_id_ref 分组）。关闭时不需要加载。
   const cexMappingsByChain = cexEnabled ? loadAllMappings() : new Map<number, CexMapping[]>();
   // 报价缓存（本次扫描内复用）：(tokenAddrLower) → CexQuote
@@ -77,14 +77,68 @@ export async function runScan(): Promise<ScanSummary> {
       const dexes = listDexes(w.chain_id_ref, true);
       const staking = listStaking(w.chain_id_ref, true);
 
-      // 发现仓位：直接持有 + 质押溯源（转账扫描），合并去重
+      // 发现仓位：直接持有 + 质押溯源（根据配置选择方式）
       const direct = await findDirectPositions(client, w.address as `0x${string}`, dexes);
-      const staked = await findStakedPositions(
-        client,
-        w.address as `0x${string}`,
-        dexes,
-        staking
-      );
+      let staked: DiscoveredPosition[] = [];
+      
+      const scanMethod = getStakingScanMethod();
+      switch (scanMethod) {
+        case "transfer_scan":
+          staked = await findStakedPositions(
+            client,
+            w.address as `0x${string}`,
+            dexes,
+            staking
+          );
+          break;
+        case "contract_direct":
+          staked = await findStakedPositionsDirect(
+            client,
+            w.address as `0x${string}`,
+            dexes,
+            staking
+          );
+          break;
+        case "hybrid":
+        default:
+          // 先尝试转账扫描，如果失败或没有结果再尝试合约直查
+          try {
+            staked = await findStakedPositions(
+              client,
+              w.address as `0x${string}`,
+              dexes,
+              staking
+            );
+            
+            // 如果转账扫描结果很少，并且启用了兜底机制，补充合约直查
+            if (isStakingFallbackEnabled() && staked.length < 10) {
+              console.log(`转账扫描只发现 ${staked.length} 个仓位，启用兜底合约直查...`);
+              const directStaked = await findStakedPositionsDirect(
+                client,
+                w.address as `0x${string}`,
+                dexes,
+                staking
+              );
+              
+              // 合并结果，去重
+              const hybridStaked = dedupeDiscovered([...staked, ...directStaked]);
+              if (hybridStaked.length > staked.length) {
+                console.log(`兜底扫描额外发现 ${hybridStaked.length - staked.length} 个仓位`);
+                staked = hybridStaked;
+              }
+            }
+          } catch (error) {
+            console.warn('转账扫描失败，使用合约直查作为替代:', error);
+            staked = await findStakedPositionsDirect(
+              client,
+              w.address as `0x${string}`,
+              dexes,
+              staking
+            );
+          }
+          break;
+      }
+      
       const discovered = dedupeDiscovered([...direct, ...staked]);
 
       // 兜底恢复：库里有但本次未发现的仓位（尤其质押仓位：转账发生在扫描窗口外）。
@@ -179,13 +233,16 @@ export async function runScan(): Promise<ScanSummary> {
           // decimals 取自 tokenMap（缺失兜底 18），用于把 raw 价换算成整币单位后再与 CEX 同口径对比。
           const dec0 = tokenMap.get(r.token0.toLowerCase())?.decimals ?? 18;
           const dec1 = tokenMap.get(r.token1.toLowerCase())?.decimals ?? 18;
+          // 整币单位价格（1 token0 = ? token1，已按 decimals 换算）：供 last_price0 持久化 +
+          // 越界/波动告警文案共用，确保与 CEX 对比口径一致、可直接展示，不再误用 raw 单位。
+          const price0Human = rawToHumanPrice(r.status.price, dec0, dec1);
           const cexPriceInfo = cexEnabled
             ? computeCexPriceDiff(
                 r.token0.toLowerCase(),
                 r.token1.toLowerCase(),
                 r.status.price,
                 cexQuoteByAddr,
-                cexThreshold,
+                r.fee,
                 sym0,
                 sym1,
                 dec0,
@@ -193,19 +250,20 @@ export async function runScan(): Promise<ScanSummary> {
               )
             : null;
 
-          // upsert 仓位最新状态
+          // upsert 仓位最新状态（pair_flip 从 prev 保留，避免扫描覆盖用户翻转设置）
+          const prevPairFlip = prev?.pair_flip ?? 0;
           db.prepare(
             `INSERT INTO positions
               (wallet_id, chain_id_ref, dex_id, dex_name, token_id, token0, token1, token0_symbol, token1_symbol, fee, pool,
                tick_lower, tick_upper, source, staker_contract, staking_id,
                last_current_tick, last_in_range, last_price0, last_liquidity,
                last_margin_lower, last_margin_upper, last_cex_price,
-               last_checked_at, notify_state, last_notified_at)
+               last_checked_at, notify_state, last_notified_at, pair_flip)
              VALUES (@wallet_id,@chain_id_ref,@dex_id,@dex_name,@token_id,@token0,@token1,@token0_symbol,@token1_symbol,@fee,@pool,
                      @tick_lower,@tick_upper,@source,@staker_contract,@staking_id,
                      @last_current_tick,@last_in_range,@last_price0,@last_liquidity,
                      @last_margin_lower,@last_margin_upper,@last_cex_price,
-                     @last_checked_at,@notify_state,@last_notified_at)
+                     @last_checked_at,@notify_state,@last_notified_at,@pair_flip)
              ON CONFLICT(chain_id_ref, dex_name, token_id) DO UPDATE SET
                last_current_tick=excluded.last_current_tick,
                last_in_range=excluded.last_in_range,
@@ -221,7 +279,8 @@ export async function runScan(): Promise<ScanSummary> {
                fee=excluded.fee, pool=excluded.pool,
                tick_lower=excluded.tick_lower, tick_upper=excluded.tick_upper,
                dex_id=excluded.dex_id, source=excluded.source, staker_contract=excluded.staker_contract,
-               staking_id=excluded.staking_id`
+               staking_id=excluded.staking_id,
+               pair_flip=excluded.pair_flip`
           ).run({
             wallet_id: w.id,
             chain_id_ref: w.chain_id_ref,
@@ -241,7 +300,7 @@ export async function runScan(): Promise<ScanSummary> {
             staking_id: dp.stakingId ?? null,
             last_current_tick: r.status.currentTick,
             last_in_range: inRange ? 1 : 0,
-            last_price0: r.status.price,
+            last_price0: price0Human,
             last_liquidity: r.liquidity?.toString() ?? "",
             last_margin_lower: currMarginLower,
             last_margin_upper: currMarginUpper,
@@ -249,11 +308,12 @@ export async function runScan(): Promise<ScanSummary> {
             last_checked_at: nowIso,
             notify_state: inRange ? "in_range" : "out_of_range",
             last_notified_at: prev?.last_notified_at ?? "",
+            pair_flip: prevPairFlip,
           });
 
           const positionRow = db
-            .prepare("SELECT id, last_notified_at FROM positions WHERE chain_id_ref=? AND dex_name=? AND token_id=?")
-            .get(w.chain_id_ref, dex.name, dp.tokenId) as { id: number; last_notified_at: string };
+            .prepare("SELECT id, last_notified_at, pair_flip FROM positions WHERE chain_id_ref=? AND dex_name=? AND token_id=?")
+            .get(w.chain_id_ref, dex.name, dp.tokenId) as { id: number; last_notified_at: string; pair_flip?: number };
 
           // ===== 越界告警触发判定 =====
           // 1) 首次发现且越界 → 告警
@@ -272,7 +332,7 @@ export async function runScan(): Promise<ScanSummary> {
           // ===== 发送告警（越界 + 波动各自独立发送）=====
           if (rangeTrigger) {
             const alertType = !inRange ? "out_of_range" : "re_in_range";
-            const n = buildNotification(w, chain.name, dex.name, dp, r, sym0, sym1);
+            const n = buildNotification(w, chain.name, dex.name, dp, r, sym0, sym1, positionRow.pair_flip, price0Human);
             const sendRes = await notifyAll(n);
             alertsSent++;
 
@@ -294,7 +354,7 @@ export async function runScan(): Promise<ScanSummary> {
             const n = buildTickMoveNotification(
               w, chain.name, dex.name, dp, r, sym0, sym1,
               prev.last_margin_lower, currMarginLower,
-              tickMoveDelta, tickMoveDirection
+              tickMoveDelta, tickMoveDirection, positionRow.pair_flip, price0Human
             );
             const sendRes = await notifyAll(n);
             alertsSent++;
@@ -315,7 +375,7 @@ export async function runScan(): Promise<ScanSummary> {
           if (cexPriceInfo && cexPriceInfo.exceedsThreshold) {
             const n = buildCexPriceNotification(
               w, chain.name, dex.name, dp, r, sym0, sym1,
-              cexPriceInfo.payload
+              cexPriceInfo.payload, positionRow.pair_flip
             );
             const sendRes = await notifyAll(n);
             alertsSent++;
@@ -463,23 +523,38 @@ function buildNotification(
   dp: DiscoveredPosition,
   r: any,
   sym0: string,
-  sym1: string
+  sym1: string,
+  pair_flip?: number,
+  price0Human: string = ""
 ) {
   const tag = w.label ? `[${w.label}]` : "";
   // token 对标签：优先用 symbol，没有则回退到地址缩写
   const short = (a: string) => `${a.slice(0, 6)}…${a.slice(-4)}`;
-  const label0 = sym0 || short(r.token0);
-  const label1 = sym1 || short(r.token1);
-  const pair = `${label0}/${label1}`;
-  const title = `⚠️ LP 越界 ${tag} ${pair} · ${chainName}/${dexName}`;
+
+  // 处理交易对翻转：翻转后展示口径变为「1 token1 = ? token0」
+  // price0Human 是整币单位「1 token0 = ? token1」（已按 decimals 换算），翻转时取倒数
+  const flip = pair_flip === 1;
+  const baseLabel0 = sym0 || short(r.token0);
+  const baseLabel1 = sym1 || short(r.token1);
+  const displayLabel0 = flip ? baseLabel1 : baseLabel0;
+  const displayLabel1 = flip ? baseLabel0 : baseLabel1;
+  const displayPair = `${displayLabel0}/${displayLabel1}`;
+  // 翻转时汇率取倒数；空值兜底显示原字符串
+  const displayPrice = price0Human
+    ? flip
+      ? fmt(1 / Number(price0Human))
+      : price0Human
+    : "";
+
+  const title = `⚠️ LP 越界 ${tag} ${displayPair} · ${chainName}/${dexName}`;
   const dir = r.status.currentTick < r.tickLower ? "低于下界" : "高于上界";
   const body =
-    `仓位 #${dp.tokenId}（${pair}）已 ${dir}！\n` +
-    `token0: ${label0} (${short(r.token0)})\n` +
-    `token1: ${label1} (${short(r.token1)})\n` +
+    `仓位 #${dp.tokenId}（${displayPair}）已 ${dir}！\n` +
+    `token0: ${displayLabel0} (${flip ? short(r.token1) : short(r.token0)})\n` +
+    `token1: ${displayLabel1} (${flip ? short(r.token0) : short(r.token1)})\n` +
     `当前 tick: ${r.status.currentTick}\n` +
     `区间: [${r.tickLower}, ${r.tickUpper}]\n` +
-    `价格(1 ${label0} ≈ x ${label1}): ${r.status.price}\n` +
+    `价格(1 ${displayLabel0} ≈ x ${displayLabel1}): ${displayPrice}\n` +
     (dp.source === "staking" ? `来源: 质押 @ ${short(dp.stakerContract ?? "")}\n` : `来源: 直接持有\n`) +
     `钱包: ${w.address}`;
   return { title, body };
@@ -497,21 +572,35 @@ function buildTickMoveNotification(
   prevMarginLower: number,
   currMarginLower: number,
   delta: number,
-  direction: string
+  direction: string,
+  pair_flip?: number,
+  price0Human: string = ""
 ) {
   const tag = w.label ? `[${w.label}]` : "";
   const short = (a: string) => `${a.slice(0, 6)}…${a.slice(-4)}`;
-  const label0 = sym0 || short(r.token0);
-  const label1 = sym1 || short(r.token1);
-  const pair = `${label0}/${label1}`;
+
+  // 处理交易对翻转：翻转后展示口径变为「1 token1 = ? token0」
+  // price0Human 是整币单位「1 token0 = ? token1」（已按 decimals 换算），翻转时取倒数
+  const flip = pair_flip === 1;
+  const baseLabel0 = sym0 || short(r.token0);
+  const baseLabel1 = sym1 || short(r.token1);
+  const displayLabel0 = flip ? baseLabel1 : baseLabel0;
+  const displayLabel1 = flip ? baseLabel0 : baseLabel1;
+  const displayPair = `${displayLabel0}/${displayLabel1}`;
+  const displayPrice = price0Human
+    ? flip
+      ? fmt(1 / Number(price0Human))
+      : price0Human
+    : "";
+
   const pct = (x: number) => `${(x * 100).toFixed(1)}%`;
-  const title = `📈 LP 波动 ${tag} ${pair} · ${chainName}/${dexName}`;
+  const title = `📈 LP 波动 ${tag} ${displayPair} · ${chainName}/${dexName}`;
   const body =
-    `仓位 #${dp.tokenId}（${pair}）价格波动较大，${direction}\n` +
+    `仓位 #${dp.tokenId}（${displayPair}）价格波动较大，${direction}\n` +
     `区间内位置: ${pct(prevMarginLower)} → ${pct(currMarginLower)}（变动 ${pct(delta)}）\n` +
     `当前 tick: ${r.status.currentTick}\n` +
     `区间: [${r.tickLower}, ${r.tickUpper}]\n` +
-    `价格(1 ${label0} ≈ x ${label1}): ${r.status.price}\n` +
+    `价格(1 ${displayLabel0} ≈ x ${displayLabel1}): ${displayPrice}\n` +
     (dp.source === "staking" ? `来源: 质押 @ ${short(dp.stakerContract ?? "")}\n` : `来源: 直接持有\n`) +
     `钱包: ${w.address}`;
   return { title, body };
@@ -579,7 +668,7 @@ function computeCexPriceDiff(
   token1Lower: string,
   dexRateStr: string, // r.status.price: raw 单位的 token1/token0（1.0001^tick）
   quoteByAddr: Map<string, CexQuote>,
-  threshold: number,
+  fee: number, // 池子 fee（百万分比，如 3000 = 0.3%，10000 = 1%）
   sym0: string,
   sym1: string,
   dec0: number, // token0 decimals，raw→整币换算用
@@ -603,6 +692,10 @@ function computeCexPriceDiff(
 
   const diff = (dexRate - cexRate) / cexRate;
   const absDiff = Math.abs(diff);
+
+  // 动态阈值：池子 fee 的 2 倍。fee 为百万分比（如 10000 = 1%），换算成 0~1 的小数后 × 2。
+  // 例：1% fee → 阈值 2%，0.3% fee → 阈值 0.6%，0.05% fee → 阈值 0.1%。
+  const threshold = (fee / 1_000_000) * 2;
 
   // quote 仅展示用：两侧计价币种相同时取其一，不同时拼成 'USDT/USDC'
   const quote = q0.quote === q1.quote ? q0.quote || "USD" : `${q0.quote}/${q1.quote}`;
@@ -630,19 +723,30 @@ function buildCexPriceNotification(
   r: any,
   sym0: string,
   sym1: string,
-  p: CexPricePayload
+  p: CexPricePayload,
+  pair_flip?: number
 ) {
   const tag = w.label ? `[${w.label}]` : "";
   const short = (a: string) => `${a.slice(0, 6)}…${a.slice(-4)}`;
-  const label0 = sym0 || short(r.token0);
-  const label1 = sym1 || short(r.token1);
-  const pair = `${label0}/${label1}`;
+  const flip = pair_flip === 1;
+
+  // 翻转后展示口径变为「1 token1 = ? token0」：汇率取倒数，符号/标签交换
+  const baseLabel0 = sym0 || short(r.token0);
+  const baseLabel1 = sym1 || short(r.token1);
+  const label0 = flip ? baseLabel1 : baseLabel0;
+  const label1 = flip ? baseLabel0 : baseLabel1;
+  const pairLabel = `${label0}/${label1}`;
+  const dexRate = flip ? 1 / p.dexRate : p.dexRate;
+  const cexRate = flip ? 1 / p.cexRate : p.cexRate;
+  const token0CexSymbol = flip ? p.token1CexSymbol : p.token0CexSymbol;
+  const token1CexSymbol = flip ? p.token0CexSymbol : p.token1CexSymbol;
+
   const pctSigned = (x: number) => `${x >= 0 ? "+" : ""}${(x * 100).toFixed(2)}%`;
-  const title = `💱 CEX 价差 ${tag} ${p.pairLabel} · ${chainName}/${dexName}`;
+  const title = `💱 CEX 价差 ${tag} ${pairLabel} · ${chainName}/${dexName}`;
   const body =
-    `仓位 #${dp.tokenId}（${p.pairLabel}）DEX 池价与 CEX 汇率偏差较大\n` +
-    `DEX 池价: 1 ${sym0} = ${fmt(p.dexRate)} ${sym1}\n` +
-    `CEX 汇率: 1 ${sym0} = ${fmt(p.cexRate)} ${sym1}（${p.token0CexSymbol} ÷ ${p.token1CexSymbol}，均以 ${p.quote} 计价）\n` +
+    `仓位 #${dp.tokenId}（${pairLabel}）DEX 池价与 CEX 汇率偏差较大\n` +
+    `DEX 池价: 1 ${label0} = ${fmt(dexRate)} ${label1}\n` +
+    `CEX 汇率: 1 ${label0} = ${fmt(cexRate)} ${label1}（${token0CexSymbol} ÷ ${token1CexSymbol}，均以 ${p.quote} 计价）\n` +
     `价差: ${pctSigned(p.diff)}（阈值 ${(Math.abs(p.absDiff) * 100).toFixed(2)}%）\n` +
     `当前 tick: ${r.status.currentTick}\n` +
     `区间: [${r.tickLower}, ${r.tickUpper}]\n` +
@@ -664,6 +768,22 @@ function fmt(n: number): string {
   // 防御性：万一仍含 e/E，手动按小数点移位展开
   if (/[eE]/.test(s)) s = numberToFullString(n);
   return s === "" || s === "-" ? "0" : s;
+}
+
+/**
+ * 把 raw 单位的价格（1.0001^tick，wei/wei 比）换算成整币单位（1 token0 = ? token1），
+ * 并展开成无科学计数法的字符串。
+ *
+ * 与 computeCexPriceDiff 里的 dexRate 同口径：rawRate × 10^(dec0−dec1)。
+ * 用于 last_price0 持久化 + 越界/波动告警文案，确保与 CEX 对比口径一致、可直接展示。
+ * 解析失败或非法时返回原始字符串（兜底，不致空值）。
+ */
+function rawToHumanPrice(rawStr: string, dec0: number, dec1: number): string {
+  const raw = Number(rawStr);
+  if (!Number.isFinite(raw) || raw <= 0) return rawStr;
+  const human = raw * Math.pow(10, dec0 - dec1);
+  if (!Number.isFinite(human) || human <= 0) return rawStr;
+  return fmt(human);
 }
 
 /** 任意 number 转成不含科学计数法的字符串（大数/极小数都展开）。 */

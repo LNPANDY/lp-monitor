@@ -1,27 +1,29 @@
 /**
  * 配置导入/导出：把 chains / dexes / staking_contracts / wallets / token_symbols 五张配置表
- * 打包成一个 JSON 文件，方便多机部署、团队复用、备份。
+ * 以及 pair_flips（交易对翻转状态）打包成一个 JSON 文件，方便多机部署、团队复用、备份。
  *
- * 导出格式（version 2）：
+ * 导出格式（version 3）：
  * {
- *   version: 2,
+ *   version: 3,
  *   exportedAt: ISO,
  *   chains:    [{ key, name, chain_id, rpc_urls[], explorer_url, symbol, enabled }],
  *   dexes:     [{ chain_key, name, type, factory, npm, enabled }],
  *   staking:   [{ chain_key, platform, pair_label, contract, read_type, enabled }],
  *   wallets:   [{ chain_key, address, label, enabled }],
- *   cex_mappings: [{ chain_key, token_addr, token_symbol, cex_symbol, fixed_price, quote, enabled }]
+ *   cex_mappings: [{ chain_key, token_addr, token_symbol, cex_symbol, fixed_price, quote, inverted, enabled }],
+ *   pair_flips: [{ chain_key, dex_name, token0, token1, pair_flip }]
  * }
  *
  * 导入策略：以「业务唯一键」做 upsert（chain key / chain_id、dex factory、staking contract、
  * wallet chain+address、cex_mapping chain+token_addr），不依赖数据库自增 id，重复导入安全。
+ * pair_flips 根据 chain_key + dex_name + token0 + token1 匹配 positions 并恢复翻转状态。
  * 默认勾选项 enabled 生效。
  */
 import { getDb } from "../db";
 import { invalidateClients } from "../chains";
 import { invalidateTokenCache } from "../chains/tokens";
 
-const EXPORT_VERSION = 2;
+const EXPORT_VERSION = 3;
 
 export interface ConfigBundle {
   version: number;
@@ -31,6 +33,7 @@ export interface ConfigBundle {
   staking: any[];
   wallets: any[];
   cex_mappings: any[];
+  pair_flips: any[];
 }
 
 /** 导出当前全部配置（不含 positions/alerts/tokens 运行态数据）。 */
@@ -51,17 +54,30 @@ export function exportConfig(): ConfigBundle {
      FROM wallets w JOIN chains c ON c.id=w.chain_id_ref`
   ).all() as any[]).map((w) => ({ ...w, enabled: !!w.enabled, address: w.address.toLowerCase() }));
   const cexMappings = (db.prepare(
-    `SELECT c.key AS chain_key, ts.token_addr, ts.token_symbol, ts.cex_symbol, ts.fixed_price, ts.quote, ts.enabled
+    `SELECT c.key AS chain_key, ts.token_addr, ts.token_symbol, ts.cex_symbol, ts.fixed_price, ts.quote, ts.inverted, ts.enabled
      FROM token_symbols ts JOIN chains c ON c.id=ts.chain_id_ref`
   ).all() as any[]).map((m) => ({
     ...m,
     enabled: !!m.enabled,
+    inverted: m.inverted === 1,
     token_addr: m.token_addr.toLowerCase(),
     cex_symbol: m.cex_symbol.toUpperCase(),
     quote: (m.quote || "").toUpperCase(),
   }));
 
-  return { version: EXPORT_VERSION, exportedAt: new Date().toISOString(), chains, dexes, staking, wallets, cex_mappings: cexMappings };
+  const pairFlips = (db.prepare(
+    `SELECT c.key AS chain_key, p.dex_name, p.token0, p.token1, p.pair_flip
+     FROM positions p JOIN chains c ON c.id = p.chain_id_ref
+     WHERE p.pair_flip = 1`
+  ).all() as any[]).map((r) => ({
+    chain_key: r.chain_key,
+    dex_name: r.dex_name,
+    token0: r.token0.toLowerCase(),
+    token1: r.token1.toLowerCase(),
+    pair_flip: true,
+  }));
+
+  return { version: EXPORT_VERSION, exportedAt: new Date().toISOString(), chains, dexes, staking, wallets, cex_mappings: cexMappings, pair_flips: pairFlips };
 }
 
 export interface ImportResult {
@@ -70,6 +86,7 @@ export interface ImportResult {
   staking: { added: number; updated: number };
   wallets: { added: number; updated: number };
   cex_mappings: { added: number; updated: number };
+  pair_flips: { applied: number };
 }
 
 /** 导入配置。事务内 upsert，失败回滚。mode: 'merge'（默认，跳过已存在）/ 'overwrite'（暂等同 merge）。 */
@@ -81,6 +98,7 @@ export function importConfig(bundle: Partial<ConfigBundle>, mode: "merge" | "ove
     staking: { added: 0, updated: 0 },
     wallets: { added: 0, updated: 0 },
     cex_mappings: { added: 0, updated: 0 },
+    pair_flips: { applied: 0 },
   };
   void mode;
 
@@ -167,15 +185,31 @@ export function importConfig(bundle: Partial<ConfigBundle>, mode: "merge" | "ove
       const tokenSymbol = m.token_symbol ?? "";
       const fixedPrice = (m.fixed_price != null && Number(m.fixed_price) > 0) ? Number(m.fixed_price) : null;
       const quote = (m.quote || "").toUpperCase();
+      const inverted = m.inverted ? 1 : 0;
       const enabled = m.enabled === false ? 0 : 1;
       if (existing) {
-        db.prepare(`UPDATE token_symbols SET token_symbol=?, cex_symbol=?, fixed_price=?, quote=?, enabled=? WHERE id=?`)
-          .run(tokenSymbol, cexSymbol, fixedPrice, quote, enabled, existing.id);
+        db.prepare(`UPDATE token_symbols SET token_symbol=?, cex_symbol=?, fixed_price=?, quote=?, inverted=?, enabled=? WHERE id=?`)
+          .run(tokenSymbol, cexSymbol, fixedPrice, quote, inverted, enabled, existing.id);
         res.cex_mappings.updated++;
       } else {
-        db.prepare(`INSERT INTO token_symbols (chain_id_ref, token_addr, token_symbol, cex_symbol, fixed_price, quote, enabled) VALUES (?,?,?,?,?,?,?)`)
-          .run(chainId, tokenAddr, tokenSymbol, cexSymbol, fixedPrice, quote, enabled);
+        db.prepare(`INSERT INTO token_symbols (chain_id_ref, token_addr, token_symbol, cex_symbol, fixed_price, quote, inverted, enabled) VALUES (?,?,?,?,?,?,?,?)`)
+          .run(chainId, tokenAddr, tokenSymbol, cexSymbol, fixedPrice, quote, inverted, enabled);
         res.cex_mappings.added++;
+      }
+    }
+
+    // pair_flips：根据 chain_key + dex_name + token0 + token1 匹配 positions，恢复翻转状态
+    for (const pf of bundle.pair_flips ?? []) {
+      const chainId = chainKeyToId.get(pf.chain_key);
+      if (!chainId || !pf.dex_name || !pf.token0 || !pf.token1) continue;
+      const token0 = pf.token0.toLowerCase();
+      const token1 = pf.token1.toLowerCase();
+      if (pf.pair_flip) {
+        const result = db.prepare(
+          `UPDATE positions SET pair_flip = 1
+           WHERE chain_id_ref = ? AND dex_name = ? AND token0 = ? AND token1 = ? AND pair_flip = 0`
+        ).run(chainId, pf.dex_name, token0, token1);
+        res.pair_flips.applied += result.changes;
       }
     }
   });

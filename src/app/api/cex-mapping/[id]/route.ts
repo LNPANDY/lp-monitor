@@ -3,7 +3,7 @@ import { ok, fail, getBody } from "@/lib/api";
 
 export const dynamic = "force-dynamic";
 
-/** PATCH: 更新一条 CEX 匹配（cex_symbol / token_symbol / enabled / fixed_price / quote）。 */
+/** PATCH: 更新一条 CEX 匹配（cex_symbol / token_symbol / enabled / fixed_price / quote / inverted）。 */
 export async function PATCH(req: Request, { params }: { params: { id: string } }) {
   const b = await getBody<{
     cex_symbol?: string;
@@ -11,6 +11,7 @@ export async function PATCH(req: Request, { params }: { params: { id: string } }
     enabled?: number;
     fixed_price?: number | null;
     quote?: string;
+    inverted?: number | boolean;
   }>(req);
   const db = getDb();
   const sets: string[] = [];
@@ -35,6 +36,10 @@ export async function PATCH(req: Request, { params }: { params: { id: string } }
   if (b.quote !== undefined) {
     sets.push("quote=?");
     args.push((b.quote || "").trim().toUpperCase());
+  }
+  if (b.inverted !== undefined) {
+    sets.push("inverted=?");
+    args.push(b.inverted ? 1 : 0);
   }
   if (sets.length === 0) return fail("无更新字段");
   args.push(params.id);

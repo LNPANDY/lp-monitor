@@ -9,6 +9,10 @@ data/*.db-wal
 *.db-journal
 *.db-shm
 *.db-wal
+*.sqlite3
+*.sqlite3-journal
+*.sqlite3-shm
+*.sqlite3-wal
 .env.local
 .env*.local
 *.log

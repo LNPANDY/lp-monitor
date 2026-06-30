@@ -2,8 +2,24 @@
 import { useState } from "react";
 import useSWR from "swr";
 import { fetcher, short, timeAgo, fmtFull } from "@/components/util";
+
+/** 将常见的 cron 表达式转为人类可读标签 */
+function cronToLabel(cron: string): string {
+  const m = cron.trim();
+  // */N * * * * → N 分钟
+  const starSlash = m.match(/^\*\/(\d+)\s+\*\s+\*\s+\*\s+\*$/);
+  if (starSlash) {
+    const n = Number(starSlash[1]);
+    if (n >= 60) return `${Math.round(n / 60)} 小时`;
+    return `${n} 分钟`;
+  }
+  // 0 * * * * → 1 小时
+  if (m === "0 * * * *") return "1 小时";
+  return m;
+}
 import { LiquidityButton } from "@/components/liquidity-button";
 import { LiquidityProbe } from "@/components/liquidity-probe";
+import { Field } from "@/components/form";
 
 interface Position {
   id: number;
@@ -32,6 +48,7 @@ interface Position {
   wallet_address: string;
   last_alert_type?: string;
   last_cex_price?: string; // JSON: CexPricePayload，开启 CEX 对比且有报价时写入
+  pair_flip?: number; // 0=原始 token0/token1，1=用户翻转为 token1/token0
 }
 
 interface MonitorState {
@@ -71,7 +88,7 @@ export default function DashboardPage() {
           <Stat label="监控仓位" value={list.length} />
           <Stat label="越界" value={outOfRange.length} danger={outOfRange.length > 0} />
           <div className="text-sm text-ink-soft">
-            <div>调度：{mon?.cron ?? "—"}</div>
+            <div>调度：{mon?.cron ? cronToLabel(mon.cron) : "—"}</div>
             <div>状态：{mon?.running ? "扫描中…" : `上次 ${timeAgo(mon?.last?.at)}`}</div>
           </div>
         </div>
@@ -83,6 +100,9 @@ export default function DashboardPage() {
       {/* 扫描频率和告警阈值设置 */}
       <ScanIntervalAndAlerts currentCron={mon?.cron ?? ""} onChanged={() => reloadMon()} />
 
+      {/* 链上资产统计 */}
+      <PortfolioSection />
+
       {/* 流动性探针（场景C + 收藏） */}
       <LiquidityProbe />
 
@@ -93,7 +113,7 @@ export default function DashboardPage() {
             ⚠️ 越界仓位（{outOfRange.length}）
           </h2>
           <div className="grid grid-cols-1 gap-3 md:grid-cols-2 lg:grid-cols-3">
-            {outOfRange.map((p) => <PositionCard key={p.id} p={p} highlight />)}
+            {outOfRange.map((p) => <PositionCard key={p.id} p={p} highlight onFlipped={reloadPos} />)}
           </div>
         </section>
       )}
@@ -105,7 +125,7 @@ export default function DashboardPage() {
           <EmptyHint />
         ) : (
           <div className="grid grid-cols-1 gap-3 md:grid-cols-2 lg:grid-cols-3">
-            {list.map((p) => <PositionCard key={p.id} p={p} />)}
+            {list.map((p) => <PositionCard key={p.id} p={p} onFlipped={reloadPos} />)}
           </div>
         )}
       </section>
@@ -122,7 +142,7 @@ export default function DashboardPage() {
           </button>
           {showClosed && (
             <div className="grid grid-cols-1 gap-3 md:grid-cols-2 lg:grid-cols-3 opacity-60">
-              {closed.map((p) => <PositionCard key={p.id} p={p} closed />)}
+              {closed.map((p) => <PositionCard key={p.id} p={p} closed onFlipped={reloadPos} />)}
             </div>
           )}
         </section>
@@ -145,13 +165,154 @@ function Stat({ label, value, danger }: { label: string; value: number; danger?:
   );
 }
 
+/* ============ 链上资产统计 ============ */
+interface AssetItem {
+  kind: "native" | "erc20" | "lp";
+  symbol: string;
+  amount: string;
+  valueUsd: number | null;
+  subItems?: { symbol: string; amount: string; valueUsd: number | null }[];
+}
+interface PortfolioResult {
+  items: AssetItem[];
+  totalUsd: number;
+  nativeSymbol: string;
+  warnings: string[];
+}
+
+function PortfolioSection() {
+  const { data: chains } = useSWR<any[]>("/api/chains", fetcher);
+  const [chainId, setChainId] = useState<number | "">("");
+  const [addr, setAddr] = useState("");
+  // 手动触发：点「统计」后才请求，避免无输入时自动拉链上数据
+  const [query, setQuery] = useState<{ chainId: number; addr: string } | null>(null);
+  // ERC20 代币列表折叠状态（默认展开）
+  const [erc20Open, setErc20Open] = useState(true);
+  const { data, error, isLoading } = useSWR<PortfolioResult>(
+    query ? `/api/portfolio?chain_id=${query.chainId}&address=${encodeURIComponent(query.addr)}` : null,
+    fetcher
+  );
+
+  function doQuery() {
+    if (!chainId || !/^0x[a-fA-F0-9]{40}$/.test(addr.trim())) return;
+    setQuery({ chainId, addr: addr.trim() });
+  }
+
+  return (
+    <section className="card p-5">
+      <h2 className="mb-1 text-base font-semibold">链上资产统计</h2>
+      <p className="mb-3 text-xs text-ink-soft">
+        选择链并输入钱包地址，实时统计该钱包的 GAS 余额、ERC20 代币余额 + LP 仓位价值（含直接持有与质押，按 CEX 报价折算）。
+      </p>
+      <div className="mb-4 grid grid-cols-1 gap-3 md:grid-cols-[1fr_2fr_auto]">
+        <Field label="链">
+          <select className="input" value={chainId} onChange={(e) => setChainId(e.target.value ? Number(e.target.value) : "")}>
+            <option value="">选择链</option>
+            {(chains ?? []).map((c: any) => <option key={c.id} value={c.id}>{c.name}</option>)}
+          </select>
+        </Field>
+        <Field label="钱包地址">
+          <input className="input" value={addr} onChange={(e) => setAddr(e.target.value)} placeholder="0x…" />
+        </Field>
+        <div className="flex items-end">
+          <button className="btn-primary w-full" onClick={doQuery} disabled={!chainId || !addr}>统计</button>
+        </div>
+      </div>
+
+      {isLoading && <p className="text-sm text-ink-soft">统计中…（需读取链上余额与池子状态）</p>}
+      {error && <p className="text-sm text-warn">❌ {(error as any)?.message ?? error}</p>}
+      {data && !isLoading && (
+        <>
+          {data.items.length === 0 ? (
+            <p className="text-sm text-ink-soft">未发现资产（该钱包未登记或无仓位）。</p>
+          ) : (() => {
+            const nativeItems = data.items.filter((it) => it.kind === "native");
+            const erc20Items = data.items.filter((it) => it.kind === "erc20");
+            const lpItems = data.items.filter((it) => it.kind === "lp");
+            return (
+              <div className="overflow-hidden rounded-md border border-slate-200">
+                {/* GAS 原生代币 */}
+                {nativeItems.map((it, i) => (
+                  <div key={`native-${i}`} className={`flex items-center justify-between px-3 py-2 text-sm ${it.kind === "native" ? "bg-slate-50" : ""}`}>
+                    <span className="font-medium">
+                      {it.symbol}
+                      {it.kind === "native" && <span className="ml-1 text-ink-soft">:{it.amount}</span>}
+                    </span>
+                    <span className={it.valueUsd === null ? "text-ink-soft" : "text-ink"}>
+                      {it.valueUsd === null ? "—" : `${it.valueUsd.toFixed(1)}U`}
+                    </span>
+                  </div>
+                ))}
+                {/* ERC20 代币折叠区域 */}
+                {erc20Items.length > 0 && (
+                  <>
+                    <div className="flex items-center justify-between border-t border-slate-200 px-3 py-1.5 text-xs">
+                      <span className="font-medium text-ink-soft">
+                        ERC20 代币（{erc20Items.length} 种）
+                      </span>
+                      <button
+                        className="text-ink-soft hover:text-ink transition-colors"
+                        onClick={() => setErc20Open((v) => !v)}
+                      >
+                        {erc20Open ? "收起 ▲" : "展开 ▼"}
+                      </button>
+                    </div>
+                    {erc20Open && erc20Items.map((it, i) => (
+                      <div key={`erc20-${i}`} className="flex items-center justify-between px-3 py-2 text-sm">
+                        <span className="font-medium">
+                          {it.symbol}<span className="ml-1 text-ink-soft">:{it.amount}</span>
+                        </span>
+                        <span className={it.valueUsd === null ? "text-ink-soft" : "text-ink"}>
+                          {it.valueUsd === null ? "—" : `${it.valueUsd.toFixed(1)}U`}
+                        </span>
+                      </div>
+                    ))}
+                  </>
+                )}
+                {/* LP 仓位 */}
+                {lpItems.map((it, i) => (
+                  <div key={`lp-${i}`}>
+                    <div className="flex items-center justify-between border-t border-slate-200 px-3 py-2 text-sm">
+                      <span className="font-medium">{it.symbol}</span>
+                      <span className={it.valueUsd === null ? "text-ink-soft" : "text-ink"}>
+                        {it.valueUsd === null ? "—" : `${it.valueUsd.toFixed(1)}U`}
+                      </span>
+                    </div>
+                    {it.subItems?.map((s, j) => (
+                      <div key={j} className="flex items-center justify-between px-3 py-1.5 pl-6 text-xs text-ink-soft">
+                        <span>{s.symbol}:{s.amount}</span>
+                        <span>{s.valueUsd === null ? "—" : `${s.valueUsd.toFixed(1)}U`}</span>
+                      </div>
+                    ))}
+                  </div>
+                ))}
+                {/* 总价值 */}
+                <div className="flex items-center justify-between border-t border-slate-200 bg-slate-50 px-3 py-2.5 text-sm font-bold">
+                  <span>总价值</span>
+                  <span>{data.totalUsd.toFixed(1)}U</span>
+                </div>
+              </div>
+            );
+          })()}
+          {data.warnings.length > 0 && (
+            <div className="mt-2 space-y-0.5">
+              {data.warnings.map((w, i) => (
+                <p key={i} className="text-xs text-warn">⚠ {w}</p>
+              ))}
+            </div>
+          )}
+        </>
+      )}
+    </section>
+  );
+}
+
 function ScanIntervalAndAlerts({ currentCron, onChanged }: { currentCron: string; onChanged: () => void }) {
   const [preset, setPreset] = useState("");
   const [msg, setMsg] = useState("");
   const [busy, setBusy] = useState(false);
   const { data: alertData, mutate: mutateAlerts } = useSWR<any>("/api/alert-settings", fetcher);
   const [tickThreshold, setTickThreshold] = useState("");
-  const [cexThreshold, setCexThreshold] = useState("");
 
   // 从 cron 反推分钟数用于默认显示
   const m = currentCron.match(/^\*\/(\d+) \* \* \* \*$/);
@@ -209,7 +370,6 @@ function ScanIntervalAndAlerts({ currentCron, onChanged }: { currentCron: string
     try {
       const body: any = {};
       if (tickThreshold !== "") body.tick_move_threshold = Number(tickThreshold);
-      if (cexThreshold !== "") body.cex_price_threshold = Number(cexThreshold);
       const r = await fetch("/api/alert-settings", {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
@@ -218,7 +378,7 @@ function ScanIntervalAndAlerts({ currentCron, onChanged }: { currentCron: string
       const j = await r.json();
       if (!j.ok) throw new Error(j.error);
       setMsg("✅ 阈值已更新");
-      setTickThreshold(""); setCexThreshold("");
+      setTickThreshold("");
       mutateAlerts();
     } catch (e: any) {
       setMsg(`❌ ${e.message}`);
@@ -232,7 +392,7 @@ function ScanIntervalAndAlerts({ currentCron, onChanged }: { currentCron: string
         <div className="flex items-center gap-2 border-r border-slate-200 pr-4">
           <span className="text-sm font-medium">扫描频率：</span>
           <span className="text-sm text-ink-soft">
-            {currentCron || "—"} {curMin > 0 && <span className="tag-muted ml-1">约每 {curMin} 分钟</span>}
+            {currentCron ? cronToLabel(currentCron) : "—"}
           </span>
           <select
             className="input max-w-[120px] text-xs"
@@ -280,7 +440,7 @@ function ScanIntervalAndAlerts({ currentCron, onChanged }: { currentCron: string
           >
             {alertData?.cex_price_enabled ? "CEX 价差：开" : "CEX 价差：关"}
           </button>
-          <span className="text-xs text-ink-soft">阈值 {alertData?.cex_price_threshold ?? 3}%</span>
+          <span className="text-xs text-ink-soft">超过费率 2 倍时提醒</span>
 
           {/* 阈值设置 */}
           <input
@@ -292,18 +452,9 @@ function ScanIntervalAndAlerts({ currentCron, onChanged }: { currentCron: string
             onChange={(e) => setTickThreshold(e.target.value)}
             placeholder="波动阈值 %"
           />
-          <input
-            className="input max-w-[100px] text-xs"
-            type="number"
-            min={0}
-            max={100}
-            value={cexThreshold}
-            onChange={(e) => setCexThreshold(e.target.value)}
-            placeholder="CEX 价差 %"
-          />
           <button
             className="btn-ghost text-xs"
-            disabled={busy || (tickThreshold === "" && cexThreshold === "")}
+            disabled={busy || tickThreshold === ""}
             onClick={applyThreshold}
           >
             应用阈值
@@ -329,7 +480,50 @@ function EmptyHint() {
   );
 }
 
-function PositionCard({ p, highlight, closed }: { p: Position; highlight?: boolean; closed?: boolean }) {
+function FlipButton({ positionId, currentFlip, onFlipped }: { positionId: number; currentFlip: boolean; onFlipped?: () => void }) {
+  const [loading, setLoading] = useState(false);
+  const [flip, setFlip] = useState(currentFlip);
+
+  const handleFlip = async () => {
+    setLoading(true);
+    try {
+      const response = await fetch(`/api/positions/${positionId}/pair-flip`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ flip: !flip })
+      });
+      const result = await response.json();
+      
+      if (result.ok) {
+        setFlip(!flip);
+        // 通知父组件刷新，让卡片其它依赖 pair_flip 的展示同步更新
+        onFlipped?.();
+      } else {
+        alert(result.error || "操作失败");
+      }
+    } catch (error) {
+      alert("操作失败：" + error);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <button
+      onClick={handleFlip}
+      disabled={loading}
+      className={`text-xs px-2 py-1 rounded ${
+        flip 
+          ? "bg-blue-100 text-blue-700 hover:bg-blue-200" 
+          : "bg-slate-100 text-slate-600 hover:bg-slate-200"
+      } transition-colors`}
+    >
+      {loading ? "..." : (flip ? "还原" : "翻转")}
+    </button>
+  );
+}
+
+function PositionCard({ p, highlight, closed, onFlipped }: { p: Position; highlight?: boolean; closed?: boolean; onFlipped?: () => void }) {
   const inRange = p.last_in_range === 1;
   const explorer = p.explorer_url?.replace(/\/$/, "");
   const dexLabel = p.dex_display_name || p.dex_name;
@@ -337,52 +531,69 @@ function PositionCard({ p, highlight, closed }: { p: Position; highlight?: boole
   const marginUpper = ((p.tick_upper - p.last_current_tick) / Math.max(p.tick_upper - p.tick_lower, 1)) * 100;
   const sym0 = p.token0_symbol || short(p.token0);
   const sym1 = p.token1_symbol || short(p.token1);
-  const pair = `${sym0}/${sym1}`;
+  const pair = p.pair_flip ? `${sym1}/${sym0}` : `${sym0}/${sym1}`;
   // CEX 对比信息：last_cex_price 是 JSON(CexPricePayload)，解析失败/缺失则不展示该行
   const cexInfo = parseCexPrice(p.last_cex_price);
-  // 价差超过该值就在卡片里标红（与后端 cex_price_threshold 解耦，前端固定 1% 做视觉提示，真正告警阈值在设置页）
+  // 价差超过该值就在卡片里标红（前端固定 1% 做视觉提示；真正告警阈值为该仓位 fee 的 2 倍，由后端按 fee 动态计算）
   const cexWarnThresh = 0.01;
+
+  // 翻转后展示口径变为「1 token1 = ? token0」：汇率取倒数，符号/标签交换
+  const flip = p.pair_flip === 1;
+  const displaySym0 = flip ? sym1 : sym0;
+  const displaySym1 = flip ? sym0 : sym1;
+  // last_price0 原始口径与 dexRate 一致（1 token0 = ? token1），翻转后取倒数；用 fmtFull 展开避免科学计数法
+  const displayPrice0 = p.last_price0
+    ? fmtFull(flip ? 1 / Number(p.last_price0) : Number(p.last_price0))
+    : p.last_price0;
+  // cexRate 原始口径是「1 token0 = ? token1」，翻转后取倒数
+  const displayCexRate = cexInfo ? (flip ? 1 / cexInfo.cexRate : cexInfo.cexRate) : 0;
+  const displayToken0Cex = cexInfo ? (flip ? cexInfo.token1CexSymbol : cexInfo.token0CexSymbol) : "";
+  const displayToken1Cex = cexInfo ? (flip ? cexInfo.token0CexSymbol : cexInfo.token1CexSymbol) : "";
 
   return (
     <div className={`card p-4 ${closed ? "border-dashed border-slate-300 bg-slate-50" : highlight ? "border-warn" : ""}`}>
-      <div className="mb-2 flex items-start justify-between gap-2">
-        <div>
-          <div className="flex items-center gap-2">
-            <span className="font-semibold">{pair}</span>
-            <span className="text-xs text-ink-soft">{dexLabel}</span>
-            {closed ? <span className="tag-muted">已平仓</span> : inRange ? <span className="tag-ok">在区间内</span> : <span className="tag-warn">已越界</span>}
-            {!closed && p.last_alert_type === "tick_move" && <span className="tag-info">波动</span>}
-            {!closed && p.last_alert_type === "cex_price" && <span className="tag-info">CEX 价差</span>}
-            {!closed && p.source === "staking" && <span className="tag-muted">质押中</span>}
-          </div>
-          <div className="mt-0.5 text-xs text-ink-soft">
-            {p.chain_name} · #{p.token_id}
+        <div className="mb-2 flex items-start justify-between gap-2">
+          <div className="flex-1">
+            <div className="flex items-center gap-2">
+              <span className="font-semibold">{pair}</span>
+              {p.pair_flip === 1 && (
+                <span className="text-xs text-blue-600 bg-blue-50 px-1.5 py-0.5 rounded" title="交易对已翻转">
+                  翻转
+                </span>
+              )}
+              {closed ? <span className="tag-muted">已平仓</span> : inRange ? <span className="tag-ok">在区间内</span> : <span className="tag-warn">已越界</span>}
+              {!closed && p.last_alert_type === "tick_move" && <span className="tag-info">波动</span>}
+              {!closed && p.last_alert_type === "cex_price" && <span className="tag-info">CEX 价差</span>}
+              {!closed && p.source === "staking" && <span className="tag-muted">质押中</span>}
+            </div>
+            <div className="mt-0.5 text-xs text-ink-soft">
+              {p.chain_name} · {dexLabel} · #{p.token_id}
+            </div>
           </div>
         </div>
-      </div>
 
       <div className="space-y-1 text-sm">
         <Row label="交易对">
           <span title={`${p.token0} / ${p.token1}`}>
-            {pair} · fee {p.fee / 10000}%
+            {pair} · fee {(p.fee / 10000).toFixed(2)}%
           </span>
         </Row>
         <Row label="当前 tick">
           <span className={inRange ? "" : "text-warn font-semibold"}>{p.last_current_tick}</span>
         </Row>
         <Row label="区间">[{p.tick_lower}, {p.tick_upper}]</Row>
-        <Row label="价格">1 {sym0} ≈ {p.last_price0} {sym1}</Row>
-        {cexInfo && (
-          <Row label={`CEX 汇率 (${cexInfo.token0CexSymbol}÷${cexInfo.token1CexSymbol})`}>
-            <span>1 {sym0} = {fmtFull(cexInfo.cexRate)} {sym1}</span>
+        <Row label="价格">1 {displaySym0} ≈ {displayPrice0} {displaySym1}</Row>
+        {cexInfo && displayToken0Cex && displayToken1Cex && (
+          <Row label={`CEX 汇率 (${displayToken0Cex}÷${displayToken1Cex})`}>
+            <span>1 {displaySym0} = {fmtFull(displayCexRate)} {displaySym1}</span>
           </Row>
         )}
         {cexInfo && (
-          <Row label="DEX vs CEX">
+          <Row label="CEX差价">
             <span className={cexInfo.absDiff >= cexWarnThresh ? "text-warn font-semibold" : ""}>
               差 {pctSigned(cexInfo.diff)}
             </span>
-            <span className="ml-1 text-ink-soft">（DEX {fmtFull(cexInfo.dexRate)} / CEX {fmtFull(cexInfo.cexRate)}）</span>
+            <span className="ml-1 text-ink-soft">{fmtFull(displayCexRate)}</span>
           </Row>
         )}
 
@@ -420,6 +631,7 @@ function PositionCard({ p, highlight, closed }: { p: Position; highlight?: boole
         {explorer && p.token_id && (
           <a className="btn-ghost" href={`${explorer}/token/${p.dex_display_name ? "" : ""}`} target="_blank" rel="noreferrer" aria-disabled style={{ display: "none" }}>NFT</a>
         )}
+        <FlipButton positionId={p.id} currentFlip={!!p.pair_flip} onFlipped={onFlipped} />
       </div>
 
       {!closed && <LiquidityButton positionId={p.id} staking={p.source === "staking"} />}
