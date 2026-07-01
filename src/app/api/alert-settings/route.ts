@@ -25,8 +25,9 @@ export async function PUT(req: Request) {
     cex_price_enabled?: string;
   }>(req);
 
+  // 注意：前端传的是字符串 "0"/"1"，字符串 "0" 是 truthy，不能用 ?: 判断
   if (body.tick_move_enabled !== undefined) {
-    setSetting("tick_move_enabled", body.tick_move_enabled ? "1" : "0");
+    setSetting("tick_move_enabled", String(body.tick_move_enabled) === "1" ? "1" : "0");
   }
   if (body.tick_move_threshold !== undefined) {
     const v = Number(body.tick_move_threshold);
@@ -34,7 +35,7 @@ export async function PUT(req: Request) {
     setSetting("tick_move_threshold", String(v));
   }
   if (body.cex_price_enabled !== undefined) {
-    setSetting("cex_price_enabled", body.cex_price_enabled ? "1" : "0");
+    setSetting("cex_price_enabled", String(body.cex_price_enabled) === "1" ? "1" : "0");
   }
 
   return ok({
