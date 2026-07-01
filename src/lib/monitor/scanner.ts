@@ -250,8 +250,14 @@ export async function runScan(): Promise<ScanSummary> {
               )
             : null;
 
-          // upsert 仓位最新状态（pair_flip 从 prev 保留，避免扫描覆盖用户翻转设置）
-          const prevPairFlip = prev?.pair_flip ?? 0;
+          // upsert 仓位最新状态（pair_flip 从 prev 保留；prev 为 null 时从 pair_flips 表恢复历史翻转）
+          let prevPairFlip = prev?.pair_flip ?? 0;
+          if (prevPairFlip === 0) {
+            const savedFlip = db.prepare(
+              "SELECT id FROM pair_flips WHERE chain_id_ref=? AND dex_name=? AND token0=? AND token1=?"
+            ).get(w.chain_id_ref, dex.name, r.token0.toLowerCase(), r.token1.toLowerCase());
+            if (savedFlip) prevPairFlip = 1;
+          }
           db.prepare(
             `INSERT INTO positions
               (wallet_id, chain_id_ref, dex_id, dex_name, token_id, token0, token1, token0_symbol, token1_symbol, fee, pool,

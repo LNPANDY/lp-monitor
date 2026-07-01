@@ -204,6 +204,18 @@ function migrate(db: DB) {
       UNIQUE(chain_id_ref, pool_addr, staker_addr)
     );
     CREATE INDEX IF NOT EXISTS idx_liq_fav_chain ON liquidity_favorites(chain_id_ref);
+
+    -- 交易对翻转偏好（独立于 positions 表，钱包/链删除重建后仍可恢复）
+    -- 唯一键: chain_id_ref + dex_name + token0 + token1（忽略 token_id，同一交易对共享翻转）
+    CREATE TABLE IF NOT EXISTS pair_flips (
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      chain_id_ref  INTEGER NOT NULL REFERENCES chains(id) ON DELETE CASCADE,
+      dex_name      TEXT    NOT NULL,
+      token0        TEXT    NOT NULL,
+      token1        TEXT    NOT NULL,
+      created_at    TEXT    NOT NULL DEFAULT (datetime('now')),
+      UNIQUE(chain_id_ref, dex_name, token0, token1)
+    );
   `);
 
   // 兼容已有数据库：新增列用 ADD COLUMN（忽略已存在的错误）

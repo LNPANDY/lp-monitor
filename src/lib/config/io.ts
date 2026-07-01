@@ -66,9 +66,8 @@ export function exportConfig(): ConfigBundle {
   }));
 
   const pairFlips = (db.prepare(
-    `SELECT c.key AS chain_key, p.dex_name, p.token0, p.token1, p.pair_flip
-     FROM positions p JOIN chains c ON c.id = p.chain_id_ref
-     WHERE p.pair_flip = 1`
+    `SELECT c.key AS chain_key, pf.dex_name, pf.token0, pf.token1
+     FROM pair_flips pf JOIN chains c ON c.id = pf.chain_id_ref`
   ).all() as any[]).map((r) => ({
     chain_key: r.chain_key,
     dex_name: r.dex_name,
@@ -198,13 +197,18 @@ export function importConfig(bundle: Partial<ConfigBundle>, mode: "merge" | "ove
       }
     }
 
-    // pair_flips：根据 chain_key + dex_name + token0 + token1 匹配 positions，恢复翻转状态
+    // pair_flips：写入 pair_flips 独立表 + 同步更新现有 positions 行
     for (const pf of bundle.pair_flips ?? []) {
       const chainId = chainKeyToId.get(pf.chain_key);
       if (!chainId || !pf.dex_name || !pf.token0 || !pf.token1) continue;
       const token0 = pf.token0.toLowerCase();
       const token1 = pf.token1.toLowerCase();
       if (pf.pair_flip) {
+        // 写入独立翻转偏好表（即使 positions 暂无该行也能保留）
+        db.prepare(
+          `INSERT OR IGNORE INTO pair_flips (chain_id_ref, dex_name, token0, token1) VALUES (?,?,?,?)`
+        ).run(chainId, pf.dex_name, token0, token1);
+        // 同步更新已存在的 positions 行
         const result = db.prepare(
           `UPDATE positions SET pair_flip = 1
            WHERE chain_id_ref = ? AND dex_name = ? AND token0 = ? AND token1 = ? AND pair_flip = 0`
