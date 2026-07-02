@@ -49,6 +49,7 @@ interface Position {
   last_alert_type?: string;
   last_cex_price?: string; // JSON: CexPricePayload，开启 CEX 对比且有报价时写入
   pair_flip?: number; // 0=原始 token0/token1，1=用户翻转为 token1/token0
+  cex_alert_muted?: number; // 1=该 token 对已静音 CEX 差价预警，0=正常
 }
 
 interface MonitorState {
@@ -432,13 +433,13 @@ function ScanIntervalAndAlerts({ currentCron, onChanged }: { currentCron: string
           </button>
           <span className="text-xs text-ink-soft">阈值 {alertData?.tick_move_threshold ?? 10}%</span>
 
-          {/* CEX 对比开关 */}
+          {/* CEX 价差推送开关（仅控制是否推送告警，不影响卡片中 CEX 数据展示） */}
           <button
             className={alertData?.cex_price_enabled ? "btn-primary text-xs" : "btn-ghost text-xs"}
             disabled={busy}
             onClick={toggleCex}
           >
-            {alertData?.cex_price_enabled ? "CEX 价差：开" : "CEX 价差：关"}
+            {alertData?.cex_price_enabled ? "CEX 推送：开" : "CEX 推送：关"}
           </button>
           <span className="text-xs text-ink-soft">超过费率 2 倍时提醒</span>
 
@@ -513,12 +514,56 @@ function FlipButton({ positionId, currentFlip, onFlipped }: { positionId: number
       onClick={handleFlip}
       disabled={loading}
       className={`text-xs px-2 py-1 rounded ${
-        flip 
-          ? "bg-blue-100 text-blue-700 hover:bg-blue-200" 
+        flip
+          ? "bg-blue-100 text-blue-700 hover:bg-blue-200"
           : "bg-slate-100 text-slate-600 hover:bg-slate-200"
       } transition-colors`}
     >
       {loading ? "..." : (flip ? "还原" : "翻转")}
+    </button>
+  );
+}
+
+/** CEX 差价预警静音按钮（按 token 对，类似翻转按钮） */
+function CexAlertMuteButton({ positionId, currentMuted, onToggled }: { positionId: number; currentMuted: boolean; onToggled?: () => void }) {
+  const [loading, setLoading] = useState(false);
+  const [muted, setMuted] = useState(currentMuted);
+
+  const handleToggle = async () => {
+    setLoading(true);
+    try {
+      const response = await fetch(`/api/positions/${positionId}/cex-alert-mute`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ mute: !muted })
+      });
+      const result = await response.json();
+
+      if (result.ok) {
+        setMuted(!muted);
+        onToggled?.();
+      } else {
+        alert(result.error || "操作失败");
+      }
+    } catch (error) {
+      alert("操作失败：" + error);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <button
+      onClick={handleToggle}
+      disabled={loading}
+      title={muted ? "点击恢复该交易对的 CEX 差价预警" : "点击静音该交易对的 CEX 差价预警"}
+      className={`text-xs px-2 py-1 rounded ${
+        muted
+          ? "bg-orange-100 text-orange-700 hover:bg-orange-200"
+          : "bg-emerald-50 text-emerald-700 hover:bg-emerald-100"
+      } transition-colors`}
+    >
+      {loading ? "..." : (muted ? "预警:关" : "预警:开")}
     </button>
   );
 }
@@ -632,6 +677,7 @@ function PositionCard({ p, highlight, closed, onFlipped }: { p: Position; highli
           <a className="btn-ghost" href={`${explorer}/token/${p.dex_display_name ? "" : ""}`} target="_blank" rel="noreferrer" aria-disabled style={{ display: "none" }}>NFT</a>
         )}
         <FlipButton positionId={p.id} currentFlip={!!p.pair_flip} onFlipped={onFlipped} />
+        <CexAlertMuteButton positionId={p.id} currentMuted={!!p.cex_alert_muted} onToggled={onFlipped} />
       </div>
 
       {!closed && <LiquidityButton positionId={p.id} staking={p.source === "staking"} />}

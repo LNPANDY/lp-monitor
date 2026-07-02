@@ -216,6 +216,16 @@ function migrate(db: DB) {
       created_at    TEXT    NOT NULL DEFAULT (datetime('now')),
       UNIQUE(chain_id_ref, dex_name, token0, token1)
     );
+
+    -- CEX 差价预警静音（按 token 对，不区分 DEX，同一 token0/token1 跨 DEX 共享）
+    CREATE TABLE IF NOT EXISTS cex_alert_mutes (
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      chain_id_ref  INTEGER NOT NULL REFERENCES chains(id) ON DELETE CASCADE,
+      token0        TEXT    NOT NULL,
+      token1        TEXT    NOT NULL,
+      created_at    TEXT    NOT NULL DEFAULT (datetime('now')),
+      UNIQUE(chain_id_ref, token0, token1)
+    );
   `);
 
   // 兼容已有数据库：新增列用 ADD COLUMN（忽略已存在的错误）

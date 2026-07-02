@@ -59,12 +59,14 @@ export async function runScan(): Promise<ScanSummary> {
   let alertsSent = 0;
   const db = getDb();
 
-  // CEX 对比开关：整次扫描共用一份。关闭时跳过所有报价拉取。
+  // CEX 对比全局开关：控制是否推送 CEX 价差告警（不影响 CEX 数据计算与卡片展示）。
   const cexEnabled = isCexPriceEnabled();
-  // 所有链上的 token→CEX 映射（按 chain_id_ref 分组）。关闭时不需要加载。
-  const cexMappingsByChain = cexEnabled ? loadAllMappings() : new Map<number, CexMapping[]>();
+  // 所有链上的 token→CEX 映射（按 chain_id_ref 分组）。始终加载，确保仓位卡片始终显示 CEX 数据。
+  const cexMappingsByChain = loadAllMappings();
   // 报价缓存（本次扫描内复用）：(tokenAddrLower) → CexQuote
   const cexQuoteByAddr = new Map<string, CexQuote>();
+  // 本次扫描中已静音的 CEX 差价预警 token 对集合：(chain_id_ref|token0|token1) → true
+  const cexMutedPairs = new Set<string>();
 
   const wallets = db.prepare("SELECT * FROM wallets WHERE enabled=1").all() as WalletRow[];
   if (wallets.length === 0) {
@@ -236,19 +238,18 @@ export async function runScan(): Promise<ScanSummary> {
           // 整币单位价格（1 token0 = ? token1，已按 decimals 换算）：供 last_price0 持久化 +
           // 越界/波动告警文案共用，确保与 CEX 对比口径一致、可直接展示，不再误用 raw 单位。
           const price0Human = rawToHumanPrice(r.status.price, dec0, dec1);
-          const cexPriceInfo = cexEnabled
-            ? computeCexPriceDiff(
-                r.token0.toLowerCase(),
-                r.token1.toLowerCase(),
-                r.status.price,
-                cexQuoteByAddr,
-                r.fee,
-                sym0,
-                sym1,
-                dec0,
-                dec1
-              )
-            : null;
+          // CEX 价差始终计算（无论全局开关状态），确保仓位卡片始终展示 CEX 数据
+          const cexPriceInfo = computeCexPriceDiff(
+            r.token0.toLowerCase(),
+            r.token1.toLowerCase(),
+            r.status.price,
+            cexQuoteByAddr,
+            r.fee,
+            sym0,
+            sym1,
+            dec0,
+            dec1
+          );
 
           // upsert 仓位最新状态（pair_flip 从 prev 保留；prev 为 null 时从 pair_flips 表恢复历史翻转）
           let prevPairFlip = prev?.pair_flip ?? 0;
@@ -378,7 +379,16 @@ export async function runScan(): Promise<ScanSummary> {
           }
 
           // CEX 价差告警（独立发送，每次超过阈值都发，不设冷却）
-          if (cexPriceInfo && cexPriceInfo.exceedsThreshold) {
+          // 前置条件：① 全局 CEX 价差推送开关开启 ② 该 token 对未被用户静音
+          const muteKey = `${w.chain_id_ref}|${r.token0.toLowerCase()}|${r.token1.toLowerCase()}`;
+          if (!cexMutedPairs.has(muteKey)) {
+            cexMutedPairs.add(muteKey);
+            const muted = db
+              .prepare("SELECT id FROM cex_alert_mutes WHERE chain_id_ref=? AND token0=? AND token1=?")
+              .get(w.chain_id_ref, r.token0.toLowerCase(), r.token1.toLowerCase());
+            if (muted) cexMutedPairs.add(muteKey);
+          }
+          if (cexPriceInfo && cexPriceInfo.exceedsThreshold && cexEnabled && !cexMutedPairs.has(muteKey)) {
             const n = buildCexPriceNotification(
               w, chain.name, dex.name, dp, r, sym0, sym1,
               cexPriceInfo.payload, positionRow.pair_flip
