@@ -11,12 +11,14 @@
  *   staking:   [{ chain_key, platform, pair_label, contract, read_type, enabled }],
  *   wallets:   [{ chain_key, address, label, enabled }],
  *   cex_mappings: [{ chain_key, token_addr, token_symbol, cex_symbol, fixed_price, quote, inverted, enabled }],
- *   pair_flips: [{ chain_key, dex_name, token0, token1, pair_flip }]
+ *   pair_flips: [{ chain_key, dex_name, token0, token1, pair_flip }],
+ *   cex_alert_mutes: [{ chain_key, token0, token1, muted }]
  * }
  *
  * 导入策略：以「业务唯一键」做 upsert（chain key / chain_id、dex factory、staking contract、
  * wallet chain+address、cex_mapping chain+token_addr），不依赖数据库自增 id，重复导入安全。
  * pair_flips 根据 chain_key + dex_name + token0 + token1 匹配 positions 并恢复翻转状态。
+ * cex_alert_mutes 根据 chain_key + token0 + token1 恢复静音状态。
  * 默认勾选项 enabled 生效。
  */
 import { getDb } from "../db";
@@ -34,6 +36,7 @@ export interface ConfigBundle {
   wallets: any[];
   cex_mappings: any[];
   pair_flips: any[];
+  cex_alert_mutes: any[];
 }
 
 /** 导出当前全部配置（不含 positions/alerts/tokens 运行态数据）。 */
@@ -76,7 +79,17 @@ export function exportConfig(): ConfigBundle {
     pair_flip: true,
   }));
 
-  return { version: EXPORT_VERSION, exportedAt: new Date().toISOString(), chains, dexes, staking, wallets, cex_mappings: cexMappings, pair_flips: pairFlips };
+  const cexAlertMutes = (db.prepare(
+    `SELECT c.key AS chain_key, cam.token0, cam.token1
+     FROM cex_alert_mutes cam JOIN chains c ON c.id = cam.chain_id_ref`
+  ).all() as any[]).map((r) => ({
+    chain_key: r.chain_key,
+    token0: r.token0.toLowerCase(),
+    token1: r.token1.toLowerCase(),
+    muted: true,
+  }));
+
+  return { version: EXPORT_VERSION, exportedAt: new Date().toISOString(), chains, dexes, staking, wallets, cex_mappings: cexMappings, pair_flips: pairFlips, cex_alert_mutes: cexAlertMutes };
 }
 
 export interface ImportResult {
@@ -86,6 +99,7 @@ export interface ImportResult {
   wallets: { added: number; updated: number };
   cex_mappings: { added: number; updated: number };
   pair_flips: { applied: number };
+  cex_alert_mutes: { applied: number };
 }
 
 /** 导入配置。事务内 upsert，失败回滚。mode: 'merge'（默认，跳过已存在）/ 'overwrite'（暂等同 merge）。 */
@@ -98,6 +112,7 @@ export function importConfig(bundle: Partial<ConfigBundle>, mode: "merge" | "ove
     wallets: { added: 0, updated: 0 },
     cex_mappings: { added: 0, updated: 0 },
     pair_flips: { applied: 0 },
+    cex_alert_mutes: { applied: 0 },
   };
   void mode;
 
@@ -214,6 +229,20 @@ export function importConfig(bundle: Partial<ConfigBundle>, mode: "merge" | "ove
            WHERE chain_id_ref = ? AND dex_name = ? AND token0 = ? AND token1 = ? AND pair_flip = 0`
         ).run(chainId, pf.dex_name, token0, token1);
         res.pair_flips.applied += result.changes;
+      }
+    }
+
+    // cex_alert_mutes：写入 cex_alert_mutes 独立表
+    for (const cam of bundle.cex_alert_mutes ?? []) {
+      const chainId = chainKeyToId.get(cam.chain_key);
+      if (!chainId || !cam.token0 || !cam.token1) continue;
+      const token0 = cam.token0.toLowerCase();
+      const token1 = cam.token1.toLowerCase();
+      if (cam.muted) {
+        db.prepare(
+          `INSERT OR IGNORE INTO cex_alert_mutes (chain_id_ref, token0, token1) VALUES (?,?,?)`
+        ).run(chainId, token0, token1);
+        res.cex_alert_mutes.applied++;
       }
     }
   });
