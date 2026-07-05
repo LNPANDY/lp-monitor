@@ -106,9 +106,10 @@ export function loadAllMappings(): Map<number, CexMapping[]> {
  * 批量获取多个币安 symbol 的当前报价（去重 + 进程内缓存 + 单次 REST）。
  *
  * @param symbols 大写 symbol 数组，如 ['0GUSDT','WETHUSDT','WETHUSDT']（重复会被去重）
+ * @param skipCache 为 true 时跳过缓存，强制从币安拉最新价（资产统计等需要实时价格的场景用）
  * @returns symbol → CexQuote。拉取失败的 symbol 不会出现在结果里。
  */
-export async function fetchQuotes(symbols: string[]): Promise<Map<string, CexQuote>> {
+export async function fetchQuotes(symbols: string[], skipCache = false): Promise<Map<string, CexQuote>> {
   const out = new Map<string, CexQuote>();
   // 去重 + 大写
   const uniq = [...new Set(symbols.map((s) => s.toUpperCase()))].filter(Boolean);
@@ -117,6 +118,10 @@ export async function fetchQuotes(symbols: string[]): Promise<Map<string, CexQuo
   const now = Date.now();
   const todo: string[] = [];
   for (const s of uniq) {
+    if (skipCache) {
+      todo.push(s);
+      continue;
+    }
     const hit = _priceCache.get(s);
     if (hit && now - hit.ts < CACHE_TTL_MS) {
       out.set(s, hit.quote);
@@ -128,10 +133,15 @@ export async function fetchQuotes(symbols: string[]): Promise<Map<string, CexQuo
 
   // 币安 /api/v3/ticker/price 支持 symbols=[...] 数组查询（URL 里是方括号包裹的 JSON 字符串数组）。
   // 一次请求拿回多个 symbol 的最新成交价。失败则整体降级（逐个重试成本高，直接放弃本次报价）。
+  //
+  // 重要：必须显式 cache:'no-store'。Next.js 14 服务端 fetch 默认是 force-cache，
+  // 会把币安响应缓存进 Data Cache，导致即便跳过了进程内 _priceCache（skipCache=true），
+  // 拿到的仍是上一次币安请求的缓存响应——资产统计会显示过期报价。
+  // 进程内 _priceCache 已做 30s 跨 token 复用，HTTP 层不需要再缓存。
   try {
     const symbolsParam = encodeURIComponent(JSON.stringify(todo));
     const url = `${BINANCE_HOST}/api/v3/ticker/price?symbols=${symbolsParam}`;
-    const resp = await fetch(url, { headers: { Accept: "application/json" } });
+    const resp = await fetch(url, { headers: { Accept: "application/json" }, cache: "no-store" });
     if (!resp.ok) throw new Error(`binance status ${resp.status}`);
     const data = (await resp.json()) as Array<{ symbol: string; price: string }>;
     for (const item of data) {
@@ -161,8 +171,11 @@ export async function fetchQuote(symbol: string): Promise<CexQuote | null> {
  * 翻转映射（inverted=true）对拉到的报价取倒数并交换 base/quote：
  *   原报价 1 USDC = 1.0001 USDT → 翻转后 1 USDT = 0.9999 USDC
  * 用于扫描器：一次性拿到本链所有 token 的报价，无需区分固定/币安/翻转来源。
+ *
+ * @param skipCache 为 true 时跳过币安报价的进程内缓存，强制拉最新价。
+ *                  资产统计等需要实时价格的场景应传 true，避免展示 30s 内的过期价。
  */
-export async function buildQuotesByAddr(mappings: CexMapping[]): Promise<Map<string, CexQuote>> {
+export async function buildQuotesByAddr(mappings: CexMapping[], skipCache = false): Promise<Map<string, CexQuote>> {
   const out = new Map<string, CexQuote>();
   // 1) 固定价：直接构造，base 取 token_symbol（映射里没存，用 cex_symbol 切分兜底），quote 用 quote 字段
   const binanceSymbols = new Set<string>();
@@ -182,7 +195,7 @@ export async function buildQuotesByAddr(mappings: CexMapping[]): Promise<Map<str
   }
   // 2) 币安映射：批量拉价，回填到 byAddr（翻转的取倒数）
   if (binanceSymbols.size > 0) {
-    const fresh = await fetchQuotes([...binanceSymbols]);
+    const fresh = await fetchQuotes([...binanceSymbols], skipCache);
     for (const m of mappings) {
       if (m.fixedPrice !== null) continue;
       const q = fresh.get(m.cexSymbol);

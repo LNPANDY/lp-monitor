@@ -380,12 +380,13 @@ export async function runScan(): Promise<ScanSummary> {
 
           // CEX 价差告警（独立发送，每次超过阈值都发，不设冷却）
           // 前置条件：① 全局 CEX 价差推送开关开启 ② 该 token 对未被用户静音
+          // 静音状态按 (chain_id_ref, token0, token1) 缓存到 cexMutedPairs，避免同一 token 对跨仓位重复查 DB
           const muteKey = `${w.chain_id_ref}|${r.token0.toLowerCase()}|${r.token1.toLowerCase()}`;
           if (!cexMutedPairs.has(muteKey)) {
-            cexMutedPairs.add(muteKey);
             const muted = db
               .prepare("SELECT id FROM cex_alert_mutes WHERE chain_id_ref=? AND token0=? AND token1=?")
               .get(w.chain_id_ref, r.token0.toLowerCase(), r.token1.toLowerCase());
+            // 仅当 DB 确认静音时才加入集合；未静音的 token 对不加入，保持 has()=false
             if (muted) cexMutedPairs.add(muteKey);
           }
           if (cexPriceInfo && cexPriceInfo.exceedsThreshold && cexEnabled && !cexMutedPairs.has(muteKey)) {
@@ -612,8 +613,7 @@ function buildTickMoveNotification(
   const pct = (x: number) => `${(x * 100).toFixed(1)}%`;
   const title = `📈 LP 波动 ${tag} ${displayPair} · ${chainName}/${dexName}`;
   const body =
-    `仓位 #${dp.tokenId}（${displayPair}）价格波动较大，${direction}\n` +
-    `区间内位置: ${pct(prevMarginLower)} → ${pct(currMarginLower)}（变动 ${pct(delta)}）\n` +
+    `仓位 #${dp.tokenId} 区间内位置: ${pct(prevMarginLower)} → ${pct(currMarginLower)}（变动 ${pct(delta)}）\n` +
     `当前 tick: ${r.status.currentTick}\n` +
     `区间: [${r.tickLower}, ${r.tickUpper}]\n` +
     `价格(1 ${displayLabel0} ≈ x ${displayLabel1}): ${displayPrice}\n` +

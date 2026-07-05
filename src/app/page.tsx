@@ -185,18 +185,21 @@ function PortfolioSection() {
   const { data: chains } = useSWR<any[]>("/api/chains", fetcher);
   const [chainId, setChainId] = useState<number | "">("");
   const [addr, setAddr] = useState("");
-  // 手动触发：点「统计」后才请求，避免无输入时自动拉链上数据
-  const [query, setQuery] = useState<{ chainId: number; addr: string } | null>(null);
+  // 手动触发：点「统计」后才请求，避免无输入时自动拉链上数据。
+  // query 里带一个自增 seq，每次点击都产生全新的 SWR key，从而：
+  //  ① 不复用上次的 SWR 缓存数据（避免先显示旧数据再后台刷新）
+  //  ② isLoading=true，明确展示「统计中…」
+  const [query, setQuery] = useState<{ chainId: number; addr: string; seq: number } | null>(null);
   // ERC20 代币列表折叠状态（默认展开）
   const [erc20Open, setErc20Open] = useState(true);
   const { data, error, isLoading } = useSWR<PortfolioResult>(
-    query ? `/api/portfolio?chain_id=${query.chainId}&address=${encodeURIComponent(query.addr)}` : null,
+    query ? `/api/portfolio?chain_id=${query.chainId}&address=${encodeURIComponent(query.addr)}&_=${query.seq}` : null,
     fetcher
   );
 
   function doQuery() {
     if (!chainId || !/^0x[a-fA-F0-9]{40}$/.test(addr.trim())) return;
-    setQuery({ chainId, addr: addr.trim() });
+    setQuery((prev) => ({ chainId, addr: addr.trim(), seq: (prev?.seq ?? 0) + 1 }));
   }
 
   return (

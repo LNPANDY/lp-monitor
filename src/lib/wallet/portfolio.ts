@@ -78,9 +78,11 @@ export async function computePortfolio(chainDbId: number, address: string): Prom
   const warnings: string[] = [];
 
   // ===== 1. 加载该链 CEX 报价（含 __native__ 的 GAS 报价） =====
+  // 资产统计需要实时价格，跳过 binance.ts 的 30s 进程内缓存，强制拉最新价，
+  // 否则短时间内多次打开资产面板会看到过期价（典型场景：刚切换链/钱包后立即查看）。
   const allMappings = loadAllMappings();
   const chainMappings = allMappings.get(chainDbId) ?? [];
-  const quoteByAddr = await buildQuotesByAddr(chainMappings);
+  const quoteByAddr = await buildQuotesByAddr(chainMappings, true);
 
   // ===== 2. 原生 GAS 余额 =====
   const items: AssetItem[] = [];
