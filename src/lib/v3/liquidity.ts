@@ -25,6 +25,7 @@ import {
   getAmountsForLiquidity,
   tickToSqrtPriceX96,
   tickToPriceDisplay,
+  sqrtPriceX96ToHumanPrice,
   FEE_TO_TICK_SPACING,
 } from "./math";
 
@@ -316,6 +317,8 @@ export interface MinRangeProbeResult {
   /** 价格区间 [low, high] */
   priceLow: string;
   priceHigh: string;
+  /** 当前 tick 对应价格（1 token0 = ? token1，与 priceLow/priceHigh 同口径） */
+  priceCurrent: string;
   priceLabel: string;
   fee: number;
   token0Symbol: string;
@@ -381,6 +384,7 @@ export async function probeMinRange(
     liquidity,
     priceLow: tickToPriceDisplay(tickLower, decimals0, decimals1),
     priceHigh: tickToPriceDisplay(tickUpper, decimals0, decimals1),
+    priceCurrent: sqrtPriceX96ToHumanPrice(sqrtPriceX96, decimals0, decimals1),
     priceLabel: `${symbol0}/${symbol1}`,
     fee: info.fee,
     token0Symbol: symbol0,

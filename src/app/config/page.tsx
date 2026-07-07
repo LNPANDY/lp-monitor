@@ -285,6 +285,7 @@ function StakingSection() {
               { key: "pair_label", label: "交易对" },
               { key: "contract", label: "合约地址" },
               { key: "read_type", label: "读取方式" },
+              { key: "dex_id", label: "关联DEX", type: "select", options: dexes?.map((d: any) => ({ value: d.id.toString(), label: d.name })) || [] },
             ]}
             values={s}
             onSave={async (u) => { await api(`/api/staking/${s.id}`, "PATCH", u); mutate(chainId ? `/api/staking?chain_id=${chainId}` : "/api/staking"); }}
@@ -294,6 +295,7 @@ function StakingSection() {
                 {s.pair_label && <span className="text-ink-soft">{s.pair_label}</span>}
                 <span className="text-ink-soft">{s.chain_name}</span>
                 <span className="font-mono text-xs text-ink-soft">{short(s.contract)}</span>
+                {s.dex_name && <span className="tag-muted text-xs">{s.dex_name}</span>}
               </div>
             }
             actions={<>

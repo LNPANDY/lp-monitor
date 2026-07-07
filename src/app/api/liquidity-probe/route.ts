@@ -5,6 +5,8 @@ import { listDexes } from "@/lib/chains/dexes";
 import { resolveTokens } from "@/lib/chains/tokens";
 import { probeMinRange } from "@/lib/v3/liquidity";
 import type { MinRangeProbeResult } from "@/lib/v3/liquidity";
+import { loadAllMappings, buildQuotesByAddr, type CexQuote } from "@/lib/cex/binance";
+import { sqrtPriceX96ToHumanPrice } from "@/lib/v3/math";
 
 export const dynamic = "force-dynamic";
 
@@ -115,6 +117,47 @@ export async function POST(req: Request) {
     return fail(`最小区间探针失败：${(e as Error).message}`, 502);
   }
 
+  // 6. CEX 差价计算（复用 scanner 同款逻辑）
+  const cexMappingsByChain = loadAllMappings();
+  const chainMappings = cexMappingsByChain.get(b.chainId) ?? [];
+  let cexPayload: any = undefined;
+  if (chainMappings.length > 0) {
+    const quoteByAddr = await buildQuotesByAddr(chainMappings);
+    const q0 = quoteByAddr.get(token0.toLowerCase());
+    const q1 = quoteByAddr.get(token1.toLowerCase());
+    if (q0 && q1 && result.priceCurrent) {
+      const dexRate = Number(result.priceCurrent);
+      const cexRate = q0.price / q1.price;
+      if (Number.isFinite(dexRate) && dexRate > 0 && Number.isFinite(cexRate) && cexRate > 0) {
+        const diff = (dexRate - cexRate) / cexRate;
+        const absDiff = Math.abs(diff);
+        const threshold = (result.fee / 1_000_000) * 2;
+        const quote = q0.quote === q1.quote ? q0.quote || "USD" : `${q0.quote}/${q1.quote}`;
+        cexPayload = {
+          pairLabel: `${sym0}/${sym1}`,
+          token0CexSymbol: q0.symbol,
+          token1CexSymbol: q1.symbol,
+          quote,
+          dexRate,
+          cexRate,
+          diff,
+          absDiff,
+          exceedsThreshold: absDiff >= threshold,
+        };
+      }
+    }
+  }
+
+  // 7. 翻转状态：从 pair_flips 表读取（按 chain + token 对匹配）
+  let pairFlip = 0;
+  const dexName = npm
+    ? (listDexes(b.chainId, false).find(d => d.npm.toLowerCase() === npm.toLowerCase())?.name ?? "")
+    : "";
+  const flipRow = db
+    .prepare("SELECT id FROM pair_flips WHERE chain_id_ref=? AND (dex_name=? OR dex_name='') AND token0=? AND token1=?")
+    .get(b.chainId, dexName, token0.toLowerCase(), token1.toLowerCase());
+  if (flipRow) pairFlip = 1;
+
   // 6. 写缓存（probe 快照 position_id 为空）
   const now = new Date();
   const expires = new Date(now.getTime() + CACHE_TTL_MS);
@@ -153,7 +196,7 @@ export async function POST(req: Request) {
     expires.toISOString()
   );
 
-  return ok({ ...result, cached: false });
+  return ok({ ...result, token0, token1, pairFlip, cex: cexPayload, cached: false });
   } catch (e) {
     console.error("[liquidity-probe] UNCAUGHT:", e);
     return fail(`未捕获异常：${(e as Error).message}`, 500);

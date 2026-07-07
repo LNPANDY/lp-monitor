@@ -14,12 +14,30 @@ interface ProbeResult {
   liquidity: { amount0: string; amount1: string };
   priceLow: string;
   priceHigh: string;
+  priceCurrent: string;
   priceLabel: string;
   fee: number;
+  token0: string;
+  token1: string;
   token0Symbol: string;
   token1Symbol: string;
   sampledAt: string;
   cached?: boolean;
+  pairFlip?: number;
+  cex?: CexPricePayload;
+}
+
+/** CEX 价差结构（与后端 CexPricePayload / scanner 对齐） */
+interface CexPricePayload {
+  pairLabel: string;
+  token0CexSymbol: string;
+  token1CexSymbol: string;
+  quote: string;
+  dexRate: number;
+  cexRate: number;
+  diff: number;
+  absDiff: number;
+  exceedsThreshold?: boolean;
 }
 
 interface Chain {
@@ -51,6 +69,26 @@ interface Favorite {
   fee?: number | null;
 }
 
+/** 展开小数，避免科学计数法 */
+function fmtFull(n: number): string {
+  if (!Number.isFinite(n)) return "—";
+  if (n === 0) return "0";
+  let s = Math.abs(n) < 1 ? n.toFixed(18) : n.toFixed(8);
+  if (s.indexOf(".") >= 0) s = s.replace(/0+$/, "").replace(/\.$/, "");
+  if (/[eE]/.test(s)) {
+    const neg = n < 0;
+    const parts = s.replace(/-/g, "").split(/[eE]/);
+    const exp = parseInt(parts[1]);
+    const base = parts[0].replace(".", "");
+    if (exp > 0) {
+      s = base + "0".repeat(exp - (parts[0].includes(".") ? parts[0].split(".")[1].length : 0));
+    }
+  }
+  return s === "" || s === "-" ? "0" : s;
+}
+
+const pctSigned = (x: number) => `${x >= 0 ? "+" : ""}${(x * 100).toFixed(2)}%`;
+
 /**
  * 最小区间流动性探针（场景C）+ 收藏。
  *
@@ -72,9 +110,15 @@ export function LiquidityProbe() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [favMsg, setFavMsg] = useState("");
+  // 翻转状态（来自后端返回，或本地切换暂存）
+  const [localFlip, setLocalFlip] = useState(0);
+  const [flipLoading, setFlipLoading] = useState(false);
 
   // 根据选择的链过滤可用的 DEX
   const availableDexes = chainId ? (allDexes ?? []).filter(d => d.chain_id_ref === Number(chainId) && d.enabled) : [];
+
+  // 当前生效的翻转状态（优先用后端返回的 pairFlip）
+  const flip = (result?.pairFlip ?? localFlip) === 1;
 
   async function probe(force: boolean, overrides?: { chainId?: string; pool?: string; staker?: string; npm?: string; dexId?: string }) {
     const cId = overrides?.chainId ?? chainId;
@@ -111,10 +155,41 @@ export function LiquidityProbe() {
       const j = await r.json();
       if (!j.ok) throw new Error(j.error || "探针失败");
       setResult(j.data as ProbeResult);
+      setLocalFlip(j.data.pairFlip ?? 0);
     } catch (e: any) {
       setError(e.message);
     } finally {
       setLoading(false);
+    }
+  }
+
+  /** 翻转交易对 */
+  async function handleFlip() {
+    if (!chainId || !result) return;
+    setFlipLoading(true);
+    try {
+      const npmAddr = dexId
+        ? (allDexes ?? []).find(d => d.id === Number(dexId))?.npm ?? npm
+        : npm;
+      const r = await fetch("/api/liquidity-probe/pair-flip", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          chain_id: Number(chainId),
+          token0: result.token0,
+          token1: result.token1,
+          flip: !flip,
+          npm: npmAddr,
+        }),
+      });
+      const j = await r.json();
+      if (!j.ok) throw new Error(j.error || "翻转失败");
+      // 翻转成功后重新探测，让后端返回最新 pairFlip + cex
+      await probe(false);
+    } catch (e: any) {
+      alert("翻转失败：" + e.message);
+    } finally {
+      setFlipLoading(false);
     }
   }
 
@@ -200,6 +275,17 @@ export function LiquidityProbe() {
       // ignore
     }
   }
+
+  // 探针结果：翻转后的展示计算
+  const displaySym0 = result ? (flip ? result.token1Symbol : result.token0Symbol) : "";
+  const displaySym1 = result ? (flip ? result.token0Symbol : result.token1Symbol) : "";
+  const displayPair = result ? (flip ? `${result.token1Symbol}/${result.token0Symbol}` : `${result.token0Symbol}/${result.token1Symbol}`) : "";
+  const displayPriceCurrent = result?.priceCurrent
+    ? fmtFull(flip ? 1 / Number(result.priceCurrent) : Number(result.priceCurrent))
+    : "";
+  const displayCexRate = result?.cex ? (flip ? 1 / result.cex.cexRate : result.cex.cexRate) : 0;
+  const displayToken0Cex = result?.cex ? (flip ? result.cex.token1CexSymbol : result.cex.token0CexSymbol) : "";
+  const displayToken1Cex = result?.cex ? (flip ? result.cex.token0CexSymbol : result.cex.token1CexSymbol) : "";
 
   return (
     <div className="card p-4">
@@ -324,21 +410,41 @@ export function LiquidityProbe() {
       {result && (
         <div className="mt-3 rounded border border-slate-200 bg-slate-50 p-3 text-xs">
           <div className="mb-1.5 flex items-center gap-2">
-            <span className="font-semibold">{result.token0Symbol}/{result.token1Symbol}</span>
+            <span className="font-semibold">{displayPair}</span>
             <span className="tag-muted">{result.fee / 10000}%</span>
             <span className="tag-muted">ts {result.tickSpacing}</span>
             {result.cached && <span className="text-[10px] text-ink-soft">缓存命中</span>}
+            {flip && (
+              <span className="text-xs text-blue-600 bg-blue-50 px-1.5 py-0.5 rounded" title="交易对已翻转">
+                翻转
+              </span>
+            )}
           </div>
           <div className="space-y-0.5">
             <PRow label="当前 tick / 窗口">
               {result.currentTick} [{result.tickLower}, {result.tickUpper}]
             </PRow>
             <PRow label="窗口流动性">
-              {result.liquidity.amount0} {result.token0Symbol} / {result.liquidity.amount1} {result.token1Symbol}
+              {result.liquidity.amount0} {displaySym0} / {result.liquidity.amount1} {displaySym1}
+            </PRow>
+            <PRow label="当前价格">
+              1 {displaySym0} ≈ {displayPriceCurrent} {displaySym1}
             </PRow>
             <PRow label="价格区间">
-              {result.priceLow} ~ {result.priceHigh} {result.priceLabel}
+              {result.priceLow} ~ {result.priceHigh} {displaySym1}/{displaySym0}
             </PRow>
+            {result.cex && displayToken0Cex && displayToken1Cex && (
+              <PRow label={`CEX 汇率 (${displayToken0Cex}÷${displayToken1Cex})`}>
+                <span>1 {displaySym0} = {fmtFull(displayCexRate)} {displaySym1}</span>
+              </PRow>
+            )}
+            {result.cex && (
+              <PRow label="CEX差价">
+                <span className={result.cex.absDiff >= 0.01 ? "text-warn font-semibold" : ""}>
+                  {pctSigned(result.cex.diff)}
+                </span>
+              </PRow>
+            )}
             <PRow label="采样时间">{new Date(result.sampledAt).toLocaleString()}</PRow>
           </div>
 
@@ -357,8 +463,11 @@ export function LiquidityProbe() {
             </div>
           </div>
 
-          <div className="mt-1.5">
+          <div className="mt-1.5 flex gap-2">
             <button className="btn-ghost text-xs" onClick={() => probe(true)}>强制刷新</button>
+            <button className="btn-ghost text-xs" onClick={handleFlip} disabled={flipLoading}>
+              {flipLoading ? "翻转中…" : flip ? "🔄 取消翻转" : "🔄 翻转交易对"}
+            </button>
           </div>
         </div>
       )}

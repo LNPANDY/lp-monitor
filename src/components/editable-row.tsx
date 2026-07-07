@@ -12,7 +12,7 @@ export function EditableRow({
   actions,
   disabled,
 }: {
-  fields: { key: string; label: string; placeholder?: string }[];
+  fields: { key: string; label: string; placeholder?: string; type?: string; options?: Array<{ value: string; label: string }> }[];
   values: Record<string, any>;
   onSave: (updates: Record<string, any>) => Promise<void>;
   display?: React.ReactNode;
@@ -50,12 +50,27 @@ export function EditableRow({
           {fields.map((f) => (
             <label key={f.key} className="block">
               <span className="label">{f.label}</span>
-              <input
-                className="input"
-                value={form[f.key] ?? ""}
-                placeholder={f.placeholder ?? ""}
-                onChange={(e) => setForm({ ...form, [f.key]: e.target.value })}
-              />
+              {f.type === "select" ? (
+                <select
+                  className="input"
+                  value={form[f.key] ?? ""}
+                  onChange={(e) => setForm({ ...form, [f.key]: e.target.value })}
+                >
+                  <option value="">无关联</option>
+                  {f.options?.map((option) => (
+                    <option key={option.value} value={option.value}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
+              ) : (
+                <input
+                  className="input"
+                  value={form[f.key] ?? ""}
+                  placeholder={f.placeholder ?? ""}
+                  onChange={(e) => setForm({ ...form, [f.key]: e.target.value })}
+                />
+              )}
             </label>
           ))}
         </div>

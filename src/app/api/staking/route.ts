@@ -7,7 +7,12 @@ export async function GET(req: Request) {
   const url = new URL(req.url);
   const chainId = url.searchParams.get("chain_id");
   const db = getDb();
-  let sql = "SELECT s.*, c.name AS chain_name, c.key AS chain_key FROM staking_contracts s JOIN chains c ON c.id=s.chain_id_ref WHERE 1=1";
+  let sql = `
+    SELECT s.*, c.name AS chain_name, c.key AS chain_key, d.name AS dex_name 
+    FROM staking_contracts s 
+    JOIN chains c ON c.id=s.chain_id_ref 
+    LEFT JOIN dexes d ON d.id=s.dex_id 
+    WHERE 1=1`;
   const args: any[] = [];
   if (chainId) { sql += " AND s.chain_id_ref=?"; args.push(chainId); }
   sql += " ORDER BY s.created_at DESC";

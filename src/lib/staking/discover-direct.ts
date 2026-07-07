@@ -153,7 +153,7 @@ async function scanContractPositions(
 }
 
 /**
- * 验证一批 tokenId 是否属于目标钱包（通过 deposits(tokenId) 查 owner）
+ * 验证一批 tokenId 是否属于目标钱包（通过 depositorOf(tokenId) 查 owner）
  */
 async function verifyTokenBatch(
   client: PublicClient,
@@ -166,15 +166,12 @@ async function verifyTokenBatch(
 ): Promise<void> {
   const abi = [
     {
-      name: "deposits",
+      name: "depositorOf",
       type: "function",
       stateMutability: "view",
-      inputs: [{ name: "tokenId", type: "uint256" }],
+      inputs: [{ name: "", type: "uint256" }],
       outputs: [
-        { name: "owner", type: "address" },
-        { name: "liquidity", type: "uint128" },
-        { name: "tickLower", type: "int24" },
-        { name: "tickUpper", type: "int24" },
+        { name: "", type: "address" },
       ],
     },
   ] as const;
@@ -191,11 +188,11 @@ async function verifyTokenBatch(
         const res = await client.readContract({
           address: contract,
           abi,
-          functionName: "deposits",
+          functionName: "depositorOf",
           args: [BigInt(idStr)],
-        }) as unknown as any[];
+        }) as string;
 
-        if ((res[0] as string).toLowerCase() === targetWallet.toLowerCase()) {
+        if (res.toLowerCase() === targetWallet.toLowerCase()) {
           result.push({
             tokenId: idStr,
             dexId,
@@ -204,8 +201,8 @@ async function verifyTokenBatch(
             stakingId,
           });
         }
-      } catch (error) {
-        // 该合约可能不支持 deposits(uint256) 签名，忽略
+} catch (error) {
+        // 该合约可能不支持 depositorOf(uint256) 签名，忽略
       }
     });
 

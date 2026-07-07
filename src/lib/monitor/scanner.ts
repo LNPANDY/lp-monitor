@@ -611,9 +611,14 @@ function buildTickMoveNotification(
     : "";
 
   const pct = (x: number) => `${(x * 100).toFixed(1)}%`;
+  // 涨跌判定（考虑翻转）：tick 上移 → 原始价格（1 token0=? token1）上涨
+  //   未翻转：展示口径 = 原始价格 → tick 上移 = 上涨
+  //   已翻转：展示口径 = 1/原始价格 → tick 上移 = 下跌
+  const tickUp = currMarginLower > prevMarginLower;
+  const displayDirection = tickUp === !flip ? "上涨" : "下跌";
   const title = `📈 LP 波动 ${tag} ${displayPair} · ${chainName}/${dexName}`;
   const body =
-    `仓位 #${dp.tokenId} 区间内位置: ${pct(prevMarginLower)} → ${pct(currMarginLower)}（变动 ${pct(delta)}）\n` +
+    `仓位 #${dp.tokenId} 区间内位置: ${pct(prevMarginLower)} → ${pct(currMarginLower)}（变动 ${pct(delta)}，${displayDirection}）\n` +
     `当前 tick: ${r.status.currentTick}\n` +
     `区间: [${r.tickLower}, ${r.tickUpper}]\n` +
     `价格(1 ${displayLabel0} ≈ x ${displayLabel1}): ${displayPrice}\n` +
