@@ -159,8 +159,7 @@ export function exportConfig(): ConfigBundle {
       token0_symbol: symbols.token0_symbol,
       token1_symbol: symbols.token1_symbol,
       fee: r.fee,
-    };
-  });
+    });
 
   return { version: EXPORT_VERSION, exportedAt: new Date().toISOString(), chains, dexes, staking, wallets, cex_mappings: cexMappings, pair_flips: pairFlips, cex_alert_mutes: cexAlertMutes, liquidity_favorites: liquidityFavorites };
 }

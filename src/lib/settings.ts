@@ -9,6 +9,7 @@ export interface AppSettings {
   staking_scan_fallback_enabled: boolean;
   staking_scan_contract_batch_size: number;
   staking_scan_concurrent_limit: number;
+  push_cooldown_minutes: number;
 }
 
 interface SettingRow { key: string; value: string }
@@ -43,6 +44,12 @@ export function getSettings(): Partial<AppSettings> {
         const concurrent = parseInt(value);
         if (!isNaN(concurrent) && concurrent > 0) {
           settings[key] = concurrent;
+        }
+        break;
+      case "push_cooldown_minutes":
+        const cooldown = parseInt(value);
+        if (!isNaN(cooldown) && cooldown >= 1) {
+          settings[key] = cooldown;
         }
         break;
     }
@@ -114,4 +121,12 @@ export function getContractBatchSize(): number {
  */
 export function isStakingFallbackEnabled(): boolean {
   return getSetting("staking_scan_fallback_enabled") || true;
+}
+
+/**
+ * 获取推送冷却时间（分钟）
+ */
+export function getPushCooldownMinutes(): number {
+  const cooldown = getSetting("push_cooldown_minutes") || 2;
+  return Math.min(Math.max(cooldown, 1), 60); // 限制在1-60分钟之间
 }

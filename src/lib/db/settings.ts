@@ -42,3 +42,9 @@ export function isTickMoveEnabled(): boolean {
 export function isCexPriceEnabled(): boolean {
   return getSetting("cex_price_enabled", "0") === "1";
 }
+
+/** 推送冷却时间（分钟）。默认 2 分钟，可选 2, 5, 10, 20, 30。 */
+export function getPushCooldownMinutes(): number {
+  const v = Number(getSetting("push_cooldown_minutes", ""));
+  return [2, 5, 10, 20, 30].includes(v) ? v : 2;
+}

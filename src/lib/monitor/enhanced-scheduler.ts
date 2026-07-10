@@ -124,7 +124,17 @@ async function scanKnownPositionsWrapper() {
     return summary;
   } catch (e: any) {
     console.error("[scanner-known] scan failed:", e);
-    _lastKnownPositionsSummary = { error: e?.message ?? String(e), at: new Date().toISOString() };
+    _lastKnownPositionsSummary = { 
+      positions: 0, 
+      active: 0, 
+      closed: 0, 
+      alertsSent: 0, 
+      pushSkipped: 0, 
+      durationMs: 0,
+      errors: [],
+      error: e?.message ?? String(e), 
+      at: new Date().toISOString() 
+    };
     throw e;
   } finally {
     _running = false;
@@ -147,7 +157,17 @@ async function fullScanWrapper() {
     return summary;
   } catch (e: any) {
     console.error("[scanner] scan failed:", e);
-    _lastFullScanSummary = { error: e?.message ?? String(e), at: new Date().toISOString() };
+    _lastFullScanSummary = { 
+      wallets: 0, 
+      positions: 0, 
+      outOfRange: 0, 
+      alertsSent: 0, 
+      errors: [],
+      startedAt: new Date().toISOString(),
+      durationMs: 0,
+      error: e?.message ?? String(e), 
+      at: new Date().toISOString() 
+    };
     throw e;
   } finally {
     _running = false;

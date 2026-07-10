@@ -282,7 +282,7 @@ async function getPositionStatus(
     inRange: posData.status.inRange,
     liquidity: posData.liquidity,
     price: posData.status.price.toString(),
-    isClosed: posData.liquidity === BigInt(0) || posData.liquidity === '' || !posData.liquidity,
+    isClosed: posData.liquidity === BigInt(0),
     cexPrice
   };
 }
@@ -323,6 +323,30 @@ function checkAlertConditions(position: any, status: any): Alert[] {
     
     // 检查是否超过阈值
     if (priceDiff > 1) { // 超过1%差价才告警
+      // 检查历史差价，避免频繁推送
+      const lastAlert = db.prepare(`
+        SELECT message, sent_at FROM alerts 
+        WHERE position_id = ? AND type = 'cex_price_diff' 
+        ORDER BY sent_at DESC LIMIT 1
+      `).get(position.id) as { message: string; sent_at: string } | undefined;
+      
+      if (lastAlert && lastAlert.message) {
+        const lastMessage = lastAlert.message;
+        const match = lastMessage.match(/差价 (\d+\.?\d*)%/);
+        if (match && match[1]) {
+          const lastDiff = parseFloat(match[1]);
+        
+        // 如果两次差价相差小于10%，且时间间隔小于推送频率，则跳过
+        if (Math.abs(priceDiff - lastDiff) < 10) {
+          const pushCooldown = getPushCooldownMinutes() * 60 * 1000;
+          const timeDiff = Date.now() - new Date(lastAlert.sent_at).getTime();
+          
+          if (timeDiff < pushCooldown) {
+            return; // 跳过这次推送
+          }
+        }
+      }
+      
       alerts.push({
         type: 'cex_price_diff',
         message: `CEX差价告警: ${position.token0_symbol}/${position.token1_symbol} DEX价格: $${dexPrice.toFixed(4)}, CEX价格: $${cexPrice.toFixed(4)}, 差价: ${priceDiff.toFixed(2)}%`,
@@ -347,39 +371,6 @@ function checkAlertConditions(position: any, status: any): Alert[] {
 async function processAlerts(position: any, alert: Alert, summary: KnownPositionsSummary) {
   const db = getDb();
   const now = new Date().toISOString();
-  
-  // 特殊处理CEX差价告警
-  if (alert.type === 'cex_price_diff') {
-    // 检查历史差价，避免频繁推送
-    const lastAlert = db.prepare(`
-      SELECT message, sent_at FROM alerts 
-      WHERE position_id = ? AND type = 'cex_price_diff' 
-      ORDER BY sent_at DESC LIMIT 1
-    `).get(position.id) as { message: string; sent_at: string } | undefined;
-    
-    if (lastAlert && lastAlert.message) {
-      const lastMessage = lastAlert.message;
-      const match = lastMessage.match(/差价 (\d+\.?\d*)%/);
-      if (match && match[1]) {
-        const lastDiff = parseFloat(match[1]);
-        
-        // 计算当前差价
-        const currentDiff = parseFloat(alert.message.match(/差价 (\d+\.?\d*)%/)![1]);
-        
-        // 如果两次差价相差小于10%，且时间间隔小于推送频率，则跳过
-        if (Math.abs(currentDiff - lastDiff) < 10) {
-          const pushCooldown = getPushCooldownMinutes() * 60 * 1000;
-          const timeDiff = Date.now() - new Date(lastAlert.sent_at).getTime();
-          
-          if (timeDiff < pushCooldown) {
-            summary.pushSkipped++;
-            console.log(`[scanner-known] 跳过CEX差价推送: ${alert.type} (仓位 ${position.id})`);
-            return;
-          }
-        }
-      }
-    }
-  }
   
   // 检查推送频次
   const pushAllowed = await checkPushCooldown(position.id, alert.type);

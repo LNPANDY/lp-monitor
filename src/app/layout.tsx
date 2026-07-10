@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import Link from "next/link";
 import { ExtensionGuard } from "@/components/extension-guard";
+import { WalletConnect } from "@/components/wallet-connect";
 import "./globals.css";
 
 export const metadata: Metadata = {
@@ -23,6 +24,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
               <Link href="/" className="hover:underline">仪表盘</Link>
               <Link href="/alerts" className="hover:underline">告警</Link>
               <Link href="/config" className="hover:underline">配置</Link>
+              <WalletConnect />
             </nav>
           </div>
         </header>

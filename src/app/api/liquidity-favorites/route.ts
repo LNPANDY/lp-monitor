@@ -1,5 +1,7 @@
 import { getDb } from "@/lib/db";
 import { ok, fail, getBody } from "@/lib/api";
+import { getClient } from "@/lib/chains";
+import { resolveTokens } from "@/lib/chains/tokens";
 
 export const dynamic = "force-dynamic";
 
@@ -29,12 +31,13 @@ export async function GET(req: Request) {
   const chainId = url.searchParams.get("chain_id");
   const db = getDb();
   let sql = `SELECT f.*, c.name AS chain_name,
-                    ls.token0_symbol, ls.token1_symbol,
-                    json_extract(ls.payload, '$.fee') AS fee
+                    f.token0_symbol,
+                    f.token1_symbol,
+                    COALESCE(json_extract(ls.payload, '$.fee'), 0) AS fee
              FROM liquidity_favorites f
              JOIN chains c ON c.id=f.chain_id_ref
              LEFT JOIN (
-               SELECT chain_id_ref, pool_addr, staker_addr, token0_symbol, token1_symbol, payload
+               SELECT chain_id_ref, pool_addr, staker_addr, payload
                FROM liquidity_snapshots
                WHERE id IN (
                  SELECT MAX(id) FROM liquidity_snapshots
@@ -48,7 +51,32 @@ export async function GET(req: Request) {
   if (chainId) { sql += " AND f.chain_id_ref=?"; args.push(Number(chainId)); }
   sql += " ORDER BY f.sort_order DESC, f.created_at DESC";
   const rows = db.prepare(sql).all(...args) as (FavoriteRow & ChainInfo)[];
-  return ok(rows);
+  
+  // 直接使用 liquidity_favorites 表中的 token symbol
+  const enhancedRows = rows.map(row => {
+    // 如果 symbol 为空字符串，尝试从快照获取 fee 信息
+    if (!row.token0_symbol && !row.token1_symbol) {
+      const pos = db.prepare(`
+        SELECT token0_symbol, token1_symbol 
+        FROM positions 
+        WHERE chain_id_ref = ? AND pool = ? AND COALESCE(staker_contract, '') = COALESCE(?, '')
+        ORDER BY last_checked_at DESC 
+        LIMIT 1
+      `).get(row.chain_id_ref, row.pool_addr, row.staker_addr) as { token0_symbol: string; token1_symbol: string } | undefined;
+      
+      if (pos && pos.token0_symbol && pos.token1_symbol) {
+        return {
+          ...row,
+          token0_symbol: pos.token0_symbol,
+          token1_symbol: pos.token1_symbol
+        };
+      }
+    }
+    
+    return row;
+  });
+  
+  return ok(enhancedRows);
 }
 
 /** 新建收藏。chain_id + pool 必填，label/staker/npm 可选。 */

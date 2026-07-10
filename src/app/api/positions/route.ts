@@ -10,7 +10,7 @@ export async function GET(req: Request) {
   const includeClosed = url.searchParams.get("all") === "1";
   const db = getDb();
   let sql = `SELECT p.*, w.label AS wallet_label, w.address AS wallet_address,
-                    c.name AS chain_name, c.key AS chain_key, c.explorer_url,
+                    c.name AS chain_name, c.key AS chain_key, c.explorer_url, c.chain_id AS chain_id,
                     d.name AS dex_display_name,
                     (SELECT a.type FROM alerts a WHERE a.position_id=p.id ORDER BY a.sent_at DESC LIMIT 1) AS last_alert_type,
                     (SELECT CASE WHEN m.id IS NOT NULL THEN 1 ELSE 0 END

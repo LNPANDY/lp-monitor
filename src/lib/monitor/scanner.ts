@@ -42,6 +42,8 @@ export interface ScanSummary {
   errors: string[];
   startedAt: string;
   durationMs: number;
+  at?: string;
+  error?: string;
 }
 
 interface WalletRow {

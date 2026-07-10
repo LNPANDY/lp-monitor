@@ -19,12 +19,14 @@ function cronToLabel(cron: string): string {
 }
 import { LiquidityButton } from "@/components/liquidity-button";
 import { LiquidityProbe } from "@/components/liquidity-probe";
+import { RemovePositionButton } from "@/components/remove-position-button";
 import { Field } from "@/components/form";
 
 interface Position {
   id: number;
   dex_name: string;
   dex_display_name?: string;
+  dex_id?: number;
   token_id: string;
   token0: string;
   token1: string;
@@ -43,6 +45,7 @@ interface Position {
   staker_contract: string;
   chain_name: string;
   chain_key: string;
+  chain_id: number; // EVM chainId（钱包切链用）
   explorer_url: string;
   wallet_label: string;
   wallet_address: string;
@@ -389,6 +392,23 @@ function ScanIntervalAndAlerts({ currentCron, onChanged }: { currentCron: string
     } finally { setBusy(false); }
   }
 
+  async function applyPushCooldown(minutes: number) {
+    setBusy(true); setMsg("");
+    try {
+      const r = await fetch("/api/alert-settings", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ push_cooldown_minutes: minutes }),
+      });
+      const j = await r.json();
+      if (!j.ok) throw new Error(j.error);
+      setMsg(`✅ 推送冷却时间已更新为 ${minutes} 分钟`);
+      mutateAlerts();
+    } catch (e: any) {
+      setMsg(`❌ ${e.message}`);
+    } finally { setBusy(false); }
+  }
+
   return (
     <div className="card p-4">
       <div className="flex flex-wrap items-center gap-4">
@@ -463,6 +483,24 @@ function ScanIntervalAndAlerts({ currentCron, onChanged }: { currentCron: string
           >
             应用阈值
           </button>
+        </div>
+
+        {/* 推送冷却时间 */}
+        <div className="flex items-center gap-2">
+          <span className="text-sm font-medium">推送冷却：</span>
+          <select
+            className="input max-w-[120px] text-xs"
+            value={alertData?.push_cooldown_minutes || 2}
+            onChange={(e) => applyPushCooldown(Number(e.target.value))}
+            disabled={busy}
+          >
+            <option value="2">2分钟</option>
+            <option value="5">5分钟</option>
+            <option value="10">10分钟</option>
+            <option value="20">20分钟</option>
+            <option value="30">30分钟</option>
+          </select>
+          <span className="text-xs text-ink-soft">相同告警间隔</span>
         </div>
       </div>
 
@@ -684,6 +722,12 @@ function PositionCard({ p, highlight, closed, onFlipped }: { p: Position; highli
       </div>
 
       {!closed && <LiquidityButton positionId={p.id} staking={p.source === "staking"} />}
+
+      {!closed && (
+        <RemovePositionButton
+          position={{ id: p.id, token_id: p.token_id, source: p.source, token0_symbol: p.token0_symbol, token1_symbol: p.token1_symbol }}
+        />
+      )}
     </div>
   );
 }

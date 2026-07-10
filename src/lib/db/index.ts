@@ -226,12 +226,41 @@ function migrate(db: DB) {
       created_at    TEXT    NOT NULL DEFAULT (datetime('now')),
       UNIQUE(chain_id_ref, token0, token1)
     );
+
+-- 流动性收藏：保存探针收藏信息，包含token symbol
+    CREATE TABLE IF NOT EXISTS liquidity_favorites (
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      chain_id_ref  INTEGER NOT NULL REFERENCES chains(id) ON DELETE CASCADE,
+      label         TEXT    NOT NULL DEFAULT '',   -- 自定义备注，如 '0G/WETH 0.3% 主池'
+      pool_addr     TEXT    NOT NULL,             -- V3 池子地址（小写）
+      staker_addr   TEXT    NOT NULL DEFAULT '',  -- 可选 vault/质押地址（小写）
+      npm_addr      TEXT    NOT NULL DEFAULT '',  -- 可选 NPM 地址（留空则按链取第一个 v3-fork）
+      sort_order    INTEGER NOT NULL DEFAULT 0,   -- 排序权重，越大越靠前
+      token0_symbol  TEXT    NOT NULL DEFAULT '', -- token0的symbol，用于显示
+      token1_symbol  TEXT    NOT NULL DEFAULT '', -- token1的symbol，用于显示
+      created_at    TEXT    NOT NULL DEFAULT (datetime('now')),
+      UNIQUE(chain_id_ref, pool_addr, staker_addr)
+    );
+
+    -- 推送状态记录：用于控制相同告警的推送频次，避免重复推送
+    CREATE TABLE IF NOT EXISTS push_states (
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      position_id   INTEGER NOT NULL,
+      alert_type    TEXT NOT NULL,               -- 'cex_diff' | 'tick_move' | 'out_of_range' | 're_in_range' | 'closed'
+      last_push_time TEXT   NOT NULL DEFAULT (datetime('now')),
+      UNIQUE(position_id, alert_type)
+    );
+    CREATE INDEX IF NOT EXISTS idx_push_states_position ON push_states(position_id);
+    CREATE INDEX IF NOT EXISTS idx_push_states_time ON push_states(last_push_time);
   `);
 
   // 兼容已有数据库：新增列用 ADD COLUMN（忽略已存在的错误）
   safeAddColumn(db, "positions", "last_liquidity", "TEXT NOT NULL DEFAULT ''");
   safeAddColumn(db, "positions", "token0_symbol", "TEXT NOT NULL DEFAULT ''");
   safeAddColumn(db, "positions", "token1_symbol", "TEXT NOT NULL DEFAULT ''");
+  // liquidity_favorites 表新增 token symbol 字段
+  safeAddColumn(db, "liquidity_favorites", "token0_symbol", "TEXT NOT NULL DEFAULT ''");
+  safeAddColumn(db, "liquidity_favorites", "token1_symbol", "TEXT NOT NULL DEFAULT ''");
   // pair_flip: 0=原始token0/token1, 1=用户翻转为token1/token0
   safeAddColumn(db, "positions", "pair_flip", "INTEGER NOT NULL DEFAULT 0");
   // tick 波动预警：上次扫描时 tick 距区间边界的相对位置（百分比 0~1）
@@ -257,6 +286,7 @@ function seedDefaultSettings(db: DB) {
     { key: "staking_scan_fallback_enabled", value: "true" }, // 启用兜底机制：转账扫描失败时尝试合约直查
     { key: "staking_scan_contract_batch_size", value: "50" }, // 合约直查时的批量大小
     { key: "staking_scan_concurrent_limit", value: "6" }, // 并发限制
+    { key: "push_cooldown_minutes", value: "2" }, // 推送冷却时间（分钟），默认2分钟
   ];
   
   for (const setting of defaultSettings) {
