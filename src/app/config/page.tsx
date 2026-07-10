@@ -37,7 +37,7 @@ function IoSection() {
       const a = document.createElement("a"); a.href = url;
       a.download = `lp-monitor-config-${new Date().toISOString().slice(0, 10)}.json`;
       a.click(); URL.revokeObjectURL(url);
-      setMsg("✅ 已导出配置文件");
+      setMsg("✅ 已导出配置文件（包含收藏）");
     } catch (e: any) { setMsg(`❌ 导出失败：${e.message}`); }
     finally { setBusy(false); }
   }
@@ -51,8 +51,11 @@ function IoSection() {
         const r = await fetch("/api/config", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(bundle) });
         const j = await r.json(); if (!j.ok) throw new Error(j.error);
         const d = j.data;
-        setMsg(`✅ 导入完成：链 +${d.chains.added}/~${d.chains.updated}，DEX +${d.dexes.added}/~${d.dexes.updated}，质押 +${d.staking.added}/~${d.staking.updated}，钱包 +${d.wallets.added}/~${d.wallets.updated}，CEX +${d.cex_mappings.added}/~${d.cex_mappings.updated}${d.pair_flips?.applied ? `，翻转 +${d.pair_flips.applied}` : ""}`);
-        mutate((k: string) => typeof k === "string" && (k.includes("/api/chains") || k.includes("/api/dexes") || k.includes("/api/staking") || k.includes("/api/wallets") || k.includes("/api/cex-mapping") || k.includes("/api/positions")), undefined, { revalidate: true });
+        let extraInfo = "";
+        if (d.pair_flips?.applied) extraInfo += `，翻转 +${d.pair_flips.applied}`;
+        if (d.liquidity_favorites) extraInfo += `，收藏 +${d.liquidity_favorites.added}/~${d.liquidity_favorites.updated}`;
+        setMsg(`✅ 导入完成：链 +${d.chains.added}/~${d.chains.updated}，DEX +${d.dexes.added}/~${d.dexes.updated}，质押 +${d.staking.added}/~${d.staking.updated}，钱包 +${d.wallets.added}/~${d.wallets.updated}，CEX +${d.cex_mappings.added}/~${d.cex_mappings.updated}${extraInfo}`);
+        mutate((k: string) => typeof k === "string" && (k.includes("/api/chains") || k.includes("/api/dexes") || k.includes("/api/staking") || k.includes("/api/wallets") || k.includes("/api/cex-mapping") || k.includes("/api/positions") || k.includes("/api/liquidity-favorites")), undefined, { revalidate: true });
       } catch (e: any) { setMsg(`❌ 导入失败：${e.message}`); }
       finally { setBusy(false); }
     };
@@ -62,7 +65,7 @@ function IoSection() {
   return (
     <section className="card p-5">
       <h2 className="mb-1 text-base font-semibold">配置导入 / 导出</h2>
-      <p className="mb-3 text-xs text-ink-soft">把链、DEX、质押合约、监控钱包、CEX 报价匹配、交易对翻转状态打包成 JSON 文件，方便多机部署、备份。导入时按唯一键 upsert，重复导入安全。</p>
+      <p className="mb-3 text-xs text-ink-soft">把链、DEX、质押合约、监控钱包、CEX 报价匹配、交易对翻转状态<strong>和流动性探针收藏（包含链、DEX、Token信息）</strong>打包成 JSON 文件，方便多机部署、备份。导入时按唯一键 upsert，重复导入安全。</p>
       <div className="flex flex-wrap items-center gap-3">
         <button className="btn-primary" onClick={doExport} disabled={busy}>导出配置</button>
         <label className="btn-ghost cursor-pointer">导入配置
@@ -806,6 +809,7 @@ function NotifySection() {
   );
 }
 
+/* ============ 收藏导入/导出 ============ */
 /* ============ 通用开关 ============ */
 function Toggle({ id, enabled, kind, disabled }: { id: number; enabled: boolean; kind: "wallets" | "chains" | "dexes" | "staking" | "cex-mapping"; disabled?: boolean }) {
   async function toggle() {

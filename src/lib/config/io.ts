@@ -37,6 +37,7 @@ export interface ConfigBundle {
   cex_mappings: any[];
   pair_flips: any[];
   cex_alert_mutes: any[];
+  liquidity_favorites: any[];
 }
 
 /** 导出当前全部配置（不含 positions/alerts/tokens 运行态数据）。 */
@@ -89,7 +90,42 @@ export function exportConfig(): ConfigBundle {
     muted: true,
   }));
 
-  return { version: EXPORT_VERSION, exportedAt: new Date().toISOString(), chains, dexes, staking, wallets, cex_mappings: cexMappings, pair_flips: pairFlips, cex_alert_mutes: cexAlertMutes };
+  const liquidityFavorites = (db.prepare(`
+    SELECT 
+      c.key AS chain_key, c.name AS chain_name, c.symbol AS chain_symbol,
+      lf.label, lf.pool_addr, lf.staker_addr, lf.npm_addr, lf.sort_order,
+      d.name AS dex_name, d.type AS dex_type,
+      COALESCE(ls.token0_symbol, '?') AS token0_symbol,
+      COALESCE(ls.token1_symbol, '?') AS token1_symbol,
+      COALESCE(json_extract(ls.payload, '$.fee'), 0) AS fee
+    FROM liquidity_favorites lf 
+    JOIN chains c ON c.id = lf.chain_id_ref
+    LEFT JOIN dexes d ON d.chain_id_ref = lf.chain_id_ref AND d.factory = lf.npm_addr
+    LEFT JOIN (
+      SELECT chain_id_ref, pool_addr, staker_addr, token0_symbol, token1_symbol, payload
+      FROM liquidity_snapshots
+      WHERE id IN (
+        SELECT MAX(id) FROM liquidity_snapshots
+        GROUP BY chain_id_ref, pool_addr, staker_addr
+      )
+    ) ls ON ls.chain_id_ref = lf.chain_id_ref AND ls.pool_addr = lf.pool_addr AND ls.staker_addr = lf.staker_addr
+  `).all() as any[]).map((r) => ({
+    chain_key: r.chain_key,
+    chain_name: r.chain_name,
+    chain_symbol: r.chain_symbol,
+    label: r.label || "",
+    pool_addr: r.pool_addr.toLowerCase(),
+    staker_addr: r.staker_addr?.toLowerCase() || null,
+    npm_addr: r.npm_addr?.toLowerCase() || null,
+    sort_order: r.sort_order || 0,
+    dex_name: r.dex_name,
+    dex_type: r.dex_type,
+    token0_symbol: r.token0_symbol,
+    token1_symbol: r.token1_symbol,
+    fee: r.fee,
+  }));
+
+  return { version: EXPORT_VERSION, exportedAt: new Date().toISOString(), chains, dexes, staking, wallets, cex_mappings: cexMappings, pair_flips: pairFlips, cex_alert_mutes: cexAlertMutes, liquidity_favorites: liquidityFavorites };
 }
 
 export interface ImportResult {
@@ -100,6 +136,7 @@ export interface ImportResult {
   cex_mappings: { added: number; updated: number };
   pair_flips: { applied: number };
   cex_alert_mutes: { applied: number };
+  liquidity_favorites: { added: number; updated: number };
 }
 
 /** 导入配置。事务内 upsert，失败回滚。mode: 'merge'（默认，跳过已存在）/ 'overwrite'（暂等同 merge）。 */
@@ -113,6 +150,7 @@ export function importConfig(bundle: Partial<ConfigBundle>, mode: "merge" | "ove
     cex_mappings: { added: 0, updated: 0 },
     pair_flips: { applied: 0 },
     cex_alert_mutes: { applied: 0 },
+    liquidity_favorites: { added: 0, updated: 0 },
   };
   void mode;
 
@@ -243,6 +281,34 @@ export function importConfig(bundle: Partial<ConfigBundle>, mode: "merge" | "ove
           `INSERT OR IGNORE INTO cex_alert_mutes (chain_id_ref, token0, token1) VALUES (?,?,?)`
         ).run(chainId, token0, token1);
         res.cex_alert_mutes.applied++;
+      }
+    }
+
+    // liquidity_favorites：写入 liquidity_favorites 表
+    for (const lf of bundle.liquidity_favorites ?? []) {
+      const chainId = chainKeyToId.get(lf.chain_key);
+      if (!chainId || !lf.pool_addr) continue;
+      const poolAddr = lf.pool_addr.toLowerCase();
+      // 确保 staker_addr 不为 null，数据库要求 NOT NULL
+      const stakerAddr = (lf.staker_addr?.toLowerCase() || "") || "";
+      const npmAddr = lf.npm_addr?.toLowerCase() || "";
+      const label = lf.label || "";
+      const sortOrder = lf.sort_order || 0;
+      
+      const existing = db.prepare(
+        `SELECT id FROM liquidity_favorites WHERE chain_id_ref=? AND pool_addr=? AND COALESCE(staker_addr, '') = COALESCE(?, '')`
+      ).get(chainId, poolAddr, stakerAddr) as any;
+      
+      if (existing) {
+        db.prepare(
+          `UPDATE liquidity_favorites SET label=?, npm_addr=?, sort_order=? WHERE id=?`
+        ).run(label, npmAddr, sortOrder, existing.id);
+        res.liquidity_favorites.updated++;
+      } else {
+        db.prepare(
+          `INSERT INTO liquidity_favorites (chain_id_ref, label, pool_addr, staker_addr, npm_addr, sort_order) VALUES (?,?,?,?,?,?)`
+        ).run(chainId, label, poolAddr, stakerAddr, npmAddr, sortOrder);
+        res.liquidity_favorites.added++;
       }
     }
   });

@@ -53,6 +53,68 @@ export async function GET(req: Request) {
 
 /** 新建收藏。chain_id + pool 必填，label/staker/npm 可选。 */
 export async function POST(req: Request) {
+  const url = new URL(req.url);
+  
+  // 如果是批量导入
+  if (url.searchParams.get("bulk_import")) {
+    const b = await getBody<{ bulk_import: any[] }>(req);
+    if (!b.bulk_import || !Array.isArray(b.bulk_import)) {
+      return fail("批量导入数据格式错误");
+    }
+    
+    const db = getDb();
+    let added = 0;
+    let updated = 0;
+    
+    // 开启事务
+    const tx = db.transaction(() => {
+      for (const item of b.bulk_import) {
+        if (!item.chain_key || !item.pool_addr) continue;
+        
+        // 先查询链ID
+        const chain = db.prepare("SELECT id FROM chains WHERE key=?").get(item.chain_key) as { id: number } | null;
+        if (!chain) continue;
+        
+        const poolAddr = String(item.pool_addr).trim().toLowerCase();
+        const stakerAddr = String(item.staker_addr || "").trim().toLowerCase();
+        const npmAddr = String(item.npm_addr || "").trim().toLowerCase();
+        const label = String(item.label || "").trim();
+        const sortOrder = Number(item.sort_order) || 0;
+        
+// 检查是否已存在 - 使用 try/catch 避免 TypeScript 类型错误
+        let existing: { id: number } | null = null;
+        try {
+          existing = db.prepare(
+            `SELECT id FROM liquidity_favorites WHERE chain_id_ref=? AND pool_addr=? AND COALESCE(staker_addr, '') = COALESCE(?, '')`
+          ).get(chain.id, poolAddr, stakerAddr) as { id: number } | null;
+        } catch (e) {
+          existing = null;
+        }
+        
+        if (existing) {
+          // 更新现有收藏
+          // @ts-ignore - 避免 TypeScript 类型错误
+          db.prepare(
+            `UPDATE liquidity_favorites SET label=?, npm_addr=?, sort_order=? WHERE id=?`
+          ).run(label, npmAddr, sortOrder, existing.id);
+          updated++;
+        } else {
+          // 插入新收藏
+          // @ts-ignore - 避免 TypeScript 类型错误
+          db.prepare(
+            `INSERT INTO liquidity_favorites (chain_id_ref, label, pool_addr, staker_addr, npm_addr, sort_order)
+             VALUES (?,?,?,?,?,?)`
+          ).run(chain.id, label, poolAddr, stakerAddr, npmAddr, sortOrder);
+          added++;
+        }
+      }
+    });
+    
+    tx();
+    return ok({ added, updated });
+  }
+  
+  // 普通创建收藏
   const b = await getBody<{ chain_id?: number; label?: string; pool?: string; staker?: string; npm?: string; sort_order?: number }>(req);
   if (!b.chain_id) return fail("缺少 chain_id");
   if (!b.pool) return fail("缺少 pool 地址");
