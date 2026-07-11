@@ -282,7 +282,7 @@ async function getPositionStatus(
     inRange: posData.status.inRange,
     liquidity: posData.liquidity,
     price: posData.status.price.toString(),
-    isClosed: posData.liquidity === BigInt(0) || posData.liquidity,
+    isClosed: posData.liquidity === BigInt(0) || !posData.liquidity,
     cexPrice
   };
 }

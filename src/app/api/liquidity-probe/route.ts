@@ -196,6 +196,20 @@ export async function POST(req: Request) {
     expires.toISOString()
   );
 
+  // 8. 探针成功后，把 symbol 写回匹配的收藏（按 UNIQUE 键 chain_id_ref+pool_addr+staker_addr）
+  // 这样收藏列表能显示真实 token symbol（如 W0G/USDC.e），而非空值回退
+  if (sym0 && sym1) {
+    try {
+      db.prepare(
+        `UPDATE liquidity_favorites
+         SET token0_symbol = ?, token1_symbol = ?
+         WHERE chain_id_ref = ? AND pool_addr = ? AND COALESCE(staker_addr, '') = ?`
+      ).run(sym0, sym1, b.chainId, b.pool.toLowerCase(), staker);
+    } catch {
+      // 写回失败不影响探针主流程
+    }
+  }
+
   return ok({ ...result, token0, token1, pairFlip, cex: cexPayload, cached: false });
   } catch (e) {
     console.error("[liquidity-probe] UNCAUGHT:", e);

@@ -156,6 +156,9 @@ export function LiquidityProbe() {
       if (!j.ok) throw new Error(j.error || "探针失败");
       setResult(j.data as ProbeResult);
       setLocalFlip(j.data.pairFlip ?? 0);
+      // 探针成功后刷新收藏列表——后端会把 token symbol 写回 favorites，
+      // 刷新后收藏标签即可显示真实 symbol（如 W0G/USDC.e）而非地址回退
+      reloadFav();
     } catch (e: any) {
       setError(e.message);
     } finally {
