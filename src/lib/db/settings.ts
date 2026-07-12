@@ -48,3 +48,23 @@ export function getPushCooldownMinutes(): number {
   const v = Number(getSetting("push_cooldown_minutes", ""));
   return [2, 5, 10, 20, 30].includes(v) ? v : 2;
 }
+
+// ===== 按告警类型的推送冷却配置（分钟）=====
+
+/** 获取指定告警类型的冷却时间（分钟）。 */
+export function getAlertCooldownMinutes(alertType: string): number {
+  const key = `cooldown_${alertType}`;
+  const v = Number(getSetting(key, ""));
+  return Number.isFinite(v) && v > 0 ? v : getDefaultCooldown(alertType);
+}
+
+/** 告警类型冷却默认值映射。 */
+function getDefaultCooldown(alertType: string): number {
+  const map: Record<string, number> = {
+    out_of_range: 30,
+    re_in_range: 30,
+    cex_price: 2,
+    tick_move: 10,
+  };
+  return map[alertType] ?? 2;
+}

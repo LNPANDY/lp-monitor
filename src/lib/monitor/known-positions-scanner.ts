@@ -9,10 +9,10 @@ import type { PublicClient } from "viem";
 import { resolveTokens } from "../chains/tokens";
 import { listDexes } from "../chains/dexes";
 import { getAdapter } from "../adapters";
-import { isTickMoveEnabled, isCexPriceEnabled, getTickMoveThreshold } from "../db/settings";
+import { isCexPriceEnabled } from "../db/settings";
 import { notifyAll } from "../notify";
+import { shouldPush, recordPush } from "../notify/dedup";
 import { loadAllMappings, buildQuotesByAddr } from "../cex/binance";
-import { getPushCooldownMinutes } from "../settings";
 
 export interface KnownPositionsSummary {
   positions: number;          // 处理的仓位总数
@@ -221,11 +221,11 @@ async function processSinglePosition(
   summary.active++;
   
   // 5. 检查告警条件
-  const alerts = checkAlertConditions(position, positionStatus);
+  const alerts = checkAlertConditions(position, positionStatus, dexes);
   
-  // 6. 处理告警（带推送频次控制）
+  // 6. 处理告警（统一推送去重）
   for (const alert of alerts) {
-    await processAlerts(position, alert, summary);
+    await processAlerts(position, alert, summary, positionStatus.currentTick);
   }
 }
 
@@ -240,15 +240,20 @@ async function getPositionStatus(
   quotesByAddr: Map<string, any>,
   client: PublicClient
 ) {
-  const adapter = getAdapter(dexes[0]?.type || 'v3-fork');
-  if (!adapter) {
-    throw new Error(`无法获取适配器: ${dexes[0]?.type}`);
+  // 按仓位实际的 dex_id 精确匹配 DEX（不能用 dexes[0]，否则会用错 DEX 的 factory）
+  const dex = dexes.find(d => d.id === position.dex_id) ?? dexes[0];
+  if (!dex) {
+    throw new Error(`仓位 ${position.id} 无匹配 DEX`);
   }
-  
-  // 获取仓位的当前tick和流动性
+  const adapter = getAdapter(dex.type || 'v3-fork');
+  if (!adapter) {
+    throw new Error(`无法获取适配器: ${dex.type}`);
+  }
+
+  // 获取仓位的当前tick和流动性（factory 必须是合约地址，不是 DEX 名字）
   const posData = await adapter.readRange(client, {
-    factory: dexes[0]?.name || "",
-    npm: dexes[0]?.npm || ""
+    factory: dex.factory || "",
+    npm: dex.npm || ""
   }, BigInt(position.token_id));
   
   // 获取CEX价格
@@ -281,7 +286,7 @@ async function getPositionStatus(
     currentTick: posData.status.currentTick,
     inRange: posData.status.inRange,
     liquidity: posData.liquidity,
-    price: posData.status.price.toString(),
+    price0: posData.status.price.toString(),
     isClosed: posData.liquidity === BigInt(0) || !posData.liquidity,
     cexPrice
   };
@@ -290,8 +295,7 @@ async function getPositionStatus(
 /**
  * 检查告警条件
  */
-function checkAlertConditions(position: any, status: any): Alert[] {
-  const db = getDb();
+function checkAlertConditions(position: any, status: any, dexes: any[]): Alert[] {
   const alerts: Alert[] = [];
   
   // 1. 越界告警
@@ -315,16 +319,18 @@ function checkAlertConditions(position: any, status: any): Alert[] {
   }
   
   // 3. CEX差价告警
-  if (isCexPriceEnabled() && status.cexPrice && status.cexPrice[position.token0]) {
+  if (isCexPriceEnabled() && status.cexPrice && status.cexPrice[position.token0.toLowerCase()]) {
     // 计算DEX价格
-    const dexPrice = parseFloat(status.price);
-    const cexPrice = parseFloat(status.cexPrice[position.token0].price);
+    const dexPrice = parseFloat(status.price0);
+    const cexPrice = parseFloat(status.cexPrice[position.token0.toLowerCase()].price);
     const priceDiff = Math.abs((dexPrice - cexPrice) / cexPrice * 100);
-    
-    // 检查是否超过阈值
-    if (priceDiff > 1) { // 超过1%差价才告警
+
+    // 阈值：用该仓位所属 DEX 的 fee*2（与全量扫描一致），无 fee 信息时回退 1%
+    const posDex = dexes.find(d => d.id === position.dex_id);
+    const feePct = posDex?.fee ? posDex.fee / 10000 : 0.01;
+    if (priceDiff > feePct * 100) {
       alerts.push({
-        type: 'cex_price_diff',
+        type: 'cex_price',
         message: `CEX差价告警: ${position.token0_symbol}/${position.token1_symbol} DEX价格: $${dexPrice.toFixed(4)}, CEX价格: $${cexPrice.toFixed(4)}, 差价: ${priceDiff.toFixed(2)}%`,
         severity: 'warning',
         pushAllowed: true
@@ -332,73 +338,26 @@ function checkAlertConditions(position: any, status: any): Alert[] {
     }
   }
     
-  // 4. Tick波动告警
-  if (isTickMoveEnabled()) {
-    const threshold = getTickMoveThreshold();
-    // 这里可以添加tick波动检测逻辑
-  }
+  // 4. Tick波动告警（复用全量扫描的阈值配置；已知扫描不追踪 margin 历史，故仅触发不计算 delta）
+  // tick_move 的具体波动检测由全量扫描负责（它记录 last_margin_lower），已知扫描不重复实现
   
   return alerts;
 }
 
 /**
- * 处理告警（带推送频次控制）
+ * 处理告警（统一推送去重：与全量扫描共享 push_states）
  */
-async function processAlerts(position: any, alert: Alert, summary: KnownPositionsSummary) {
-  const db = getDb();
-  const now = new Date().toISOString();
-  
-  // 特殊处理CEX差价告警
-  if (alert.type === 'cex_price_diff') {
-    // 检查历史差价，避免频繁推送
-    const lastAlert = db.prepare(`
-      SELECT message, sent_at FROM alerts 
-      WHERE position_id = ? AND type = 'cex_price_diff' 
-      ORDER BY sent_at DESC LIMIT 1
-    `).get(position.id) as { message: string; sent_at: string } | undefined;
-    
-    if (lastAlert && lastAlert.message) {
-      const lastMessage = lastAlert.message;
-      const match = lastMessage.match(/差价 (\d+\.?\d*)%/);
-      if (match && match[1]) {
-        const lastDiff = parseFloat(match[1]);
-        
-        // 计算当前差价
-        const currentDiff = parseFloat(alert.message.match(/差价 (\d+\.?\d*)%/)![1]);
-        
-        // 如果两次差价相差小于10%，且时间间隔小于推送频率，则跳过
-        if (Math.abs(currentDiff - lastDiff) < 10) {
-          const pushCooldown = getPushCooldownMinutes() * 60 * 1000;
-          const timeDiff = Date.now() - new Date(lastAlert.sent_at).getTime();
-          
-          if (timeDiff < pushCooldown) {
-            summary.pushSkipped++;
-            console.log(`[scanner-known] 跳过CEX差价推送: ${alert.type} (仓位 ${position.id})`);
-            return;
-          }
-        }
-      }
-    }
-  }
-  
-  // 检查推送频次
-  const pushAllowed = await checkPushCooldown(position.id, alert.type);
-  
-  if (!pushAllowed) {
+async function processAlerts(position: any, alert: Alert, summary: KnownPositionsSummary, currentTick: number = 0) {
+  // 统一去重：按告警类型独立冷却，两个扫描器共享 push_states
+  if (!shouldPush(position.id, alert.type)) {
     summary.pushSkipped++;
     console.log(`[scanner-known] 跳过推送: ${alert.type} (仓位 ${position.id})`);
     return;
   }
-  
-  // 记录推送时间
-  db.prepare(`
-    INSERT OR REPLACE INTO push_states (position_id, alert_type, last_push_time)
-    VALUES (?, ?, ?)
-  `).run(position.id, alert.type, now);
-  
+
   summary.alertsSent++;
   console.log(`[scanner-known] 发送告警: ${alert.type} (仓位 ${position.id})`);
-  
+
   // 发送通知
   try {
     await notifyAll({
@@ -409,29 +368,14 @@ async function processAlerts(position: any, alert: Alert, summary: KnownPosition
   } catch (error) {
     console.error(`[scanner-known] 发送通知失败:`, error);
   }
-}
 
-/**
- * 检查推送冷却时间
- */
-async function checkPushCooldown(positionId: number, alertType: string): Promise<boolean> {
+  // 记录到 alerts 表（与全量扫描一致，告警历史可见）
   const db = getDb();
-  const cooldownMinutes = getPushCooldownMinutes();
-  
-  // 如果从未推送过，允许推送
-  const lastPush = db.prepare(`
-    SELECT last_push_time FROM push_states 
-    WHERE position_id = ? AND alert_type = ?
-  `).get(positionId, alertType) as { last_push_time: string } | null;
-  
-  if (!lastPush) {
-    return true;
-  }
-  
-  // 检查是否超过冷却时间
-  const lastPushTime = new Date(lastPush.last_push_time).getTime();
-  const now = Date.now();
-  const cooldownMs = cooldownMinutes * 60 * 1000;
-  
-  return (now - lastPushTime) >= cooldownMs;
+  db.prepare(
+    `INSERT INTO alerts (position_id, type, tick_at, message, channels)
+     VALUES (?, ?, ?, ?, ?)`
+  ).run(position.id, alert.type, currentTick, alert.message, "[]");
+
+  // 记录推送时间（统一去重）
+  recordPush(position.id, alert.type);
 }

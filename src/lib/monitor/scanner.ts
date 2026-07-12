@@ -7,7 +7,6 @@
  *  5. 写回 positions / alerts
  */
 import { getDb } from "../db";
-import { appEnv } from "../db/config";
 import { getClient, listChains } from "../chains";
 import type { PublicClient } from "viem";
 import { resolveTokens } from "../chains/tokens";
@@ -26,6 +25,7 @@ import {
 import { findStakedPositionsDirect } from "../staking/discover-direct";
 import { ownerOf } from "../adapters/v3-fork";
 import { notifyAll } from "../notify";
+import { shouldPush, recordPush } from "../notify/dedup";
 import {
   loadAllMappings,
   buildQuotesByAddr,
@@ -334,50 +334,55 @@ export async function runScan(): Promise<ScanSummary> {
           const reEnteredRange =
             inRange && prevState === "out_of_range";
           const stillOutOfRangeAndExpired =
-            !inRange && prevState === "out_of_range" && !withinCooldown(prev?.last_notified_at);
+            !inRange && prevState === "out_of_range" && shouldPush(positionRow.id, "out_of_range");
 
           const rangeTrigger = enteredOutOfRange || reEnteredRange || stillOutOfRangeAndExpired;
 
           // ===== 发送告警（越界 + 波动各自独立发送）=====
           if (rangeTrigger) {
             const alertType = !inRange ? "out_of_range" : "re_in_range";
-            const n = buildNotification(w, chain.name, dex.name, dp, r, sym0, sym1, positionRow.pair_flip, price0Human);
-            const sendRes = await notifyAll(n);
-            alertsSent++;
+            if (shouldPush(positionRow.id, alertType)) {
+              const n = buildNotification(w, chain.name, dex.name, dp, r, sym0, sym1, positionRow.pair_flip, price0Human);
+              const sendRes = await notifyAll(n);
+              alertsSent++;
 
-            db.prepare(
-              `INSERT INTO alerts (position_id, type, tick_at, message, channels)
-               VALUES (?, ?, ?, ?, ?)`
-            ).run(
-              positionRow.id,
-              alertType,
-              r.status.currentTick,
-              n.body,
-              JSON.stringify(sendRes.sent)
-            );
-            db.prepare("UPDATE positions SET last_notified_at=? WHERE id=?").run(nowIso, positionRow.id);
+              db.prepare(
+                `INSERT INTO alerts (position_id, type, tick_at, message, channels)
+                 VALUES (?, ?, ?, ?, ?)`
+              ).run(
+                positionRow.id,
+                alertType,
+                r.status.currentTick,
+                n.body,
+                JSON.stringify(sendRes.sent)
+              );
+              recordPush(positionRow.id, alertType);
+            }
           }
 
-          // 波动告警（独立于越界告警，每次超过阈值都发，不设冷却）
+          // 波动告警（独立于越界告警，受 tick_move 冷却控制）
           if (tickMoveTriggered) {
-            const n = buildTickMoveNotification(
-              w, chain.name, dex.name, dp, r, sym0, sym1,
-              prev.last_margin_lower, currMarginLower,
-              tickMoveDelta, tickMoveDirection, positionRow.pair_flip, price0Human
-            );
-            const sendRes = await notifyAll(n);
-            alertsSent++;
+            if (shouldPush(positionRow.id, "tick_move")) {
+              const n = buildTickMoveNotification(
+                w, chain.name, dex.name, dp, r, sym0, sym1,
+                prev.last_margin_lower, currMarginLower,
+                tickMoveDelta, tickMoveDirection, positionRow.pair_flip, price0Human
+              );
+              const sendRes = await notifyAll(n);
+              alertsSent++;
 
-            db.prepare(
-              `INSERT INTO alerts (position_id, type, tick_at, message, channels)
-               VALUES (?, ?, ?, ?, ?)`
-            ).run(
-              positionRow.id,
-              "tick_move",
-              r.status.currentTick,
-              n.body,
-              JSON.stringify(sendRes.sent)
-            );
+              db.prepare(
+                `INSERT INTO alerts (position_id, type, tick_at, message, channels)
+                 VALUES (?, ?, ?, ?, ?)`
+              ).run(
+                positionRow.id,
+                "tick_move",
+                r.status.currentTick,
+                n.body,
+                JSON.stringify(sendRes.sent)
+              );
+              recordPush(positionRow.id, "tick_move");
+            }
           }
 
           // CEX 价差告警（独立发送，每次超过阈值都发，不设冷却）
@@ -392,23 +397,26 @@ export async function runScan(): Promise<ScanSummary> {
             if (muted) cexMutedPairs.add(muteKey);
           }
           if (cexPriceInfo && cexPriceInfo.exceedsThreshold && cexEnabled && !cexMutedPairs.has(muteKey)) {
-            const n = buildCexPriceNotification(
-              w, chain.name, dex.name, dp, r, sym0, sym1,
-              cexPriceInfo.payload, positionRow.pair_flip
-            );
-            const sendRes = await notifyAll(n);
-            alertsSent++;
+            if (shouldPush(positionRow.id, "cex_price")) {
+              const n = buildCexPriceNotification(
+                w, chain.name, dex.name, dp, r, sym0, sym1,
+                cexPriceInfo.payload, positionRow.pair_flip
+              );
+              const sendRes = await notifyAll(n);
+              alertsSent++;
 
-            db.prepare(
-              `INSERT INTO alerts (position_id, type, tick_at, message, channels)
-               VALUES (?, ?, ?, ?, ?)`
-            ).run(
-              positionRow.id,
-              "cex_price",
-              r.status.currentTick,
-              n.body,
-              JSON.stringify(sendRes.sent)
-            );
+              db.prepare(
+                `INSERT INTO alerts (position_id, type, tick_at, message, channels)
+                 VALUES (?, ?, ?, ?, ?)`
+              ).run(
+                positionRow.id,
+                "cex_price",
+                r.status.currentTick,
+                n.body,
+                JSON.stringify(sendRes.sent)
+              );
+              recordPush(positionRow.id, "cex_price");
+            }
           }
         } catch (e: any) {
           errors.push(`position ${dp.tokenId} on chain ${w.chain_id_ref}: ${e?.message ?? e}`);
@@ -526,13 +534,6 @@ async function recoverMissedPositions(
   }
 
   return recovered;
-}
-
-function withinCooldown(lastNotifiedIso: string | undefined): boolean {
-  if (!lastNotifiedIso) return false; // 没发过，不在冷却
-  const last = Date.parse(lastNotifiedIso);
-  if (Number.isNaN(last)) return false;
-  return Date.now() - last < appEnv.monitor.cooldownMs;
 }
 
 function buildNotification(

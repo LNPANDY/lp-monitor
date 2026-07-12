@@ -20,6 +20,7 @@ interface RemoveParams {
   stakerContract: string;
   source: string;
   liquidity: string;
+  realLiquidity: string;  // 链上实时 liquidity
   ownerOf: string;
   chain: {
     chainId: number;
@@ -157,7 +158,7 @@ export function RemovePositionButton({ position }: { position: Position }) {
         });
       }
 
-      const liquidity = BigInt(params.liquidity || "0");
+      const liquidity = BigInt(params.realLiquidity || params.liquidity || "0");
       if (liquidity <= 0n) {
         setGlobalError("该仓位流动性为 0，无需移除");
         return;
@@ -273,10 +274,10 @@ export function RemovePositionButton({ position }: { position: Position }) {
     
     if (supportsMulticall) {
       // 支持 multicall：一步完成 decreaseLiquidity + collect + burn
-      await executeStep2Multicall(params, BigInt(params.liquidity || "0"), currentWalletAddr);
+      await executeStep2Multicall(params, BigInt(params.realLiquidity || params.liquidity || "0"), currentWalletAddr);
     } else {
       // 不支持 multicall：分三步执行
-      await executeStep2Separate(params, BigInt(params.liquidity || "0"), currentWalletAddr);
+      await executeStep2Separate(params, BigInt(params.realLiquidity || params.liquidity || "0"), currentWalletAddr);
     }
   }
 

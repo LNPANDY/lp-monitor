@@ -52,6 +52,7 @@ export async function GET(_req: Request, { params }: { params: { id: string } })
     // 链上读 ownerOf（实时校验 NFT 归属）
     const { client } = getClient(pos.chain_id_ref);
     let ownerOf = "";
+    let realLiquidity = "0";
     try {
       console.log(`Querying ownerOf for token ${pos.token_id} from ${dex.npm}`);
       ownerOf = (await client.readContract({
@@ -69,9 +70,46 @@ export async function GET(_req: Request, { params }: { params: { id: string } })
         args: [BigInt(pos.token_id)],
       })) as string;
       console.log(`ownerOf result: ${ownerOf}`);
+
+      // 同时读取链上实时 liquidity（避免使用过期的 last_liquidity）
+      try {
+        const NPM_POSITION_ABI = [
+          {
+            name: "positions",
+            type: "function",
+            stateMutability: "view",
+            inputs: [{ name: "tokenId", type: "uint256" }],
+            outputs: [
+              { name: "nonce", type: "uint96" },
+              { name: "operator", type: "address" },
+              { name: "token0", type: "address" },
+              { name: "token1", type: "address" },
+              { name: "fee", type: "uint24" },
+              { name: "tickLower", type: "int24" },
+              { name: "tickUpper", type: "int24" },
+              { name: "liquidity", type: "uint128" },
+              { name: "feeGrowthInside0LastX128", type: "uint256" },
+              { name: "feeGrowthInside1LastX128", type: "uint256" },
+              { name: "tokensOwed0", type: "uint128" },
+              { name: "tokensOwed1", type: "uint128" },
+            ],
+          },
+        ];
+        const posData = (await client.readContract({
+          address: dex.npm as `0x${string}`,
+          abi: NPM_POSITION_ABI,
+          functionName: "positions",
+          args: [BigInt(pos.token_id)],
+        })) as [any, any, any, any, any, any, any, bigint, any, any, bigint, bigint];
+        realLiquidity = posData[7].toString();
+        console.log(`Real liquidity on-chain: ${realLiquidity}`);
+      } catch (e) {
+        console.error(`Failed to read positions for token ${pos.token_id}:`, e);
+        // 回退到 DB 中的值
+        realLiquidity = pos.last_liquidity || "0";
+      }
     } catch (error) {
       console.error(`Failed to query ownerOf for token ${pos.token_id}:`, error);
-      // NFT 可能已不存在（已 burn/转移），ownerOf 留空，前端按「无法移除」处理
       ownerOf = "";
     }
 
@@ -81,9 +119,10 @@ export async function GET(_req: Request, { params }: { params: { id: string } })
       stakerContract: pos.staker_contract || "",
       source: pos.source,
       liquidity: pos.last_liquidity || "0",
+      realLiquidity,  // 链上实时 liquidity，优先用此值
       ownerOf,
       chain: {
-        chainId: chain.chain_id, // EVM chainId
+        chainId: chain.chain_id,
         name: chain.name,
         rpcUrls: chain.rpc_urls,
         explorerUrl: chain.explorer_url,

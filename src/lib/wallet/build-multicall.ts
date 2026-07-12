@@ -20,13 +20,17 @@ const UINT128_MAX = (1n << 128n) - 1n;
  * @param tokenId     LP NFT tokenId
  * @param liquidity   当前流动性（positions.liquidity，全部移除）
  * @param recipient   收取代币的钱包地址（连接的钱包）
+ * @param amount0Min  token0 最小接收量（默认 0，传其他值启用滑点保护）
+ * @param amount1Min  token1 最小接收量（默认 0，传其他值启用滑点保护）
  * @returns { to, data } —— 直接作为 sendTx 的参数
  */
 export function buildRemoveLiquidityCalldata(
   npm: string,
   tokenId: bigint,
   liquidity: bigint,
-  recipient: string
+  recipient: string,
+  amount0Min: bigint = 0n,
+  amount1Min: bigint = 0n
 ): { to: string; data: string } {
   // deadline：当前时间 + 1 小时（秒）。用 Math.floor 避免 encodeFunctionData 收到小数。
   const deadline = BigInt(Math.floor(Date.now() / 1000) + 3600);

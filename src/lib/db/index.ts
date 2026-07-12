@@ -287,6 +287,10 @@ function seedDefaultSettings(db: DB) {
     { key: "staking_scan_contract_batch_size", value: "50" }, // 合约直查时的批量大小
     { key: "staking_scan_concurrent_limit", value: "6" }, // 并发限制
     { key: "push_cooldown_minutes", value: "2" }, // 推送冷却时间（分钟），默认2分钟
+    { key: "cooldown_out_of_range", value: "30" }, // 越界告警冷却（分钟）
+    { key: "cooldown_re_in_range", value: "30" }, // 恢复区间告警冷却（分钟）
+    { key: "cooldown_cex_price", value: "2" }, // CEX 差价告警冷却（分钟）
+    { key: "cooldown_tick_move", value: "10" }, // tick 波动告警冷却（分钟）
   ];
   
   for (const setting of defaultSettings) {

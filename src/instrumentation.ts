@@ -7,12 +7,11 @@
  * experimental.instrumentationHook（那是 13 的写法，14 里会报警告）。
  */
 export async function register() {
-  // 仅服务端运行，避免在 edge/worker 加载
   if (process.env.NEXT_RUNTIME === "nodejs") {
     const { getDb } = await import("./lib/db");
-    const { startScheduler } = await import("./lib/monitor/scheduler");
+    const { startEnhancedScheduler } = await import("./lib/monitor/enhanced-scheduler");
     getDb(); // 触发建表/seed
-    startScheduler();
-    console.log("[instrumentation] register() executed, scheduler started");
+    startEnhancedScheduler();
+    console.log("[instrumentation] register() executed, enhanced dual-frequency scheduler started");
   }
 }
