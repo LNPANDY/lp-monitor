@@ -46,7 +46,7 @@ export interface ScanSummary {
   error?: string;
 }
 
-interface WalletRow {
+export interface WalletRow {
   id: number;
   chain_id_ref: number;
   address: string;
@@ -536,7 +536,7 @@ async function recoverMissedPositions(
   return recovered;
 }
 
-function buildNotification(
+export function buildNotification(
   w: WalletRow,
   chainName: string,
   dexName: string,
@@ -581,7 +581,7 @@ function buildNotification(
 }
 
 /** tick 波动告警文案。margin 用 0~1 的相对位置，展示时转成百分比。 */
-function buildTickMoveNotification(
+export function buildTickMoveNotification(
   w: WalletRow,
   chainName: string,
   dexName: string,
@@ -636,7 +636,8 @@ void listChains;
 // ===== CEX 报价对比辅助函数 =====
 
 /** 对外传递的 DEX↔CEX 对比结果（payload 即写入 last_cex_price 的 JSON）。 */
-interface CexPriceInfo {
+/** CEX 价差告警结果。 */
+export interface CexPriceInfo {
   /** 是否超过告警阈值 */
   exceedsThreshold: boolean;
   /** 供持久化 + 展示 + 文案共用的结构化数据 */
@@ -687,7 +688,7 @@ export interface CexPricePayload {
  * 注意：CEX 报的是裸币种（如 0G），链上是 wrapped 版本（如 W0G），用户配置映射时
  * 假定 1:1 等价。这是该功能成立的前提，模块不做地址↔币种的自动猜测。
  */
-function computeCexPriceDiff(
+export function computeCexPriceDiff(
   token0Lower: string,
   token1Lower: string,
   dexRateStr: string, // r.status.price: raw 单位的 token1/token0（1.0001^tick）
@@ -739,7 +740,7 @@ function computeCexPriceDiff(
 }
 
 /** CEX 价差告警文案。 */
-function buildCexPriceNotification(
+export function buildCexPriceNotification(
   w: WalletRow,
   chainName: string,
   dexName: string,
@@ -784,7 +785,7 @@ function buildCexPriceNotification(
  * 如 2.3815542e+15 → 2381554200000000；0.00000123 → 0.00000123。
  * 告警文案里出现科学计数法很难读，统一展开。
  */
-function fmt(n: number): string {
+export function fmt(n: number): string {
   if (!Number.isFinite(n)) return "—";
   if (n === 0) return "0";
   let s = Math.abs(n) < 1 ? n.toFixed(18) : n.toFixed(8);
@@ -802,7 +803,7 @@ function fmt(n: number): string {
  * 用于 last_price0 持久化 + 越界/波动告警文案，确保与 CEX 对比口径一致、可直接展示。
  * 解析失败或非法时返回原始字符串（兜底，不致空值）。
  */
-function rawToHumanPrice(rawStr: string, dec0: number, dec1: number): string {
+export function rawToHumanPrice(rawStr: string, dec0: number, dec1: number): string {
   const raw = Number(rawStr);
   if (!Number.isFinite(raw) || raw <= 0) return rawStr;
   const human = raw * Math.pow(10, dec0 - dec1);

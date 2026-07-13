@@ -2,6 +2,7 @@
  * 已知仓位快速扫描器
  * 专门用于快速更新已知仓位的状态，检测已关闭仓位，并处理告警
  * 性能目标：100个仓位 < 10秒
+ * 与全量扫描(scanner.ts)共享推送去重(dedup.ts)和告警文案构建函数
  */
 import { getDb } from "../db";
 import { listChains, getClient } from "../chains";
@@ -9,10 +10,19 @@ import type { PublicClient } from "viem";
 import { resolveTokens } from "../chains/tokens";
 import { listDexes } from "../chains/dexes";
 import { getAdapter } from "../adapters";
-import { isCexPriceEnabled } from "../db/settings";
+import { isCexPriceEnabled, getTickMoveThreshold, isTickMoveEnabled } from "../db/settings";
 import { notifyAll } from "../notify";
 import { shouldPush, recordPush } from "../notify/dedup";
-import { loadAllMappings, buildQuotesByAddr } from "../cex/binance";
+import { loadAllMappings, buildQuotesByAddr, type CexQuote } from "../cex/binance";
+import {
+  computeCexPriceDiff,
+  rawToHumanPrice,
+  buildNotification,
+  buildTickMoveNotification,
+  buildCexPriceNotification,
+  type WalletRow,
+  type CexPricePayload,
+} from "./scanner";
 
 export interface KnownPositionsSummary {
   positions: number;          // 处理的仓位总数
@@ -26,13 +36,6 @@ export interface KnownPositionsSummary {
   error?: string;            // 错误信息（单个错误）
 }
 
-interface Alert {
-  type: string;
-  message: string;
-  severity: string;
-  pushAllowed: boolean;
-}
-
 /**
  * 快速扫描已知仓位
  */
@@ -40,7 +43,7 @@ export async function scanKnownPositions(): Promise<KnownPositionsSummary> {
   const startTime = Date.now();
   const db = getDb();
   
-  console.log(`[scanner-known] 开始已知仓位扫描`);
+  console.log(`[scanner] 开始已知仓位快速扫描`);
   
   const summary: KnownPositionsSummary = {
     positions: 0,
@@ -99,7 +102,10 @@ export async function scanKnownPositions(): Promise<KnownPositionsSummary> {
     
     // 4. 统计结果
     summary.durationMs = Date.now() - startTime;
-    console.log(`[scanner-known] 已知仓位扫描完成: ${summary.active}个活跃, ${summary.closed}个已关闭, ${summary.alertsSent}个告警, ${summary.pushSkipped}个跳过, ${summary.durationMs}ms`);
+    console.log(`[scanner] 已知仓位扫描完成: 扫描 ${summary.positions} 个仓位, ${summary.active} 个在区间内, ${summary.closed} 个已关闭, 发送 ${summary.alertsSent} 个告警${summary.pushSkipped > 0 ? `, ${summary.pushSkipped} 个去重跳过` : ""}, 耗时 ${summary.durationMs}ms`);
+    if (summary.errors.length > 0) {
+      console.log(`[scanner] 已知仓位扫描错误: ${summary.errors.length} 个`);
+    }
     
   } catch (error) {
     console.error(`[scanner-known] 扫描失败:`, error);
@@ -162,220 +168,243 @@ async function processSinglePosition(
   chain: any,
   dexes: any[],
   tokenMap: Map<string, any>,
-  quotesByAddr: Map<string, any>,
+  quotesByAddr: Map<string, CexQuote>,
   client: PublicClient,
   summary: KnownPositionsSummary
 ) {
   const db = getDb();
   const now = new Date().toISOString();
-  
-  // 1. 获取仓位当前状态
-  const positionStatus = await getPositionStatus(position, chain, dexes, tokenMap, quotesByAddr, client);
-  
+
+  // 1. 获取仓位当前状态（包含 CEX 价差、margin）
+  const status = await getPositionStatus(position, chain, dexes, tokenMap, quotesByAddr, client);
+
   // 2. 检查仓位是否已关闭
-  if (positionStatus.isClosed) {
-    // 标记为已关闭
+  if (status.isClosed) {
     db.prepare(`
-      UPDATE positions 
-      SET notify_state = 'closed', 
+      UPDATE positions
+      SET notify_state = 'closed',
           last_checked_at = ?,
           last_in_range = 0,
           last_liquidity = ''
       WHERE id = ?
     `).run(now, position.id);
-    
+
     summary.closed++;
-    console.log(`[scanner-known] 仓位已关闭: ${position.id} (${position.token0_symbol}/${position.token1_symbol})`);
-    
-    // 3. 处理关闭告警
-    await processAlerts(position, {
-      type: 'closed',
-      message: `仓位已关闭 (${position.token0_symbol}/${position.token1_symbol})`,
-      severity: 'info',
-      pushAllowed: true
-    }, summary);
-    
+    const pairLabel = `${position.token0_symbol}/${position.token1_symbol}`;
+    console.log(`[scanner-known] 仓位已关闭: #${position.token_id} ${pairLabel} (${chain.name})`);
+
+    // 关闭告警（统一去重）
+    if (shouldPush(position.id, "closed")) {
+      const dexName = dexes.find(d => d.id === position.dex_id)?.name ?? "";
+      await sendAndRecord(position, chain, dexes, "closed", {
+        title: `仓位已关闭 ${pairLabel} · ${chain.name}/${dexName}`,
+        body: `仓位 #${position.token_id}（${pairLabel}）已关闭。\n钱包: ${position.wallet_address ?? ""}`,
+      }, summary, 0);
+    }
     return;
   }
-  
-  // 4. 更新仓位状态
+
+  // 3. tick_move 检测（与全量扫描一致：对比上次 margin）
+  const tickMoveEnabled = isTickMoveEnabled();
+  const tickMoveThreshold = getTickMoveThreshold() / 100;
+  let tickMoveTriggered = false;
+  let tickMoveDelta = 0;
+  let tickMoveDirection = "";
+  if (tickMoveEnabled && typeof position.last_margin_lower === "number") {
+    const dLower = Math.abs(status.marginLower - position.last_margin_lower);
+    const dUpper = Math.abs(status.marginUpper - position.last_margin_upper);
+    const delta = Math.max(dLower, dUpper);
+    if (delta >= tickMoveThreshold) {
+      tickMoveTriggered = true;
+      tickMoveDelta = delta;
+      tickMoveDirection = status.marginLower > position.last_margin_lower ? "靠近上界" : "靠近下界";
+    }
+  }
+
+  // 4. 更新仓位状态（含 margin、CEX 数据、检查时间）
+  const cexJson = status.cexPriceInfo ? JSON.stringify(status.cexPriceInfo.payload) : "";
   db.prepare(`
-    UPDATE positions 
+    UPDATE positions
     SET last_current_tick = ?,
         last_in_range = ?,
         last_checked_at = ?,
         last_price0 = ?,
         last_liquidity = ?,
-        last_cex_price = ?
+        last_margin_lower = ?,
+        last_margin_upper = ?,
+        last_cex_price = ?,
+        notify_state = ?
     WHERE id = ?
   `).run(
-    positionStatus.currentTick,
-    positionStatus.inRange ? 1 : 0,
+    status.currentTick,
+    status.inRange ? 1 : 0,
     now,
-    positionStatus.price0,
-    positionStatus.liquidity,
-    JSON.stringify(positionStatus.cexPrice),
+    status.price0Human || status.price0,
+    status.liquidity.toString(),
+    status.marginLower,
+    status.marginUpper,
+    cexJson,
+    status.inRange ? "in_range" : "out_of_range",
     position.id
   );
-  
+
   summary.active++;
-  
-  // 5. 检查告警条件
-  const alerts = checkAlertConditions(position, positionStatus, dexes);
-  
-  // 6. 处理告警（统一推送去重）
-  for (const alert of alerts) {
-    await processAlerts(position, alert, summary, positionStatus.currentTick);
+
+  // 5. 越界/恢复告警
+  const prevState = position.notify_state ?? "unknown";
+  const enteredOutOfRange = !status.inRange && (prevState === "in_range" || prevState === "unknown");
+  const reEnteredRange = status.inRange && prevState === "out_of_range";
+  const stillOutOfRangeAndExpired = !status.inRange && prevState === "out_of_range";
+
+  if (enteredOutOfRange || reEnteredRange || stillOutOfRangeAndExpired) {
+    const alertType = !status.inRange ? "out_of_range" : "re_in_range";
+    if (shouldPush(position.id, alertType)) {
+      const dp = makeDp(position);
+      const w = makeWalletRow(position);
+      const n = buildNotification(w, chain.name, dexes.find(d => d.id === position.dex_id)?.name ?? "", dp, makeReadResult(position, status), position.token0_symbol, position.token1_symbol, position.pair_flip, status.price0Human);
+      await sendAndRecord(position, chain, dexes, alertType, n, summary, status.currentTick);
+    }
+  }
+
+  // 6. tick_move 告警
+  if (tickMoveTriggered) {
+    if (shouldPush(position.id, "tick_move")) {
+      const dp = makeDp(position);
+      const w = makeWalletRow(position);
+      const n = buildTickMoveNotification(w, chain.name, dexes.find(d => d.id === position.dex_id)?.name ?? "", dp, makeReadResult(position, status), position.token0_symbol, position.token1_symbol, position.last_margin_lower, status.marginLower, tickMoveDelta, tickMoveDirection, position.pair_flip, status.price0Human);
+      await sendAndRecord(position, chain, dexes, "tick_move", n, summary, status.currentTick);
+    }
+  }
+
+  // 7. CEX 价差告警（与全量扫描一致：动态阈值 fee*2）
+  const cexEnabled = isCexPriceEnabled();
+  if (status.cexPriceInfo && status.cexPriceInfo.exceedsThreshold && cexEnabled) {
+    if (shouldPush(position.id, "cex_price")) {
+      const dp = makeDp(position);
+      const w = makeWalletRow(position);
+      const n = buildCexPriceNotification(w, chain.name, dexes.find(d => d.id === position.dex_id)?.name ?? "", dp, makeReadResult(position, status), position.token0_symbol, position.token1_symbol, status.cexPriceInfo.payload, position.pair_flip);
+      await sendAndRecord(position, chain, dexes, "cex_price", n, summary, status.currentTick);
+    }
   }
 }
 
+/** 构造全量扫描兼容的 WalletRow 对象 */
+function makeWalletRow(position: any): WalletRow {
+  return { id: position.wallet_id, chain_id_ref: position.chain_id_ref, address: position.wallet_address ?? "", label: position.wallet_label ?? "" };
+}
+
+/** 构造全量扫描兼容的 DiscoveredPosition 对象 */
+function makeDp(position: any): any {
+  return {
+    tokenId: position.token_id,
+    source: position.source,
+    stakerContract: position.staker_contract ?? "",
+  };
+}
+
+/** 构造全量扫描兼容的 r（readRange result）对象 */
+function makeReadResult(position: any, status: any): any {
+  return {
+    token0: position.token0,
+    token1: position.token1,
+    fee: position.fee ?? 0,
+    tickLower: status.tickLower,
+    tickUpper: status.tickUpper,
+    status: {
+      currentTick: status.currentTick,
+      price: status.price0,
+    },
+  };
+}
+
+/** 发送通知 + 写 alerts 表 + 记录推送去重（统一入口） */
+async function sendAndRecord(position: any, chain: any, _dexes: any[], alertType: string, n: { title: string; body: string }, summary: KnownPositionsSummary, currentTick: number) {
+  summary.alertsSent++;
+  try {
+    await notifyAll(n);
+  } catch (error) {
+    console.error(`[scanner-known] 发送通知失败:`, error);
+  }
+  // 写入 alerts 表（与全量扫描一致）
+  const db = getDb();
+  db.prepare(
+    `INSERT INTO alerts (position_id, type, tick_at, message, channels) VALUES (?, ?, ?, ?, ?)`
+  ).run(position.id, alertType, currentTick, n.body, "[]");
+  // 记录推送去重
+  recordPush(position.id, alertType);
+}
+
 /**
- * 获取仓位当前状态
+ * 获取仓位当前状态（与全量扫描对齐：CEX 价差、margin、tick_move 都在此计算）
  */
 async function getPositionStatus(
   position: any,
   chain: any,
   dexes: any[],
   tokenMap: Map<string, any>,
-  quotesByAddr: Map<string, any>,
+  quotesByAddr: Map<string, CexQuote>,
   client: PublicClient
 ) {
-  // 按仓位实际的 dex_id 精确匹配 DEX（不能用 dexes[0]，否则会用错 DEX 的 factory）
+  // 按仓位实际的 dex_id 精确匹配 DEX
   const dex = dexes.find(d => d.id === position.dex_id) ?? dexes[0];
-  if (!dex) {
-    throw new Error(`仓位 ${position.id} 无匹配 DEX`);
-  }
+  if (!dex) throw new Error(`仓位 ${position.id} 无匹配 DEX`);
   const adapter = getAdapter(dex.type || 'v3-fork');
-  if (!adapter) {
-    throw new Error(`无法获取适配器: ${dex.type}`);
-  }
+  if (!adapter) throw new Error(`无法获取适配器: ${dex.type}`);
 
-  // 获取仓位的当前tick和流动性（factory 必须是合约地址，不是 DEX 名字）
   const posData = await adapter.readRange(client, {
     factory: dex.factory || "",
     npm: dex.npm || ""
   }, BigInt(position.token_id));
-  
-  // 获取CEX价格
-  const cexPrice: Record<string, any> = {};
-  if (isCexPriceEnabled()) {
-    for (const tokenAddr of [position.token0, position.token1]) {
-      const quote = quotesByAddr.get(tokenAddr.toLowerCase());
-      if (quote) {
-        cexPrice[tokenAddr] = quote;
-      }
-    }
-  }
-  
+
+  // 获取 decimals
+  const dec0 = tokenMap.get((position.token0 || "").toLowerCase())?.decimals ?? 18;
+  const dec1 = tokenMap.get((position.token1 || "").toLowerCase())?.decimals ?? 18;
+  const sym0 = position.token0_symbol || "";
+  const sym1 = position.token1_symbol || "";
+
   if (posData.kind === 'closed') {
     return {
       currentTick: 0,
       inRange: false,
       liquidity: BigInt(0),
       price0: '0',
+      price0Human: '',
       isClosed: true,
-      cexPrice: {}
+      tickLower: position.tick_lower,
+      tickUpper: position.tick_upper,
+      marginLower: 0,
+      marginUpper: 0,
+      cexPriceInfo: null,
     };
   }
-  
+
   if (posData.kind === 'unreadable') {
-    throw new Error('无法读取仓位状态');
+    throw new Error('无法读取仓位状态（NFT 可能已 burn 或 RPC 异常）');
   }
-  
+
+  // === 与全量扫描完全一致的 CEX 价差计算 ===
+  const price0Human = rawToHumanPrice(posData.status.price, dec0, dec1);
+  const cexPriceInfo = computeCexPriceDiff(
+    (position.token0 || "").toLowerCase(),
+    (position.token1 || "").toLowerCase(),
+    posData.status.price,
+    quotesByAddr,
+    position.fee ?? 0,
+    sym0, sym1, dec0, dec1
+  );
+
   return {
     currentTick: posData.status.currentTick,
     inRange: posData.status.inRange,
     liquidity: posData.liquidity,
     price0: posData.status.price.toString(),
+    price0Human,
     isClosed: posData.liquidity === BigInt(0) || !posData.liquidity,
-    cexPrice
+    tickLower: posData.status.tickLower,
+    tickUpper: posData.status.tickUpper,
+    marginLower: posData.status.marginLower,
+    marginUpper: posData.status.marginUpper,
+    cexPriceInfo,  // 完整的 CEX 价差对比结果（与全量扫描一致）
   };
 }
 
-/**
- * 检查告警条件
- */
-function checkAlertConditions(position: any, status: any, dexes: any[]): Alert[] {
-  const alerts: Alert[] = [];
-  
-  // 1. 越界告警
-  if (!status.inRange && position.last_in_range === 1) {
-    alerts.push({
-      type: 'out_of_range',
-      message: `仓位越界: ${position.token0_symbol}/${position.token1_symbol} (${status.currentTick} / [${position.tick_lower}, ${position.tick_upper}])`,
-      severity: 'warning',
-      pushAllowed: true
-    });
-  }
-  
-  // 2. 恢复区间告警
-  if (status.inRange && position.last_in_range === 0) {
-    alerts.push({
-      type: 're_in_range',
-      message: `仓位恢复区间: ${position.token0_symbol}/${position.token1_symbol}`,
-      severity: 'info',
-      pushAllowed: true
-    });
-  }
-  
-  // 3. CEX差价告警
-  if (isCexPriceEnabled() && status.cexPrice && status.cexPrice[position.token0.toLowerCase()]) {
-    // 计算DEX价格
-    const dexPrice = parseFloat(status.price0);
-    const cexPrice = parseFloat(status.cexPrice[position.token0.toLowerCase()].price);
-    const priceDiff = Math.abs((dexPrice - cexPrice) / cexPrice * 100);
-
-    // 阈值：用该仓位所属 DEX 的 fee*2（与全量扫描一致），无 fee 信息时回退 1%
-    const posDex = dexes.find(d => d.id === position.dex_id);
-    const feePct = posDex?.fee ? posDex.fee / 10000 : 0.01;
-    if (priceDiff > feePct * 100) {
-      alerts.push({
-        type: 'cex_price',
-        message: `CEX差价告警: ${position.token0_symbol}/${position.token1_symbol} DEX价格: $${dexPrice.toFixed(4)}, CEX价格: $${cexPrice.toFixed(4)}, 差价: ${priceDiff.toFixed(2)}%`,
-        severity: 'warning',
-        pushAllowed: true
-      });
-    }
-  }
-    
-  // 4. Tick波动告警（复用全量扫描的阈值配置；已知扫描不追踪 margin 历史，故仅触发不计算 delta）
-  // tick_move 的具体波动检测由全量扫描负责（它记录 last_margin_lower），已知扫描不重复实现
-  
-  return alerts;
-}
-
-/**
- * 处理告警（统一推送去重：与全量扫描共享 push_states）
- */
-async function processAlerts(position: any, alert: Alert, summary: KnownPositionsSummary, currentTick: number = 0) {
-  // 统一去重：按告警类型独立冷却，两个扫描器共享 push_states
-  if (!shouldPush(position.id, alert.type)) {
-    summary.pushSkipped++;
-    console.log(`[scanner-known] 跳过推送: ${alert.type} (仓位 ${position.id})`);
-    return;
-  }
-
-  summary.alertsSent++;
-  console.log(`[scanner-known] 发送告警: ${alert.type} (仓位 ${position.id})`);
-
-  // 发送通知
-  try {
-    await notifyAll({
-      title: `仓位告警: ${alert.type}`,
-      body: alert.message,
-      url: `https://etherscan.io/nft/${position.nft_id}`
-    });
-  } catch (error) {
-    console.error(`[scanner-known] 发送通知失败:`, error);
-  }
-
-  // 记录到 alerts 表（与全量扫描一致，告警历史可见）
-  const db = getDb();
-  db.prepare(
-    `INSERT INTO alerts (position_id, type, tick_at, message, channels)
-     VALUES (?, ?, ?, ?, ?)`
-  ).run(position.id, alert.type, currentTick, alert.message, "[]");
-
-  // 记录推送时间（统一去重）
-  recordPush(position.id, alert.type);
-}
