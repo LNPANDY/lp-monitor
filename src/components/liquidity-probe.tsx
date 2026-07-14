@@ -289,6 +289,16 @@ export function LiquidityProbe() {
   const displayCexRate = result?.cex ? (flip ? 1 / result.cex.cexRate : result.cex.cexRate) : 0;
   const displayToken0Cex = result?.cex ? (flip ? result.cex.token1CexSymbol : result.cex.token0CexSymbol) : "";
   const displayToken1Cex = result?.cex ? (flip ? result.cex.token0CexSymbol : result.cex.token1CexSymbol) : "";
+  // 翻转后流动性 amount0/amount1 也要交换：amount0 对应 token0，翻转后显示口径为 token1/token0
+  const displayAmount0 = result ? (flip ? result.liquidity.amount1 : result.liquidity.amount0) : "";
+  const displayAmount1 = result ? (flip ? result.liquidity.amount0 : result.liquidity.amount1) : "";
+  // 翻转后价格区间取倒数并交换 low/high（1 token0=? token1 → 1 token1=? token0）
+  const displayPriceLow = result?.priceLow
+    ? fmtFull(flip ? 1 / Number(result.priceHigh) : Number(result.priceLow))
+    : "";
+  const displayPriceHigh = result?.priceHigh
+    ? fmtFull(flip ? 1 / Number(result.priceLow) : Number(result.priceHigh))
+    : "";
 
   return (
     <div className="card p-4">
@@ -416,7 +426,6 @@ export function LiquidityProbe() {
             <span className="font-semibold">{displayPair}</span>
             <span className="tag-muted">{result.fee / 10000}%</span>
             <span className="tag-muted">ts {result.tickSpacing}</span>
-            {result.cached && <span className="text-[10px] text-ink-soft">缓存命中</span>}
             {flip && (
               <span className="text-xs text-blue-600 bg-blue-50 px-1.5 py-0.5 rounded" title="交易对已翻转">
                 翻转
@@ -428,13 +437,13 @@ export function LiquidityProbe() {
               {result.currentTick} [{result.tickLower}, {result.tickUpper}]
             </PRow>
             <PRow label="窗口流动性">
-              {result.liquidity.amount0} {displaySym0} / {result.liquidity.amount1} {displaySym1}
+              {displayAmount0} {displaySym0} / {displayAmount1} {displaySym1}
             </PRow>
             <PRow label="当前价格">
               1 {displaySym0} ≈ {displayPriceCurrent} {displaySym1}
             </PRow>
             <PRow label="价格区间">
-              {result.priceLow} ~ {result.priceHigh} {displaySym1}/{displaySym0}
+              {displayPriceLow} ~ {displayPriceHigh} {displaySym1}/{displaySym0}
             </PRow>
             {result.cex && displayToken0Cex && displayToken1Cex && (
               <PRow label={`CEX 汇率 (${displayToken0Cex}÷${displayToken1Cex})`}>
@@ -467,7 +476,7 @@ export function LiquidityProbe() {
           </div>
 
           <div className="mt-1.5 flex gap-2">
-            <button className="btn-ghost text-xs" onClick={() => probe(true)}>强制刷新</button>
+            <button className="btn-ghost text-xs" onClick={() => probe(true)}>重新探测</button>
             <button className="btn-ghost text-xs" onClick={handleFlip} disabled={flipLoading}>
               {flipLoading ? "翻转中…" : flip ? "🔄 取消翻转" : "🔄 翻转交易对"}
             </button>
