@@ -22,7 +22,6 @@ import {
   findStakedPositions,
   type DiscoveredPosition,
 } from "../staking/discover";
-import { findStakedPositionsDirect } from "../staking/discover-direct";
 import { ownerOf } from "../adapters/v3-fork";
 import { notifyAll } from "../notify";
 import { shouldPush, recordPush } from "../notify/dedup";
@@ -32,7 +31,6 @@ import {
   type CexMapping,
   type CexQuote,
 } from "../cex/binance";
-import { getStakingScanMethod, getStakingConcurrentLimit, getContractBatchSize, isStakingFallbackEnabled } from "../settings";
 
 export interface ScanSummary {
   wallets: number;
@@ -84,65 +82,15 @@ export async function runScan(): Promise<ScanSummary> {
       // 发现仓位：直接持有 + 质押溯源（根据配置选择方式）
       const direct = await findDirectPositions(client, w.address as `0x${string}`, dexes);
       let staked: DiscoveredPosition[] = [];
-      
-      const scanMethod = getStakingScanMethod();
-      switch (scanMethod) {
-        case "transfer_scan":
-          staked = await findStakedPositions(
-            client,
-            w.address as `0x${string}`,
-            dexes,
-            staking
-          );
-          break;
-        case "contract_direct":
-          staked = await findStakedPositionsDirect(
-            client,
-            w.address as `0x${string}`,
-            dexes,
-            staking
-          );
-          break;
-        case "hybrid":
-        default:
-          // 先尝试转账扫描，如果失败或没有结果再尝试合约直查
-          try {
-            staked = await findStakedPositions(
-              client,
-              w.address as `0x${string}`,
-              dexes,
-              staking
-            );
-            
-            // 如果转账扫描结果很少，并且启用了兜底机制，补充合约直查
-            if (isStakingFallbackEnabled() && staked.length < 10) {
-              console.log(`转账扫描只发现 ${staked.length} 个仓位，启用兜底合约直查...`);
-              const directStaked = await findStakedPositionsDirect(
-                client,
-                w.address as `0x${string}`,
-                dexes,
-                staking
-              );
-              
-              // 合并结果，去重
-              const hybridStaked = dedupeDiscovered([...staked, ...directStaked]);
-              if (hybridStaked.length > staked.length) {
-                console.log(`兜底扫描额外发现 ${hybridStaked.length - staked.length} 个仓位`);
-                staked = hybridStaked;
-              }
-            }
-          } catch (error) {
-            console.warn('转账扫描失败，使用合约直查作为替代:', error);
-            staked = await findStakedPositionsDirect(
-              client,
-              w.address as `0x${string}`,
-              dexes,
-              staking
-            );
-          }
-          break;
-      }
-      
+
+      // 只使用转账扫描方式
+      staked = await findStakedPositions(
+        client,
+        w.address as `0x${string}`,
+        dexes,
+        staking
+      );
+
       const discovered = dedupeDiscovered([...direct, ...staked]);
 
       // 兜底恢复：库里有但本次未发现的仓位（尤其质押仓位：转账发生在扫描窗口外）。

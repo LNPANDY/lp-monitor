@@ -282,10 +282,6 @@ function migrate(db: DB) {
 /** 初始化默认设置 */
 function seedDefaultSettings(db: DB) {
   const defaultSettings = [
-    { key: "staking_scan_method", value: "transfer_scan" }, // 默认使用转账扫描方式
-    { key: "staking_scan_fallback_enabled", value: "true" }, // 启用兜底机制：转账扫描失败时尝试合约直查
-    { key: "staking_scan_contract_batch_size", value: "50" }, // 合约直查时的批量大小
-    { key: "staking_scan_concurrent_limit", value: "6" }, // 并发限制
     { key: "push_cooldown_minutes", value: "2" }, // 推送冷却时间（分钟），默认2分钟
     { key: "cooldown_out_of_range", value: "30" }, // 越界告警冷却（分钟）
     { key: "cooldown_re_in_range", value: "30" }, // 恢复区间告警冷却（分钟）

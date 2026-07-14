@@ -315,20 +315,8 @@ function StakingSection() {
 /* ============ 扫描设置 ============ */
 function ScanSettingsSection() {
   const { data: settings, mutate } = useSWR<any>("/api/scan-settings", fetcher);
-  const { data: chains } = useSWR<any[]>("/api/chains", fetcher);
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState("");
-
-  // 对比测试状态
-  const [testChainId, setTestChainId] = useState<number | "">("");
-  const { data: wallets } = useSWR<any[]>(
-    testChainId ? `/api/wallets?chain_id=${testChainId}` : "/api/wallets",
-    fetcher
-  );
-  const [testWallet, setTestWallet] = useState<string>("");
-  const [testing, setTesting] = useState(false);
-  const [testResult, setTestResult] = useState<any>(null);
-  const [testErr, setTestErr] = useState("");
 
   const handleSave = async (updates: any) => {
     setMsg("");
@@ -350,239 +338,28 @@ function ScanSettingsSection() {
     }
   };
 
-  async function runTest() {
-    setTesting(true);
-    setTestErr("");
-    setTestResult(null);
-    try {
-      const params = new URLSearchParams();
-      if (testWallet) params.set("wallet_address", testWallet);
-      if (testChainId) params.set("chain_id", String(testChainId));
-      const r = await fetch(`/api/scan-method-test?${params}`);
-      const j = await r.json();
-      if (!j.ok) throw new Error(j.error || "测试失败");
-      setTestResult(j.data);
-    } catch (e: any) {
-      setTestErr(e.message);
-    } finally {
-      setTesting(false);
-    }
-  }
-
   return (
     <section className="card p-5">
       <h2 className="mb-1 text-base font-semibold">扫描设置</h2>
-      <p className="mb-3 text-xs text-ink-soft">配置质押扫描的方式和性能参数</p>
-      
-      <div className="mb-4 space-y-4">
+      <p className="mb-3 text-xs text-ink-soft">配置扫描相关参数</p>
+
+      <div className="space-y-4">
         <div>
           <label className="block mb-1 text-sm font-medium">
-            质押扫描方式
+            默认推送冷却（分钟）
           </label>
-          <p className="mb-2 text-xs text-ink-soft">
-            选择扫描质押NFT的方式：
-          </p>
-          <div className="space-y-2">
-            <label className="flex items-center">
-              <input
-                type="radio"
-                name="staking_scan_method"
-                value="transfer_scan"
-                checked={settings?.staking_scan_method === "transfer_scan"}
-                onChange={(e) => handleSave({ staking_scan_method: e.target.value })}
-                className="mr-2"
-              />
-              <span className="text-sm">转账扫描（默认）</span>
-            </label>
-            <p className="ml-4 text-xs text-ink-soft">
-              通过分析Transfer事件扫描历史转账，兼容性好但速度较慢。
-            </p>
-            
-            <label className="flex items-center">
-              <input
-                type="radio"
-                name="staking_scan_method"
-                value="contract_direct"
-                checked={settings?.staking_scan_method === "contract_direct"}
-                onChange={(e) => handleSave({ staking_scan_method: e.target.value })}
-                className="mr-2"
-              />
-              <span className="text-sm">合约直查</span>
-            </label>
-            <p className="ml-4 text-xs text-ink-soft">
-              直接调用合约方法获取NFT列表，速度更快，但需要合约支持相应方法。
-            </p>
-            
-            <label className="flex items-center">
-              <input
-                type="radio"
-                name="staking_scan_method"
-                value="hybrid"
-                checked={settings?.staking_scan_method === "hybrid"}
-                onChange={(e) => handleSave({ staking_scan_method: e.target.value })}
-                className="mr-2"
-              />
-              <span className="text-sm">混合模式</span>
-            </label>
-            <p className="ml-4 text-xs text-ink-soft">
-              优先使用合约直查，失败时自动回退到转账扫描，兼顾速度和兼容性。
-            </p>
-          </div>
-        </div>
-
-        <div>
-          <label className="flex items-center gap-2">
-            <input
-              type="checkbox"
-              checked={settings?.staking_scan_fallback_enabled}
-              onChange={(e) => handleSave({ staking_scan_fallback_enabled: e.target.checked })}
-              className="rounded"
-            />
-            <span className="text-sm font-medium">启用兜底机制</span>
-          </label>
-          <p className="ml-6 text-xs text-ink-soft">
-            当扫描失败时自动回退到备用方法，提高可靠性（建议开启）。
+          <input
+            type="number"
+            min="1"
+            max="60"
+            value={settings?.push_cooldown_minutes || 2}
+            onChange={(e) => handleSave({ push_cooldown_minutes: Number(e.target.value) })}
+            className="input"
+          />
+          <p className="mt-1 text-xs text-ink-soft">
+            默认推送冷却时间，1-60分钟。各类告警可单独配置覆盖此值。
           </p>
         </div>
-
-        <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
-          <div>
-            <label className="block mb-1 text-sm font-medium">
-              合约直查批量大小
-            </label>
-            <input
-              type="number"
-              min="10"
-              max="200"
-              value={settings?.staking_scan_contract_batch_size || 50}
-              onChange={(e) => handleSave({ staking_scan_contract_batch_size: Number(e.target.value) })}
-              className="input"
-            />
-            <p className="mt-1 text-xs text-ink-soft">
-              每次批量处理的NFT数量，10-200之间。数值越大速度越快但内存占用越高。
-            </p>
-          </div>
-          
-          <div>
-            <label className="block mb-1 text-sm font-medium">
-              并发限制
-            </label>
-            <input
-              type="number"
-              min="1"
-              max="20"
-              value={settings?.staking_scan_concurrent_limit || 6}
-              onChange={(e) => handleSave({ staking_scan_concurrent_limit: Number(e.target.value) })}
-              className="input"
-            />
-            <p className="mt-1 text-xs text-ink-soft">
-              同时处理的请求数量，1-20之间。数值越大速度越快但网络压力越大。
-            </p>
-          </div>
-        </div>
-      </div>
-
-      {/* 扫描方式对比测试 */}
-      <div className="mt-4 rounded-md border border-slate-200 p-4">
-        <h3 className="mb-2 text-sm font-semibold">🔄 扫描方式对比测试</h3>
-        <p className="mb-3 text-xs text-ink-soft">
-          选择钱包后一键运行两种扫描方式，对比耗时和发现的仓位数，帮你选择最快的扫描方式。
-        </p>
-        <div className="mb-3 grid grid-cols-1 gap-3 md:grid-cols-3">
-          <Field label="链（可选）">
-            <select
-              className="input"
-              value={testChainId}
-              onChange={(e) => { setTestChainId(e.target.value ? Number(e.target.value) : ""); setTestWallet(""); }}
-            >
-              <option value="">全部链</option>
-              {(chains ?? []).map((c: any) => <option key={c.id} value={c.id}>{c.name}</option>)}
-            </select>
-          </Field>
-          <Field label="钱包（不选用第一个）">
-            <select
-              className="input"
-              value={testWallet}
-              onChange={(e) => setTestWallet(e.target.value)}
-            >
-              <option value="">自动选择</option>
-              {(wallets ?? []).map((w: any) => (
-                <option key={w.id} value={w.address}>
-                  {w.label ? `${w.label} (${short(w.address)})` : short(w.address)}
-                </option>
-              ))}
-            </select>
-          </Field>
-          <div className="flex items-end">
-            <button className="btn-primary w-full" onClick={runTest} disabled={testing}>
-              {testing ? "测试中…" : "开始对比测试"}
-            </button>
-          </div>
-        </div>
-
-        {testErr && <p className="mb-2 text-sm text-warn">❌ {testErr}</p>}
-
-        {testResult && (
-          <div className="mt-2 space-y-3">
-            <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
-              {/* 转账扫描结果 */}
-              <div className="rounded-md border border-slate-200 p-3">
-                <div className="mb-1 flex items-center justify-between">
-                  <span className="text-sm font-medium">📡 转账扫描</span>
-                  {testResult.comparison.winner === "transfer_scan" && (
-                    <span className="tag-ok text-xs">最快</span>
-                  )}
-                </div>
-                <div className="text-xs text-ink-soft">耗时 {testResult.transferScan.timeMs}ms</div>
-                <div className="text-xs text-ink-soft">发现仓位 {testResult.transferScan.positions} 个</div>
-                {testResult.transferScan.errors.length > 0 && (
-                  <div className="mt-1 text-xs text-warn">错误 {testResult.transferScan.errors.length} 条</div>
-                )}
-              </div>
-
-              {/* 合约直查结果 */}
-              <div className="rounded-md border border-slate-200 p-3">
-                <div className="mb-1 flex items-center justify-between">
-                  <span className="text-sm font-medium">🎯 合约直查</span>
-                  {testResult.comparison.winner === "contract_direct" && (
-                    <span className="tag-ok text-xs">最快</span>
-                  )}
-                </div>
-                <div className="text-xs text-ink-soft">耗时 {testResult.contractDirect.timeMs}ms</div>
-                <div className="text-xs text-ink-soft">发现仓位 {testResult.contractDirect.positions} 个</div>
-                {testResult.contractDirect.errors.length > 0 && (
-                  <div className="mt-1 text-xs text-warn">错误 {testResult.contractDirect.errors.length} 条</div>
-                )}
-              </div>
-            </div>
-
-            {/* 性能对比总结 */}
-            <div className="rounded-md bg-slate-50 p-3 text-sm">
-              <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
-                <span>
-                  ⚡ 速度对比：
-                  <span className="font-semibold">
-                    {Number(testResult.comparison.speedup).toFixed(2)}x
-                  </span>
-                </span>
-                <span>
-                  📊 提升幅度：
-                  <span className="font-semibold">{testResult.comparison.improvement}%</span>
-                </span>
-                <span>
-                  📈 仓位一致性：
-                  <span className={testResult.comparison.positionsMatch ? "text-ok font-semibold" : "text-warn font-semibold"}>
-                    {testResult.comparison.positionsMatch ? "✅ 一致" : "❌ 存在差异"}
-                  </span>
-                </span>
-              </div>
-              <div className="mt-1 text-xs text-ink-soft">
-                💡 推荐使用「{testResult.comparison.winner === "transfer_scan" ? "转账扫描" : "合约直查"}」，
-                {testResult.comparison.positionsMatch ? "两种方式发现的仓位完全一致。" : "注意：两种方式发现的仓位数量不同，请检查质押合约配置。"}
-              </div>
-            </div>
-          </div>
-        )}
       </div>
 
       {busy && <span className="text-sm text-ink-soft">保存中…</span>}
