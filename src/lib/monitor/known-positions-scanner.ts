@@ -56,6 +56,9 @@ export async function scanKnownPositions(): Promise<KnownPositionsSummary> {
   };
 
   try {
+    // CEX 静音缓存（与全量扫描一致：同一 token 对本次扫描内不重复查 DB）
+    const cexMutedPairs = new Set<string>();
+
     // 1. 查询所有未关闭的仓位
     const positionsQuery = `
       SELECT p.*, w.label AS wallet_label, w.address AS wallet_address,
@@ -97,7 +100,7 @@ export async function scanKnownPositions(): Promise<KnownPositionsSummary> {
     // 3. 处理每个链的仓位
     for (const [chainRef, chain] of chainsByRef) {
       const chainPositions = positionsByChain.get(chainRef) || [];
-      await processChainPositions(chain, chainPositions, chainRef, summary);
+      await processChainPositions(chain, chainPositions, chainRef, summary, cexMutedPairs);
     }
     
     // 4. 统计结果
@@ -118,7 +121,7 @@ export async function scanKnownPositions(): Promise<KnownPositionsSummary> {
 /**
  * 处理单个链的仓位
  */
-async function processChainPositions(chain: any, positions: any[], chainIdRef: number, summary: KnownPositionsSummary) {
+async function processChainPositions(chain: any, positions: any[], chainIdRef: number, summary: KnownPositionsSummary, cexMutedPairs: Set<string>) {
   const db = getDb();
   
   try {
@@ -147,7 +150,7 @@ async function processChainPositions(chain: any, positions: any[], chainIdRef: n
     // 批量处理仓位
     for (const position of positions) {
       try {
-        await processSinglePosition(position, chain, dexes, tokenMap, quotesByAddr, client, summary);
+        await processSinglePosition(position, chain, dexes, tokenMap, quotesByAddr, client, summary, cexMutedPairs);
       } catch (error) {
         console.error(`[scanner-known] 处理仓位失败:`, error);
         summary.errors.push(`处理仓位 ${position.id} 失败: ${error instanceof Error ? error.message : String(error)}`);
@@ -170,7 +173,8 @@ async function processSinglePosition(
   tokenMap: Map<string, any>,
   quotesByAddr: Map<string, CexQuote>,
   client: PublicClient,
-  summary: KnownPositionsSummary
+  summary: KnownPositionsSummary,
+  cexMutedPairs: Set<string>
 ) {
   const db = getDb();
   const now = new Date().toISOString();
@@ -276,9 +280,17 @@ async function processSinglePosition(
     }
   }
 
-  // 7. CEX 价差告警（与全量扫描一致：动态阈值 fee*2）
+  // 7. CEX 价差告警（与全量扫描一致：动态阈值 fee*2 + 静音检查）
   const cexEnabled = isCexPriceEnabled();
-  if (status.cexPriceInfo && status.cexPriceInfo.exceedsThreshold && cexEnabled) {
+  const muteKey = `${position.chain_id_ref}|${(position.token0 || "").toLowerCase()}|${(position.token1 || "").toLowerCase()}`;
+  // 缓存静音状态：同一 token 对在本次扫描内不重复查 DB
+  if (!cexMutedPairs.has(muteKey)) {
+    const muted = db
+      .prepare("SELECT id FROM cex_alert_mutes WHERE chain_id_ref=? AND token0=? AND token1=?")
+      .get(position.chain_id_ref, (position.token0 || "").toLowerCase(), (position.token1 || "").toLowerCase());
+    if (muted) cexMutedPairs.add(muteKey);
+  }
+  if (status.cexPriceInfo && status.cexPriceInfo.exceedsThreshold && cexEnabled && !cexMutedPairs.has(muteKey)) {
     if (shouldPush(position.id, "cex_price")) {
       const dp = makeDp(position);
       const w = makeWalletRow(position);

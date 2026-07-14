@@ -56,10 +56,12 @@ interface Position {
 }
 
 interface MonitorState {
-  running: boolean;
-  cron: string;
-  cooldownMs: number;
-  last: any;
+  knownRunning: boolean;
+  fullRunning: boolean;
+  fullCron: string;
+  knownCron: string;
+  lastKnown: any;
+  lastFull: any;
 }
 
 export default function DashboardPage() {
@@ -92,8 +94,8 @@ export default function DashboardPage() {
           <Stat label="监控仓位" value={list.length} />
           <Stat label="越界" value={outOfRange.length} danger={outOfRange.length > 0} />
           <div className="text-sm text-ink-soft">
-            <div>调度：{mon?.cron ? cronToLabel(mon.cron) : "—"}</div>
-            <div>状态：{mon?.running ? "扫描中…" : `上次 ${timeAgo(mon?.last?.at)}`}</div>
+            <div>全量：{mon?.fullCron ? cronToLabel(mon.fullCron) : "—"}{mon?.fullRunning ? " (扫描中)" : ` ${timeAgo(mon?.lastFull?.at)}`}</div>
+            <div>已知：{mon?.knownRunning ? "扫描中…" : `上次 ${timeAgo(mon?.lastKnown?.at)}`}</div>
           </div>
         </div>
         <div className="flex items-center gap-2">
@@ -102,7 +104,7 @@ export default function DashboardPage() {
       </div>
 
       {/* 扫描频率和告警阈值设置 */}
-      <ScanIntervalAndAlerts currentCron={mon?.cron ?? ""} onChanged={() => reloadMon()} />
+      <ScanIntervalAndAlerts currentCron={mon?.fullCron ?? ""} knownCron={mon?.knownCron ?? ""} onChanged={() => reloadMon()} />
 
       {/* 链上资产统计 */}
       <PortfolioSection />
@@ -314,7 +316,7 @@ function PortfolioSection() {
   );
 }
 
-function ScanIntervalAndAlerts({ currentCron, onChanged }: { currentCron: string; onChanged: () => void }) {
+function ScanIntervalAndAlerts({ currentCron, knownCron, onChanged }: { currentCron: string; knownCron: string; onChanged: () => void }) {
   const [preset, setPreset] = useState("");
   const [msg, setMsg] = useState("");
   const [busy, setBusy] = useState(false);
@@ -409,12 +411,29 @@ function ScanIntervalAndAlerts({ currentCron, onChanged }: { currentCron: string
     } finally { setBusy(false); }
   }
 
+  async function applyKnownCron(cronExpr: string, label: string) {
+    setBusy(true); setMsg("");
+    try {
+      const r = await fetch("/api/monitor", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ type: "known", cron: cronExpr }),
+      });
+      const j = await r.json();
+      if (!j.ok) throw new Error(j.error);
+      setMsg(`✅ 已知仓位扫描频率已更新为 ${label}`);
+      onChanged();
+    } catch (e: any) {
+      setMsg(`❌ ${e.message}`);
+    } finally { setBusy(false); }
+  }
+
   return (
     <div className="card p-4">
       <div className="flex flex-wrap items-center gap-4">
         {/* 扫描频率 */}
         <div className="flex items-center gap-2 border-r border-slate-200 pr-4">
-          <span className="text-sm font-medium">扫描频率：</span>
+          <span className="text-sm font-medium">全量扫描：</span>
           <span className="text-sm text-ink-soft">
             {currentCron ? cronToLabel(currentCron) : "—"}
           </span>
@@ -440,6 +459,21 @@ function ScanIntervalAndAlerts({ currentCron, onChanged }: { currentCron: string
           >
             应用
           </button>
+        </div>
+
+        {/* 已知仓位扫描频率 */}
+        <div className="flex items-center gap-2 border-r border-slate-200 pr-4">
+          <span className="text-sm font-medium">已知仓位：</span>
+          <select
+            className="input max-w-[120px] text-xs"
+            value={knownCron}
+            disabled={busy}
+            onChange={(e) => applyKnownCron(e.target.value, e.target.options[e.target.selectedIndex].text)}
+          >
+            <option value="*/30 * * * * *">30 秒</option>
+            <option value="*/60 * * * * *">1 分钟</option>
+            <option value="*/120 * * * * *">2 分钟</option>
+          </select>
         </div>
 
         {/* 告警阈值 */}
