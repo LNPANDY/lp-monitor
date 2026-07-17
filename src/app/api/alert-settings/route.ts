@@ -4,6 +4,7 @@ import {
   getTickMoveThreshold,
   isTickMoveEnabled,
   isCexPriceEnabled,
+  getPushCooldownMinutes,
 } from "@/lib/db/settings";
 
 export const dynamic = "force-dynamic";
@@ -14,6 +15,7 @@ export async function GET() {
     tick_move_enabled: isTickMoveEnabled(),
     tick_move_threshold: getTickMoveThreshold(),
     cex_price_enabled: isCexPriceEnabled(),
+    push_cooldown_minutes: getPushCooldownMinutes(),
   });
 }
 
@@ -23,6 +25,7 @@ export async function PUT(req: Request) {
     tick_move_enabled?: string;
     tick_move_threshold?: number;
     cex_price_enabled?: string;
+    push_cooldown_minutes?: number;
   }>(req);
 
   // 注意：前端传的是字符串 "0"/"1"，字符串 "0" 是 truthy，不能用 ?: 判断
@@ -37,10 +40,16 @@ export async function PUT(req: Request) {
   if (body.cex_price_enabled !== undefined) {
     setSetting("cex_price_enabled", String(body.cex_price_enabled) === "1" ? "1" : "0");
   }
+  if (body.push_cooldown_minutes !== undefined) {
+    const v = Number(body.push_cooldown_minutes);
+    if (!Number.isFinite(v) || v < 1 || v > 60) return fail("push_cooldown_minutes 须为 1~60 的数值");
+    setSetting("push_cooldown_minutes", String(v));
+  }
 
   return ok({
     tick_move_enabled: isTickMoveEnabled(),
     tick_move_threshold: getTickMoveThreshold(),
     cex_price_enabled: isCexPriceEnabled(),
+    push_cooldown_minutes: getPushCooldownMinutes(),
   });
 }

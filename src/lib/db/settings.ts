@@ -59,12 +59,12 @@ export function getAlertCooldownMinutes(alertType: string): number {
 }
 
 /** 告警类型冷却默认值映射。 */
-function getDefaultCooldown(alertType: string): number {
-  const map: Record<string, number> = {
-    out_of_range: 30,
-    re_in_range: 30,
-    cex_price: 2,
-    tick_move: 10,
-  };
-  return map[alertType] ?? 2;
-}
+	function getDefaultCooldown(alertType: string): number {
+	  const map: Record<string, number> = {
+	    out_of_range: 30,
+	    re_in_range: 30,
+	    cex_price: 2,
+	    tick_move: 10,
+	  };
+	  return map[alertType] ?? getPushCooldownMinutes(); // 回退到全局默认
+	}

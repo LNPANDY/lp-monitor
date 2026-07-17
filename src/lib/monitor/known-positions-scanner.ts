@@ -198,7 +198,7 @@ async function processSinglePosition(
     console.log(`[scanner-known] 仓位已关闭: #${position.token_id} ${pairLabel} (${chain.name})`);
 
     // 关闭告警（统一去重）
-    if (shouldPush(position.id, "closed")) {
+    if (shouldPush(position.id, "closed", "closed")) {
       const dexName = dexes.find(d => d.id === position.dex_id)?.name ?? "";
       await sendAndRecord(position, chain, dexes, "closed", {
         title: `仓位已关闭 ${pairLabel} · ${chain.name}/${dexName}`,
@@ -262,7 +262,7 @@ async function processSinglePosition(
 
   if (enteredOutOfRange || reEnteredRange || stillOutOfRangeAndExpired) {
     const alertType = !status.inRange ? "out_of_range" : "re_in_range";
-    if (shouldPush(position.id, alertType)) {
+    if (shouldPush(position.id, alertType, alertType)) {
       const dp = makeDp(position);
       const w = makeWalletRow(position);
       const n = buildNotification(w, chain.name, dexes.find(d => d.id === position.dex_id)?.name ?? "", dp, makeReadResult(position, status), position.token0_symbol, position.token1_symbol, position.pair_flip, status.price0Human);
@@ -272,7 +272,7 @@ async function processSinglePosition(
 
   // 6. tick_move 告警
   if (tickMoveTriggered) {
-    if (shouldPush(position.id, "tick_move")) {
+    if (shouldPush(position.id, "tick_move", "moved")) {
       const dp = makeDp(position);
       const w = makeWalletRow(position);
       const n = buildTickMoveNotification(w, chain.name, dexes.find(d => d.id === position.dex_id)?.name ?? "", dp, makeReadResult(position, status), position.token0_symbol, position.token1_symbol, position.last_margin_lower, status.marginLower, tickMoveDelta, tickMoveDirection, position.pair_flip, status.price0Human);
@@ -291,7 +291,7 @@ async function processSinglePosition(
     if (muted) cexMutedPairs.add(muteKey);
   }
   if (status.cexPriceInfo && status.cexPriceInfo.exceedsThreshold && cexEnabled && !cexMutedPairs.has(muteKey)) {
-    if (shouldPush(position.id, "cex_price")) {
+    if (shouldPush(position.id, "cex_price", "exceeds_threshold")) {
       const dp = makeDp(position);
       const w = makeWalletRow(position);
       const n = buildCexPriceNotification(w, chain.name, dexes.find(d => d.id === position.dex_id)?.name ?? "", dp, makeReadResult(position, status), position.token0_symbol, position.token1_symbol, status.cexPriceInfo.payload, position.pair_flip);
@@ -342,8 +342,8 @@ async function sendAndRecord(position: any, chain: any, _dexes: any[], alertType
   db.prepare(
     `INSERT INTO alerts (position_id, type, tick_at, message, channels) VALUES (?, ?, ?, ?, ?)`
   ).run(position.id, alertType, currentTick, n.body, "[]");
-  // 记录推送去重
-  recordPush(position.id, alertType);
+// 记录推送去重（传递当前告警状态）
+    recordPush(position.id, alertType, alertType);
 }
 
 /**

@@ -258,6 +258,7 @@ function migrate(db: DB) {
   safeAddColumn(db, "positions", "last_liquidity", "TEXT NOT NULL DEFAULT ''");
   safeAddColumn(db, "positions", "token0_symbol", "TEXT NOT NULL DEFAULT ''");
   safeAddColumn(db, "positions", "token1_symbol", "TEXT NOT NULL DEFAULT ''");
+  safeAddColumn(db, "push_states", "last_alert_state", "TEXT NOT NULL DEFAULT ''");
   // liquidity_favorites 表新增 token symbol 字段
   safeAddColumn(db, "liquidity_favorites", "token0_symbol", "TEXT NOT NULL DEFAULT ''");
   safeAddColumn(db, "liquidity_favorites", "token1_symbol", "TEXT NOT NULL DEFAULT ''");

@@ -282,14 +282,14 @@ export async function runScan(): Promise<ScanSummary> {
           const reEnteredRange =
             inRange && prevState === "out_of_range";
           const stillOutOfRangeAndExpired =
-            !inRange && prevState === "out_of_range" && shouldPush(positionRow.id, "out_of_range");
+            !inRange && prevState === "out_of_range" && shouldPush(positionRow.id, "out_of_range", "out_of_range");
 
           const rangeTrigger = enteredOutOfRange || reEnteredRange || stillOutOfRangeAndExpired;
 
           // ===== 发送告警（越界 + 波动各自独立发送）=====
           if (rangeTrigger) {
             const alertType = !inRange ? "out_of_range" : "re_in_range";
-            if (shouldPush(positionRow.id, alertType)) {
+            if (shouldPush(positionRow.id, alertType, alertType)) {
               const n = buildNotification(w, chain.name, dex.name, dp, r, sym0, sym1, positionRow.pair_flip, price0Human);
               const sendRes = await notifyAll(n);
               alertsSent++;
@@ -304,13 +304,13 @@ export async function runScan(): Promise<ScanSummary> {
                 n.body,
                 JSON.stringify(sendRes.sent)
               );
-              recordPush(positionRow.id, alertType);
+              recordPush(positionRow.id, alertType, alertType);
             }
           }
 
           // 波动告警（独立于越界告警，受 tick_move 冷却控制）
           if (tickMoveTriggered) {
-            if (shouldPush(positionRow.id, "tick_move")) {
+            if (shouldPush(positionRow.id, "tick_move", "moved")) {
               const n = buildTickMoveNotification(
                 w, chain.name, dex.name, dp, r, sym0, sym1,
                 prev.last_margin_lower, currMarginLower,
@@ -329,7 +329,7 @@ export async function runScan(): Promise<ScanSummary> {
                 n.body,
                 JSON.stringify(sendRes.sent)
               );
-              recordPush(positionRow.id, "tick_move");
+              recordPush(positionRow.id, "tick_move", "moved");
             }
           }
 
@@ -345,7 +345,7 @@ export async function runScan(): Promise<ScanSummary> {
             if (muted) cexMutedPairs.add(muteKey);
           }
           if (cexPriceInfo && cexPriceInfo.exceedsThreshold && cexEnabled && !cexMutedPairs.has(muteKey)) {
-            if (shouldPush(positionRow.id, "cex_price")) {
+            if (shouldPush(positionRow.id, "cex_price", "exceeds_threshold")) {
               const n = buildCexPriceNotification(
                 w, chain.name, dex.name, dp, r, sym0, sym1,
                 cexPriceInfo.payload, positionRow.pair_flip
@@ -363,7 +363,7 @@ export async function runScan(): Promise<ScanSummary> {
                 n.body,
                 JSON.stringify(sendRes.sent)
               );
-              recordPush(positionRow.id, "cex_price");
+              recordPush(positionRow.id, "cex_price", "exceeds_threshold");
             }
           }
         } catch (e: any) {
