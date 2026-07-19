@@ -43,28 +43,40 @@ export function isCexPriceEnabled(): boolean {
   return getSetting("cex_price_enabled", "0") === "1";
 }
 
-/** 推送冷却时间（分钟）。默认 2 分钟，可选 2, 5, 10, 20, 30。 */
+/** 推送冷却时间（分钟）。默认 2 分钟。前端可选 2/5/10/20/30，也接受 1~60 任意值。 */
 export function getPushCooldownMinutes(): number {
   const v = Number(getSetting("push_cooldown_minutes", ""));
-  return [2, 5, 10, 20, 30].includes(v) ? v : 2;
+  return Number.isFinite(v) && v >= 1 && v <= 60 ? v : 2;
 }
 
 // ===== 按告警类型的推送冷却配置（分钟）=====
 
-/** 获取指定告警类型的冷却时间（分钟）。 */
+/**
+ * 获取指定告警类型的冷却时间（分钟）。
+ * 优先级：用户显式配置的独立 cooldown_<type> > 全局 push_cooldown_minutes > 默认值 2。
+ *
+ * 说明：历史上部署时用 safeAddColumn 写入了硬编码默认值（cex_price=2, out_of_range=30,
+ * tick_move=10, re_in_range=30）。这些"默认值"在 app_settings 表里与用户显式设置的值
+ * 无法区分。为了让前端修改的全局冷却（push_cooldown_minutes）能立即生效，
+ * 这里对"等于历史硬编码默认值"的独立配置做回退：只要独立配置等于历史默认值，
+ * 就忽略它，回退到全局配置。用户若再次通过 API 修改，写入的值（除非正好等于
+ * 历史默认）会被视为显式配置而生效。
+ */
+const HISTORICAL_DEFAULTS: Record<string, number> = {
+  cex_price: 2,
+  out_of_range: 30,
+  re_in_range: 30,
+  tick_move: 10,
+};
+
 export function getAlertCooldownMinutes(alertType: string): number {
+  const globalCooldown = getPushCooldownMinutes();
   const key = `cooldown_${alertType}`;
   const v = Number(getSetting(key, ""));
-  return Number.isFinite(v) && v > 0 ? v : getDefaultCooldown(alertType);
+  // 独立配置为空/非法 → 回退全局
+  if (!Number.isFinite(v) || v <= 0) return globalCooldown;
+  // 独立配置等于历史硬编码默认值 → 视为"未显式设置"，回退全局
+  if (HISTORICAL_DEFAULTS[alertType] === v) return globalCooldown;
+  // 独立配置是用户显式设置的值 → 采用它
+  return v;
 }
-
-/** 告警类型冷却默认值映射。 */
-	function getDefaultCooldown(alertType: string): number {
-	  const map: Record<string, number> = {
-	    out_of_range: 30,
-	    re_in_range: 30,
-	    cex_price: 2,
-	    tick_move: 10,
-	  };
-	  return map[alertType] ?? getPushCooldownMinutes(); // 回退到全局默认
-	}
