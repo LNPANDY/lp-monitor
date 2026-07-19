@@ -203,7 +203,7 @@ async function processSinglePosition(
       await sendAndRecord(position, chain, dexes, "closed", {
         title: `仓位已关闭 ${pairLabel} · ${chain.name}/${dexName}`,
         body: `仓位 #${position.token_id}（${pairLabel}）已关闭。\n钱包: ${position.wallet_address ?? ""}`,
-      }, summary, 0);
+      }, summary, 0, "closed");
     }
     return;
   }
@@ -266,7 +266,7 @@ async function processSinglePosition(
       const dp = makeDp(position);
       const w = makeWalletRow(position);
       const n = buildNotification(w, chain.name, dexes.find(d => d.id === position.dex_id)?.name ?? "", dp, makeReadResult(position, status), position.token0_symbol, position.token1_symbol, position.pair_flip, status.price0Human);
-      await sendAndRecord(position, chain, dexes, alertType, n, summary, status.currentTick);
+      await sendAndRecord(position, chain, dexes, alertType, n, summary, status.currentTick, alertType);
     }
   }
 
@@ -276,7 +276,7 @@ async function processSinglePosition(
       const dp = makeDp(position);
       const w = makeWalletRow(position);
       const n = buildTickMoveNotification(w, chain.name, dexes.find(d => d.id === position.dex_id)?.name ?? "", dp, makeReadResult(position, status), position.token0_symbol, position.token1_symbol, position.last_margin_lower, status.marginLower, tickMoveDelta, tickMoveDirection, position.pair_flip, status.price0Human);
-      await sendAndRecord(position, chain, dexes, "tick_move", n, summary, status.currentTick);
+      await sendAndRecord(position, chain, dexes, "tick_move", n, summary, status.currentTick, "moved");
     }
   }
 
@@ -295,7 +295,7 @@ async function processSinglePosition(
       const dp = makeDp(position);
       const w = makeWalletRow(position);
       const n = buildCexPriceNotification(w, chain.name, dexes.find(d => d.id === position.dex_id)?.name ?? "", dp, makeReadResult(position, status), position.token0_symbol, position.token1_symbol, status.cexPriceInfo.payload, position.pair_flip);
-      await sendAndRecord(position, chain, dexes, "cex_price", n, summary, status.currentTick);
+      await sendAndRecord(position, chain, dexes, "cex_price", n, summary, status.currentTick, "exceeds_threshold");
     }
   }
 }
@@ -330,7 +330,7 @@ function makeReadResult(position: any, status: any): any {
 }
 
 /** 发送通知 + 写 alerts 表 + 记录推送去重（统一入口） */
-async function sendAndRecord(position: any, chain: any, _dexes: any[], alertType: string, n: { title: string; body: string }, summary: KnownPositionsSummary, currentTick: number) {
+async function sendAndRecord(position: any, chain: any, _dexes: any[], alertType: string, n: { title: string; body: string }, summary: KnownPositionsSummary, currentTick: number, currentState: string) {
   summary.alertsSent++;
   try {
     await notifyAll(n);
@@ -342,8 +342,8 @@ async function sendAndRecord(position: any, chain: any, _dexes: any[], alertType
   db.prepare(
     `INSERT INTO alerts (position_id, type, tick_at, message, channels) VALUES (?, ?, ?, ?, ?)`
   ).run(position.id, alertType, currentTick, n.body, "[]");
-// 记录推送去重（传递当前告警状态）
-    recordPush(position.id, alertType, alertType);
+  // 记录推送去重（用调用点传入的状态，确保与 shouldPush 一致）
+  recordPush(position.id, alertType, currentState);
 }
 
 /**

@@ -188,8 +188,8 @@ export function RemovePositionButton({ position }: { position: Position }) {
           );
           
           setStep1({ status: "done", txHash });
-          // 等待 0.5 秒后再进行下一步
-          await new Promise(resolve => setTimeout(resolve, 500));
+          // 等待 1 秒后再进行下一步
+          await new Promise(resolve => setTimeout(resolve, 1000));
         } catch (e: any) {
           console.error("Withdraw failed:", e);
           const isUserCancel = isUserCancellation(e);
@@ -239,8 +239,8 @@ export function RemovePositionButton({ position }: { position: Position }) {
       const txHash = await sendTxWithRetry({ to: params.stakerContract, data: withdrawData }, "step1");
       console.log("Withdraw tx hash:", txHash);
       setStep1({ status: "done", txHash });
-      // 等待 0.5 秒后再进行下一步
-      await new Promise(resolve => setTimeout(resolve, 500));
+      // 等待 1 秒后再进行下一步
+      await new Promise(resolve => setTimeout(resolve, 1000));
     } catch (e: any) {
       console.error("Retry withdraw failed:", e);
       const isUserCancel = isUserCancellation(e);
