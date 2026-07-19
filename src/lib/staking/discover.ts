@@ -26,7 +26,7 @@ export interface DiscoveredPosition {
   stakingId?: number;
 }
 
-/** 直接持有：用 tokenOfOwnerByIndex 枚举。 */
+/** 直接持有：用 tokenOfOwnerByIndex 枚举。多 NFT 时并发枚举（限并 10）。 */
 export async function findDirectPositions(
   client: PublicClient,
   wallet: Address,
@@ -46,7 +46,10 @@ export async function findDirectPositions(
       continue;
     }
     if (balance === 0n) continue;
-    for (let i = 0n; i < balance; i++) {
+    // 构造索引数组，用并发限并枚举 tokenId
+    const indices: bigint[] = [];
+    for (let i = 0n; i < balance; i++) indices.push(i);
+    await eachLimit(indices, 10, async (i) => {
       try {
         const tokenId = (await client.readContract({
           address: dex.npm as Address,
@@ -56,9 +59,9 @@ export async function findDirectPositions(
         })) as bigint;
         out.push({ tokenId: tokenId.toString(), dexId: dex.id, source: "direct" });
       } catch {
-        break;
+        // 单个 NFT 读失败时不中断其它枚举（balance 与实际 token 数可能出现暂时不一致）
       }
-    }
+    });
   }
   return out;
 }
@@ -66,20 +69,30 @@ export async function findDirectPositions(
 /**
  * 质押溯源：转账扫描。
  * 并发限制：对每个 DEX 一次 getLogs，再对命中的 tokenId 并发反查 owner（限制并发数）。
+ *
+ * @param fromBlock 显式指定起始区块（优先使用），用于快速扫描动态窗口
+ * @param fromBlockDelta 当未指定 fromBlock 时，从 latest 往前回溯多少块（深度模式默认 100_000）
  */
 export async function findStakedPositions(
   client: PublicClient,
   wallet: Address,
   dexes: DexRow[],
   staking: StakingRow[],
-  fromBlockDelta = 100_000n
+  opts?: { fromBlock?: bigint; fromBlockDelta?: bigint }
 ): Promise<DiscoveredPosition[]> {
   if (staking.length === 0 || dexes.length === 0) return [];
 
   const stakingByAddr = new Map(staking.map((s) => [s.contract.toLowerCase(), s]));
 
   const latest = await client.getBlockNumber();
-  const fromBlock = latest > fromBlockDelta ? latest - fromBlockDelta : 0n;
+  let fromBlock: bigint;
+  if (opts?.fromBlock !== undefined) {
+    fromBlock = opts.fromBlock;
+  } else {
+    const delta = opts?.fromBlockDelta ?? 100_000n;
+    fromBlock = latest > delta ? latest - delta : 0n;
+  }
+  if (fromBlock < 0n) fromBlock = 0n;
 
   const transferEvent = parseAbiItem(
     "event Transfer(address indexed from, address indexed to, uint256 indexed tokenId)"
@@ -133,6 +146,100 @@ export async function findStakedPositions(
   }
 
   return out;
+}
+
+/** 零地址（Mint 的 from） */
+const ZERO_ADDR = "0x0000000000000000000000000000000000000000";
+
+export interface RecentCandidates {
+  /** 新进钱包的候选：Mint(from=0→钱包) 或 转入(其他→钱包) */
+  incoming: DiscoveredPosition[];
+  /** 质押转出候选：from=钱包 → to 命中已知质押合约 */
+  staking: DiscoveredPosition[];
+  /** 转出场景：from=钱包 → to 非质押合约（可能 burn/转移，需标 closed 检查） */
+  outgoing: { tokenId: string; dexId: number; toAddr: string }[];
+  /** 本次扫描的真实区块范围（最后一个事件所在块，用于下次窗口起点） */
+  latestSeen?: bigint;
+}
+
+/**
+ * 快速扫描：基于 transfer 事件的最近窗口发现新仓位。
+ *
+ * 对每个 DEX 的 NPM 合约，一次 getLogs 拉窗口内所有 Transfer 事件，
+ * 然后在客户端过滤出与本钱包有关的（包括 Mint 的 from=0x0 → to=钱包）：
+ *
+ *   to==钱包,  from==0x0        → Mint 新建 LP（归类 incoming）
+ *   to==钱包,  from!=0x0         → 转入（归类 incoming）
+ *   from==钱包, to==质押合约     → 质押（归类 staking，存留监控）
+ *   from==钱包, to==其它         → 转出/销毁（归类 outgoing，需 ownerOf 反查确认标 closed）
+ *
+ * 不再 balanceOf 枚举全部 NFT（避免对历史 NFT 也 readRange）。
+ * 不返回 latest 区块以避免多余 RPC：调用方用检出的事件里最大的 blockNumber 即可。
+ */
+export async function findRecentPositionsByTransfer(
+  client: PublicClient,
+  wallet: Address,
+  dexes: DexRow[],
+  staking: StakingRow[],
+  fromBlock: bigint
+): Promise<RecentCandidates> {
+  const stakingByAddr = new Map(staking.map((s) => [s.contract.toLowerCase(), s]));
+  const walletLower = wallet.toLowerCase();
+  const ZERO_LOWER = ZERO_ADDR.toLowerCase();
+
+  const transferEvent = parseAbiItem(
+    "event Transfer(address indexed from, address indexed to, uint256 indexed tokenId)"
+  );
+
+  const incoming: DiscoveredPosition[] = [];
+  const stakingOut: DiscoveredPosition[] = [];
+  const outgoing: { tokenId: string; dexId: number; toAddr: string }[] = [];
+  let latestSeen = fromBlock;
+
+  for (const dex of dexes) {
+    let logs: any[] = [];
+    try {
+      logs = await client.getLogs({
+        address: dex.npm as Address,
+        event: transferEvent,
+        fromBlock,
+        toBlock: "latest",
+      });
+    } catch {
+      continue; // RPC 限制窗口/数量，跳过该 DEX
+    }
+
+    for (const l of logs) {
+      const args = l.args as any;
+      const fromAddr = String(args.from ?? "").toLowerCase();
+      const toAddr = String(args.to ?? "").toLowerCase();
+      const tokenId = args.tokenId?.toString();
+      if (!tokenId) continue;
+      if (l.blockNumber && BigInt(l.blockNumber) > latestSeen) latestSeen = BigInt(l.blockNumber);
+
+      // 与本钱包相关的四种情形
+      const walletInvolved = fromAddr === walletLower || toAddr === walletLower;
+      if (!walletInvolved) continue;
+
+      if (toAddr === walletLower) {
+        // Mint（from=0）或转入：都是 incoming 候选
+        incoming.push({ tokenId, dexId: dex.id, source: "direct" });
+        continue;
+      }
+      // fromAddr === walletLower：转出场景
+      const s = stakingByAddr.get(toAddr);
+      if (s) {
+        stakingOut.push({
+          tokenId, dexId: dex.id, source: "staking",
+          stakerContract: s.contract, stakingId: s.id,
+        });
+      } else {
+        outgoing.push({ tokenId, dexId: dex.id, toAddr: toAddr });
+      }
+    }
+  }
+
+  return { incoming, staking: stakingOut, outgoing, latestSeen };
 }
 
 /** 简易并发限制器。 */

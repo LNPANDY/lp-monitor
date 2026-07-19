@@ -20,6 +20,7 @@ import {
 import {
   findDirectPositions,
   findStakedPositions,
+  findRecentPositionsByTransfer,
   type DiscoveredPosition,
 } from "../staking/discover";
 import { ownerOf } from "../adapters/v3-fork";
@@ -31,10 +32,24 @@ import {
   type CexMapping,
   type CexQuote,
 } from "../cex/binance";
+import { estimateBlockTimeSec, secondsToBlocks } from "../chains/blocktime";
+import {
+  getFullScanFirstHours,
+  getFullScanPaddingSec,
+} from "../db/settings";
 
 export interface ScanSummary {
   wallets: number;
-  positions: number;
+  positions: number;      // 活跃仓位数（r.kind===ok）
+  discovered: number;      // 本次处理的所有仓位数（含 closed/unreadable，对应 DB upsert 数）
+  /**
+   * 以下三字段仅 fast scan 提供（深度扫描不细分新增/恢复/关闭）。
+   * 设为可选，以便深度扫描的 ScanSummary 可省略。
+   * 未来若 fast scan 与 known 快扫合并，由合并体统一填入即可。
+   */
+  new?: number;            // 本次 DB 新增仓位数（INSERT 新行）
+  reopened?: number;        // 本次从 closed 状态恢复为活跃的仓位数
+  closed?: number;          // 本次被标 notify_state='closed' 的仓位数
   outOfRange: number;
   alertsSent: number;
   errors: string[];
@@ -55,6 +70,7 @@ export async function runScan(): Promise<ScanSummary> {
   const startedAt = Date.now();
   const errors: string[] = [];
   let positions = 0;
+  let discoveredCount = 0;
   let outOfRange = 0;
   let alertsSent = 0;
   const db = getDb();
@@ -70,21 +86,19 @@ export async function runScan(): Promise<ScanSummary> {
 
   const wallets = db.prepare("SELECT * FROM wallets WHERE enabled=1").all() as WalletRow[];
   if (wallets.length === 0) {
-    return { wallets: 0, positions: 0, outOfRange: 0, alertsSent: 0, errors, startedAt: new Date(startedAt).toISOString(), durationMs: Date.now() - startedAt };
+    return { wallets: 0, positions: 0, discovered: 0, outOfRange: 0, alertsSent: 0, errors, startedAt: new Date(startedAt).toISOString(), durationMs: Date.now() - startedAt };
   }
 
   for (const w of wallets) {
     try {
+      const tWallet0 = Date.now();
       const { client, chain } = getClient(w.chain_id_ref);
       const dexes = listDexes(w.chain_id_ref, true);
       const staking = listStaking(w.chain_id_ref, true);
 
-      // 发现仓位：直接持有 + 质押溯源（根据配置选择方式）
+      // 发现仓位：直接持有 + 质押溯源（深度模式：默认 100,000 块窗口）
       const direct = await findDirectPositions(client, w.address as `0x${string}`, dexes);
-      let staked: DiscoveredPosition[] = [];
-
-      // 只使用转账扫描方式
-      staked = await findStakedPositions(
+      const staked = await findStakedPositions(
         client,
         w.address as `0x${string}`,
         dexes,
@@ -94,15 +108,13 @@ export async function runScan(): Promise<ScanSummary> {
       const discovered = dedupeDiscovered([...direct, ...staked]);
 
       // 兜底恢复：库里有但本次未发现的仓位（尤其质押仓位：转账发生在扫描窗口外）。
-      // 反查 ownerOf，仍命中钱包或已知质押合约 → 纳入本次扫描；否则视为已转移/已平仓 → 标记 closed。
       const recovered = await recoverMissedPositions(client, w, dexes, staking, discovered);
 
+      console.log(`[scanner-deep] wallet ${w.address} chain ${chain.name}: discover=${direct.length}d+${staked.length}s recover=${recovered.length} ${(Date.now()-tWallet0)}ms`);
+
       // ===== 预取本链 CEX 报价（开启 CEX 对比时）=====
-      // 固定价直接构造，币安 symbol 批量拉取，统一按 token 地址存入 cexQuoteByAddr。
-      // 同一条链跨钱包时复用已拉过的报价（按 token 地址去重）。
       const chainMappings = cexMappingsByChain.get(w.chain_id_ref) ?? [];
       if (cexEnabled && chainMappings.length > 0) {
-        // 只拉本链还没有报价的 token：cexQuoteByAddr 里已存在的跨钱包复用
         const needFetch = chainMappings.filter((m) => !cexQuoteByAddr.has(m.tokenAddr));
         if (needFetch.length > 0) {
           const byAddr = await buildQuotesByAddr(needFetch);
@@ -110,265 +122,15 @@ export async function runScan(): Promise<ScanSummary> {
         }
       }
 
+      const ctx: ScanCtx = {
+        db, client, chain, w, dexes,
+        cexEnabled, cexQuoteByAddr, cexMutedPairs,
+        positions, discovered: discoveredCount, outOfRange, alertsSent, errors,
+      };
+
       for (const dp of [...discovered, ...recovered]) {
-        try {
-          const dex = dexes.find((d) => d.id === dp.dexId);
-          if (!dex) continue;
-          const adapter = getAdapter(dex.type);
-          const r = await adapter.readRange(client, { factory: dex.factory, npm: dex.npm }, BigInt(dp.tokenId));
-
-          const nowIso = new Date().toISOString();
-
-          // ===== 三态处理 =====
-          if (r.kind === "unreadable") {
-            // RPC 读不到 meta / pool / tick —— 不确定仓位是否还活跃。
-            // 只更新 last_checked_at，保留旧的 notify_state / tick 等字段，不标 closed、不告警。
-            db.prepare(
-              `UPDATE positions SET last_checked_at=? WHERE chain_id_ref=? AND dex_name=? AND token_id=?`
-            ).run(nowIso, w.chain_id_ref, dex.name, dp.tokenId);
-            continue;
-          }
-          if (r.kind === "closed") {
-            // liquidity=0，确认仓位已平仓（NFT 可能还在钱包/质押合约里，但流动性已全部取出）。
-            db.prepare(
-              `UPDATE positions SET notify_state='closed', last_checked_at=?, last_in_range=0
-               WHERE chain_id_ref=? AND dex_name=? AND token_id=?`
-            ).run(nowIso, w.chain_id_ref, dex.name, dp.tokenId);
-            continue;
-          }
-
-          // r.kind === "ok"，正常处理
-          positions++;
-
-          // 解析 token0/token1 的 symbol（带缓存），用于展示和告警文案
-          const tokenMap = await resolveTokens(client, w.chain_id_ref, [r.token0, r.token1]);
-          const sym0 = tokenMap.get(r.token0.toLowerCase())?.symbol ?? "";
-          const sym1 = tokenMap.get(r.token1.toLowerCase())?.symbol ?? "";
-
-          const inRange = r.status.inRange;
-          if (!inRange) outOfRange++;
-
-          // 计算 tick 在区间内的相对位置（0~1，0=下界，1=上界），用于波动预警
-          const span = Math.max(r.tickUpper - r.tickLower, 1);
-          const currMarginLower = (r.status.currentTick - r.tickLower) / span;
-          const currMarginUpper = (r.tickUpper - r.status.currentTick) / span;
-
-          const prev = db
-            .prepare("SELECT * FROM positions WHERE chain_id_ref=? AND dex_name=? AND token_id=?")
-            .get(w.chain_id_ref, dex.name, dp.tokenId) as any;
-
-          const prevState = prev?.notify_state ?? "unknown";
-
-          // ===== 波动预警判定（每次扫描都对比上次，超过阈值就告警，不设冷却）=====
-          // prev 里存的是上次扫描时的 margin（首次扫描 prev 为 null，跳过）
-          const tickMoveEnabled = isTickMoveEnabled();
-          const tickMoveThreshold = getTickMoveThreshold() / 100; // 百分比 → 0~1
-          let tickMoveTriggered = false;
-          let tickMoveDelta = 0;
-          let tickMoveDirection = "";
-          if (tickMoveEnabled && prev && typeof prev.last_margin_lower === "number") {
-            const dLower = Math.abs(currMarginLower - prev.last_margin_lower);
-            const dUpper = Math.abs(currMarginUpper - prev.last_margin_upper);
-            const delta = Math.max(dLower, dUpper);
-            if (delta >= tickMoveThreshold) {
-              tickMoveTriggered = true;
-              tickMoveDelta = delta;
-              // 方向：marginLower 变大 = tick 上移 = 靠近上界
-              tickMoveDirection = currMarginLower > prev.last_margin_lower ? "靠近上界" : "靠近下界";
-            }
-          }
-
-          // ===== CEX 价差判定 =====
-          // DEX 池价（raw 单位 token1/token0）按本链 token→CEX 映射换算成「token0 的 CEX 参考价」，
-          // 再与币安报价对比。仅当 token0 与 token1 中至少一个在 token_symbols 表里有映射、
-          // 且映射出的币安报价本次能拉到时才计算；否则 cexPriceInfo 为 null（不对比、不告警）。
-          // decimals 取自 tokenMap（缺失兜底 18），用于把 raw 价换算成整币单位后再与 CEX 同口径对比。
-          const dec0 = tokenMap.get(r.token0.toLowerCase())?.decimals ?? 18;
-          const dec1 = tokenMap.get(r.token1.toLowerCase())?.decimals ?? 18;
-          // 整币单位价格（1 token0 = ? token1，已按 decimals 换算）：供 last_price0 持久化 +
-          // 越界/波动告警文案共用，确保与 CEX 对比口径一致、可直接展示，不再误用 raw 单位。
-          const price0Human = rawToHumanPrice(r.status.price, dec0, dec1);
-          // CEX 价差始终计算（无论全局开关状态），确保仓位卡片始终展示 CEX 数据
-          const cexPriceInfo = computeCexPriceDiff(
-            r.token0.toLowerCase(),
-            r.token1.toLowerCase(),
-            r.status.price,
-            cexQuoteByAddr,
-            r.fee,
-            sym0,
-            sym1,
-            dec0,
-            dec1
-          );
-
-          // upsert 仓位最新状态（pair_flip 从 prev 保留；prev 为 null 时从 pair_flips 表恢复历史翻转）
-          let prevPairFlip = prev?.pair_flip ?? 0;
-          if (prevPairFlip === 0) {
-            const savedFlip = db.prepare(
-              "SELECT id FROM pair_flips WHERE chain_id_ref=? AND dex_name=? AND token0=? AND token1=?"
-            ).get(w.chain_id_ref, dex.name, r.token0.toLowerCase(), r.token1.toLowerCase());
-            if (savedFlip) prevPairFlip = 1;
-          }
-          db.prepare(
-            `INSERT INTO positions
-              (wallet_id, chain_id_ref, dex_id, dex_name, token_id, token0, token1, token0_symbol, token1_symbol, fee, pool,
-               tick_lower, tick_upper, source, staker_contract, staking_id,
-               last_current_tick, last_in_range, last_price0, last_liquidity,
-               last_margin_lower, last_margin_upper, last_cex_price,
-               last_checked_at, notify_state, last_notified_at, pair_flip)
-             VALUES (@wallet_id,@chain_id_ref,@dex_id,@dex_name,@token_id,@token0,@token1,@token0_symbol,@token1_symbol,@fee,@pool,
-                     @tick_lower,@tick_upper,@source,@staker_contract,@staking_id,
-                     @last_current_tick,@last_in_range,@last_price0,@last_liquidity,
-                     @last_margin_lower,@last_margin_upper,@last_cex_price,
-                     @last_checked_at,@notify_state,@last_notified_at,@pair_flip)
-             ON CONFLICT(chain_id_ref, dex_name, token_id) DO UPDATE SET
-               last_current_tick=excluded.last_current_tick,
-               last_in_range=excluded.last_in_range,
-               last_price0=excluded.last_price0,
-               last_liquidity=excluded.last_liquidity,
-               last_margin_lower=excluded.last_margin_lower,
-               last_margin_upper=excluded.last_margin_upper,
-               last_cex_price=excluded.last_cex_price,
-               last_checked_at=excluded.last_checked_at,
-               notify_state=excluded.notify_state,
-               token0=excluded.token0, token1=excluded.token1,
-               token0_symbol=excluded.token0_symbol, token1_symbol=excluded.token1_symbol,
-               fee=excluded.fee, pool=excluded.pool,
-               tick_lower=excluded.tick_lower, tick_upper=excluded.tick_upper,
-               dex_id=excluded.dex_id, source=excluded.source, staker_contract=excluded.staker_contract,
-               staking_id=excluded.staking_id,
-               pair_flip=excluded.pair_flip`
-          ).run({
-            wallet_id: w.id,
-            chain_id_ref: w.chain_id_ref,
-            dex_id: dex.id,
-            dex_name: dex.name,
-            token_id: dp.tokenId,
-            token0: r.token0,
-            token1: r.token1,
-            token0_symbol: sym0,
-            token1_symbol: sym1,
-            fee: r.fee,
-            pool: r.status.pool,
-            tick_lower: r.tickLower,
-            tick_upper: r.tickUpper,
-            source: dp.source,
-            staker_contract: dp.stakerContract ?? "",
-            staking_id: dp.stakingId ?? null,
-            last_current_tick: r.status.currentTick,
-            last_in_range: inRange ? 1 : 0,
-            last_price0: price0Human,
-            last_liquidity: r.liquidity?.toString() ?? "",
-            last_margin_lower: currMarginLower,
-            last_margin_upper: currMarginUpper,
-            last_cex_price: cexPriceInfo ? JSON.stringify(cexPriceInfo.payload) : "",
-            last_checked_at: nowIso,
-            notify_state: inRange ? "in_range" : "out_of_range",
-            last_notified_at: prev?.last_notified_at ?? "",
-            pair_flip: prevPairFlip,
-          });
-
-          const positionRow = db
-            .prepare("SELECT id, last_notified_at, pair_flip FROM positions WHERE chain_id_ref=? AND dex_name=? AND token_id=?")
-            .get(w.chain_id_ref, dex.name, dp.tokenId) as { id: number; last_notified_at: string; pair_flip?: number };
-
-          // ===== 越界告警触发判定 =====
-          // 1) 首次发现且越界 → 告警
-          // 2) 从「在区间内」翻转为「越界」→ 告警
-          // 3) 从「越界」翻回「在区间内」→ 告警（恢复通知）
-          // 4) 持续越界且超过 cooldown（上次告警距今 ≥ 冷却时间）→ 重复告警
-          const enteredOutOfRange =
-            !inRange && (prevState === "in_range" || prevState === "unknown");
-          const reEnteredRange =
-            inRange && prevState === "out_of_range";
-          const stillOutOfRangeAndExpired =
-            !inRange && prevState === "out_of_range" && shouldPush(positionRow.id, "out_of_range", "out_of_range");
-
-          const rangeTrigger = enteredOutOfRange || reEnteredRange || stillOutOfRangeAndExpired;
-
-          // ===== 发送告警（越界 + 波动各自独立发送）=====
-          if (rangeTrigger) {
-            const alertType = !inRange ? "out_of_range" : "re_in_range";
-            if (shouldPush(positionRow.id, alertType, alertType)) {
-              const n = buildNotification(w, chain.name, dex.name, dp, r, sym0, sym1, positionRow.pair_flip, price0Human);
-              const sendRes = await notifyAll(n);
-              alertsSent++;
-
-              db.prepare(
-                `INSERT INTO alerts (position_id, type, tick_at, message, channels)
-                 VALUES (?, ?, ?, ?, ?)`
-              ).run(
-                positionRow.id,
-                alertType,
-                r.status.currentTick,
-                n.body,
-                JSON.stringify(sendRes.sent)
-              );
-              recordPush(positionRow.id, alertType, alertType);
-            }
-          }
-
-          // 波动告警（独立于越界告警，受 tick_move 冷却控制）
-          if (tickMoveTriggered) {
-            if (shouldPush(positionRow.id, "tick_move", "moved")) {
-              const n = buildTickMoveNotification(
-                w, chain.name, dex.name, dp, r, sym0, sym1,
-                prev.last_margin_lower, currMarginLower,
-                tickMoveDelta, tickMoveDirection, positionRow.pair_flip, price0Human
-              );
-              const sendRes = await notifyAll(n);
-              alertsSent++;
-
-              db.prepare(
-                `INSERT INTO alerts (position_id, type, tick_at, message, channels)
-                 VALUES (?, ?, ?, ?, ?)`
-              ).run(
-                positionRow.id,
-                "tick_move",
-                r.status.currentTick,
-                n.body,
-                JSON.stringify(sendRes.sent)
-              );
-              recordPush(positionRow.id, "tick_move", "moved");
-            }
-          }
-
-          // CEX 价差告警（独立发送，每次超过阈值都发，不设冷却）
-          // 前置条件：① 全局 CEX 价差推送开关开启 ② 该 token 对未被用户静音
-          // 静音状态按 (chain_id_ref, token0, token1) 缓存到 cexMutedPairs，避免同一 token 对跨仓位重复查 DB
-          const muteKey = `${w.chain_id_ref}|${r.token0.toLowerCase()}|${r.token1.toLowerCase()}`;
-          if (!cexMutedPairs.has(muteKey)) {
-            const muted = db
-              .prepare("SELECT id FROM cex_alert_mutes WHERE chain_id_ref=? AND token0=? AND token1=?")
-              .get(w.chain_id_ref, r.token0.toLowerCase(), r.token1.toLowerCase());
-            // 仅当 DB 确认静音时才加入集合；未静音的 token 对不加入，保持 has()=false
-            if (muted) cexMutedPairs.add(muteKey);
-          }
-          if (cexPriceInfo && cexPriceInfo.exceedsThreshold && cexEnabled && !cexMutedPairs.has(muteKey)) {
-            if (shouldPush(positionRow.id, "cex_price", "exceeds_threshold")) {
-              const n = buildCexPriceNotification(
-                w, chain.name, dex.name, dp, r, sym0, sym1,
-                cexPriceInfo.payload, positionRow.pair_flip
-              );
-              const sendRes = await notifyAll(n);
-              alertsSent++;
-
-              db.prepare(
-                `INSERT INTO alerts (position_id, type, tick_at, message, channels)
-                 VALUES (?, ?, ?, ?, ?)`
-              ).run(
-                positionRow.id,
-                "cex_price",
-                r.status.currentTick,
-                n.body,
-                JSON.stringify(sendRes.sent)
-              );
-              recordPush(positionRow.id, "cex_price", "exceeds_threshold");
-            }
-          }
-        } catch (e: any) {
-          errors.push(`position ${dp.tokenId} on chain ${w.chain_id_ref}: ${e?.message ?? e}`);
-        }
+        const r = await processPosition(ctx, dp);
+        positions = r.positions; discoveredCount = r.discovered; outOfRange = r.outOfRange; alertsSent = r.alertsSent;
       }
     } catch (e: any) {
       errors.push(`wallet ${w.address}: ${e?.message ?? e}`);
@@ -378,12 +140,419 @@ export async function runScan(): Promise<ScanSummary> {
   return {
     wallets: wallets.length,
     positions,
+    discovered: discoveredCount,
     outOfRange,
     alertsSent,
     errors,
     startedAt: new Date(startedAt).toISOString(),
     durationMs: Date.now() - startedAt,
   };
+}
+
+/**
+ * 快速全量扫描：默认 cron 调用的扫描模式。
+ *
+ * 与深度模式（runScan）的差异：
+ *  1. transfer 扫描窗口由调度器传入（首次回溯 N 小时，之后距上次扫描 + 冗余）
+ *  2. 兜底 ownerOf 反查走节流版（同一仓位 5 分钟内已反查过的跳过）+ 并发（限并 10）
+ *  3. 其余（readRange、写库、告警、CEX 计算）与深度模式完全一致
+ *
+ * @param opts.fromBlockByChain 各链的 transfer 扫描起始区块（由调度器维护状态）
+ * @param opts.recoverCheckRecord 各仓位上次 ownerOf 反查的时间戳记录（由调度器维护状态）
+ */
+export async function runFastScan(opts: {
+  fromBlockByChain?: Record<number, bigint>;
+}): Promise<ScanSummary> {
+  const startedAt = Date.now();
+  const errors: string[] = [];
+  let positions = 0;
+  let discoveredCount = 0;
+  let newCount = 0;
+  let reopenedCount = 0;
+  let closedCount = 0;
+  let outOfRange = 0;
+  let alertsSent = 0;
+  const db = getDb();
+
+  const cexEnabled = isCexPriceEnabled();
+  const cexMappingsByChain = loadAllMappings();
+  const cexQuoteByAddr = new Map<string, CexQuote>();
+  const cexMutedPairs = new Set<string>();
+
+  const wallets = db.prepare("SELECT * FROM wallets WHERE enabled=1").all() as WalletRow[];
+  if (wallets.length === 0) {
+    return { wallets: 0, positions: 0, discovered: 0, new: 0, reopened: 0, closed: 0, outOfRange: 0, alertsSent: 0, errors, startedAt: new Date(startedAt).toISOString(), durationMs: Date.now() - startedAt };
+  }
+
+  for (const w of wallets) {
+    try {
+      const tWallet0 = Date.now();
+      const { client, chain } = getClient(w.chain_id_ref);
+      const dexes = listDexes(w.chain_id_ref, true);
+      const staking = listStaking(w.chain_id_ref, true);
+
+      // ===== transfer 扫描：只发现窗口内变化的仓位 =====
+      const fromBlock = opts.fromBlockByChain?.[w.chain_id_ref] ?? 0n;
+      const latest = await client.getBlockNumber();
+      console.log(`[scanner-fast] start: chain=${chain.name} (id=${w.chain_id_ref}), fromBlock=${fromBlock}, latest=${latest}`);
+
+      const tScan0 = Date.now();
+      const cands = await findRecentPositionsByTransfer(
+        client, w.address as `0x${string}`, dexes, staking, fromBlock
+      );
+      const scanMs = Date.now() - tScan0;
+      console.log(`[scanner-fast] wallet ${w.address} chain ${chain.name}: incoming=${cands.incoming.length}, staking=${cands.staking.length}, outgoing=${cands.outgoing.length} (${scanMs}ms)`);
+
+      // ===== outgoing: from=钱包 转出，DB 中已存在 → ownerOf 反查确认是否标 closed =====
+      const tClosed0 = Date.now();
+      const stakingByAddr = new Map(staking.map((s) => [s.contract.toLowerCase(), s]));
+      const walletLower = w.address.toLowerCase();
+      const nowIso = new Date().toISOString();
+      let outgoingClosed = 0;
+      for (const out of cands.outgoing) {
+        const dex = dexes.find((d) => d.id === out.dexId);
+        if (!dex) continue;
+        // 查 DB 中是否存在该仓位
+        const existing = db
+          .prepare("SELECT id, notify_state FROM positions WHERE chain_id_ref=? AND dex_name=? AND token_id=?")
+          .get(w.chain_id_ref, dex.name, out.tokenId) as { id: number; notify_state: string } | undefined;
+        if (!existing) continue; // DB 没记录的转出场景无所谓
+        if (existing.notify_state === "closed") continue;
+        // ownerOf 反查确认 owner 是否还是本钱包或已知质押合约
+        let currentOwner: string | null = null;
+        try {
+          currentOwner = await ownerOf(client, dex.npm as `0x${string}`, BigInt(out.tokenId));
+        } catch {
+          continue;
+        }
+        if (!currentOwner) continue;
+        const ownerLower = currentOwner.toLowerCase();
+        if (ownerLower === walletLower) continue; // 还在钱包里
+        if (stakingByAddr.has(ownerLower)) continue; // 还在质押合约里
+        // owner 改为非本钱包非质押合约 → 真的转移，标 closed
+        db.prepare(
+          `UPDATE positions SET notify_state='closed', last_checked_at=?, last_in_range=0
+           WHERE id=?`
+        ).run(nowIso, existing.id);
+        closedCount++;
+        outgoingClosed++;
+      }
+
+      // ===== 处理新候选：DB 不存在的 tokenId → INSERT via processPosition =====
+      // 候选来源：incoming（mint/转入）+ staking（质押转入＝stake）
+      const allIncoming = [...cands.incoming, ...cands.staking];
+      const deduped = dedupeDiscovered(allIncoming);
+      const tProc0 = Date.now();
+      let processedNew = 0;
+
+      // 预取本链 CEX 报价（processPosition 会用到）
+      const chainMappings = cexMappingsByChain.get(w.chain_id_ref) ?? [];
+      if (cexEnabled && chainMappings.length > 0) {
+        const needFetch = chainMappings.filter((m) => !cexQuoteByAddr.has(m.tokenAddr));
+        if (needFetch.length > 0) {
+          const byAddr = await buildQuotesByAddr(needFetch);
+          for (const [addr, quote] of byAddr) cexQuoteByAddr.set(addr, quote);
+        }
+      }
+
+      const ctx: ScanCtx = {
+        db, client, chain, w, dexes,
+        cexEnabled, cexQuoteByAddr, cexMutedPairs,
+        positions, discovered: discoveredCount, outOfRange, alertsSent, errors,
+      };
+
+      for (const dp of deduped) {
+        const dex = dexes.find((d) => d.id === dp.dexId);
+        if (!dex) continue;
+        // 判断 DB 是否已存在
+        const existing = db
+          .prepare("SELECT id, notify_state FROM positions WHERE chain_id_ref=? AND dex_name=? AND token_id=?")
+          .get(w.chain_id_ref, dex.name, dp.tokenId) as { id: number; notify_state: string } | undefined;
+        if (existing) {
+          // DB 已有：known 快扫负责状态更新；如已 closed 本次又复活 → 标 reopened
+          // fast scan 不再调 readRange 重复处理
+          continue;
+        }
+        // DB 不存在 → 真新仓位，processPosition 处理（内部 INSERT）
+        const r = await processPosition(ctx, dp);
+        positions = r.positions; discoveredCount = r.discovered; outOfRange = r.outOfRange; alertsSent = r.alertsSent;
+        newCount++;
+        processedNew++;
+        // processPosition 内的 INSERT 可能先 closed 再判 in_range → 需要主动 reopened 检测
+        // 读 DB 当前 notify_state，如果还活着 (in_range/out_of_range) 并不属于 reopened（已计为 new）
+      }
+      const procMs = Date.now() - tProc0;
+      const totalMs = Date.now() - tWallet0;
+      console.log(`[scanner-fast] result: chain=${chain.name} wallets=1 new=${processedNew} closed=${outgoingClosed} processing=${procMs}ms total=${totalMs}ms`);
+    } catch (e: any) {
+      errors.push(`wallet ${w.address}: ${e?.message ?? e}`);
+    }
+  }
+
+  return {
+    wallets: wallets.length,
+    positions,
+    discovered: discoveredCount,
+    new: newCount,
+    reopened: reopenedCount,
+    closed: closedCount,
+    outOfRange,
+    alertsSent,
+    errors,
+    startedAt: new Date(startedAt).toISOString(),
+    durationMs: Date.now() - startedAt,
+  };
+}
+
+/** 扫描上下文：processPosition 所需的运行时共享状态。 */
+interface ScanCtx {
+  db: ReturnType<typeof getDb>;
+  client: PublicClient;
+  chain: { name: string; [k: string]: any };
+  w: WalletRow;
+  dexes: DexRow[];
+  cexEnabled: boolean;
+  cexQuoteByAddr: Map<string, CexQuote>;
+  cexMutedPairs: Set<string>;
+  positions: number;   // 活跃仓位（r.kind===ok）
+  discovered: number;   // 本次处理的所有仓位（含 closed/unreadable，对应 DB upsert 数）
+  outOfRange: number;
+  alertsSent: number;
+  errors: string[];
+}
+
+/**
+ * 处理单个仓位：readRange → 写库 → 越界/波动/CEX 告警。
+ * runScan 与 runFastScan 共用，确保两种模式行为等价。
+ */
+async function processPosition(ctx: ScanCtx, dp: DiscoveredPosition): Promise<ScanCtx> {
+  const { db, client, chain, w, dexes, cexEnabled, cexQuoteByAddr, cexMutedPairs } = ctx;
+  let { positions, discovered, outOfRange, alertsSent, errors } = ctx;
+
+  try {
+    const dex = dexes.find((d) => d.id === dp.dexId);
+    if (!dex) return ctx;
+    const adapter = getAdapter(dex.type);
+    const r = await adapter.readRange(client, { factory: dex.factory, npm: dex.npm }, BigInt(dp.tokenId));
+
+    const nowIso = new Date().toISOString();
+    discovered++;  // 所有成功读到 readRange 的都计入 discovered（含 closed/unreadable）
+
+    // ===== 三态处理 =====
+    if (r.kind === "unreadable") {
+      db.prepare(
+        `UPDATE positions SET last_checked_at=? WHERE chain_id_ref=? AND dex_name=? AND token_id=?`
+      ).run(nowIso, w.chain_id_ref, dex.name, dp.tokenId);
+      return { ...ctx, positions, discovered, outOfRange, alertsSent, errors };
+    }
+    if (r.kind === "closed") {
+      db.prepare(
+        `UPDATE positions SET notify_state='closed', last_checked_at=?, last_in_range=0
+         WHERE chain_id_ref=? AND dex_name=? AND token_id=?`
+      ).run(nowIso, w.chain_id_ref, dex.name, dp.tokenId);
+      return { ...ctx, positions, discovered, outOfRange, alertsSent, errors };
+    }
+
+    // r.kind === "ok"，正常处理
+    positions++;
+
+    // 解析 token0/token1 的 symbol（带缓存），用于展示和告警文案
+    const tokenMap = await resolveTokens(client, w.chain_id_ref, [r.token0, r.token1]);
+    const sym0 = tokenMap.get(r.token0.toLowerCase())?.symbol ?? "";
+    const sym1 = tokenMap.get(r.token1.toLowerCase())?.symbol ?? "";
+
+    const inRange = r.status.inRange;
+    if (!inRange) outOfRange++;
+
+    // 计算 tick 在区间内的相对位置（0~1，0=下界，1=上界），用于波动预警
+    const span = Math.max(r.tickUpper - r.tickLower, 1);
+    const currMarginLower = (r.status.currentTick - r.tickLower) / span;
+    const currMarginUpper = (r.tickUpper - r.status.currentTick) / span;
+
+    const prev = db
+      .prepare("SELECT * FROM positions WHERE chain_id_ref=? AND dex_name=? AND token_id=?")
+      .get(w.chain_id_ref, dex.name, dp.tokenId) as any;
+
+    const prevState = prev?.notify_state ?? "unknown";
+
+    // ===== 波动预警判定（每次扫描都对比上次，超过阈值就告警，不设冷却）=====
+    const tickMoveEnabled = isTickMoveEnabled();
+    const tickMoveThreshold = getTickMoveThreshold() / 100; // 百分比 → 0~1
+    let tickMoveTriggered = false;
+    let tickMoveDelta = 0;
+    let tickMoveDirection = "";
+    if (tickMoveEnabled && prev && typeof prev.last_margin_lower === "number") {
+      const dLower = Math.abs(currMarginLower - prev.last_margin_lower);
+      const dUpper = Math.abs(currMarginUpper - prev.last_margin_upper);
+      const delta = Math.max(dLower, dUpper);
+      if (delta >= tickMoveThreshold) {
+        tickMoveTriggered = true;
+        tickMoveDelta = delta;
+        tickMoveDirection = currMarginLower > prev.last_margin_lower ? "靠近上界" : "靠近下界";
+      }
+    }
+
+    // ===== CEX 价差判定 =====
+    const dec0 = tokenMap.get(r.token0.toLowerCase())?.decimals ?? 18;
+    const dec1 = tokenMap.get(r.token1.toLowerCase())?.decimals ?? 18;
+    const price0Human = rawToHumanPrice(r.status.price, dec0, dec1);
+    const cexPriceInfo = computeCexPriceDiff(
+      r.token0.toLowerCase(), r.token1.toLowerCase(),
+      r.status.price, cexQuoteByAddr,
+      r.fee, sym0, sym1, dec0, dec1
+    );
+
+    // upsert 仓位最新状态（pair_flip 从 prev 保留；prev 为 null 时从 pair_flips 表恢复历史翻转）
+    let prevPairFlip = prev?.pair_flip ?? 0;
+    if (prevPairFlip === 0) {
+      const savedFlip = db.prepare(
+        "SELECT id FROM pair_flips WHERE chain_id_ref=? AND dex_name=? AND token0=? AND token1=?"
+      ).get(w.chain_id_ref, dex.name, r.token0.toLowerCase(), r.token1.toLowerCase());
+      if (savedFlip) prevPairFlip = 1;
+    }
+    db.prepare(
+      `INSERT INTO positions
+        (wallet_id, chain_id_ref, dex_id, dex_name, token_id, token0, token1, token0_symbol, token1_symbol, fee, pool,
+         tick_lower, tick_upper, source, staker_contract, staking_id,
+         last_current_tick, last_in_range, last_price0, last_liquidity,
+         last_margin_lower, last_margin_upper, last_cex_price,
+         last_checked_at, notify_state, last_notified_at, pair_flip)
+       VALUES (@wallet_id,@chain_id_ref,@dex_id,@dex_name,@token_id,@token0,@token1,@token0_symbol,@token1_symbol,@fee,@pool,
+               @tick_lower,@tick_upper,@source,@staker_contract,@staking_id,
+               @last_current_tick,@last_in_range,@last_price0,@last_liquidity,
+               @last_margin_lower,@last_margin_upper,@last_cex_price,
+               @last_checked_at,@notify_state,@last_notified_at,@pair_flip)
+       ON CONFLICT(chain_id_ref, dex_name, token_id) DO UPDATE SET
+         last_current_tick=excluded.last_current_tick,
+         last_in_range=excluded.last_in_range,
+         last_price0=excluded.last_price0,
+         last_liquidity=excluded.last_liquidity,
+         last_margin_lower=excluded.last_margin_lower,
+         last_margin_upper=excluded.last_margin_upper,
+         last_cex_price=excluded.last_cex_price,
+         last_checked_at=excluded.last_checked_at,
+         notify_state=excluded.notify_state,
+         token0=excluded.token0, token1=excluded.token1,
+         token0_symbol=excluded.token0_symbol, token1_symbol=excluded.token1_symbol,
+         fee=excluded.fee, pool=excluded.pool,
+         tick_lower=excluded.tick_lower, tick_upper=excluded.tick_upper,
+         dex_id=excluded.dex_id, source=excluded.source, staker_contract=excluded.staker_contract,
+         staking_id=excluded.staking_id,
+         pair_flip=excluded.pair_flip`
+    ).run({
+      wallet_id: w.id,
+      chain_id_ref: w.chain_id_ref,
+      dex_id: dex.id,
+      dex_name: dex.name,
+      token_id: dp.tokenId,
+      token0: r.token0,
+      token1: r.token1,
+      token0_symbol: sym0,
+      token1_symbol: sym1,
+      fee: r.fee,
+      pool: r.status.pool,
+      tick_lower: r.tickLower,
+      tick_upper: r.tickUpper,
+      source: dp.source,
+      staker_contract: dp.stakerContract ?? "",
+      staking_id: dp.stakingId ?? null,
+      last_current_tick: r.status.currentTick,
+      last_in_range: inRange ? 1 : 0,
+      last_price0: price0Human,
+      last_liquidity: r.liquidity?.toString() ?? "",
+      last_margin_lower: currMarginLower,
+      last_margin_upper: currMarginUpper,
+      last_cex_price: cexPriceInfo ? JSON.stringify(cexPriceInfo.payload) : "",
+      last_checked_at: nowIso,
+      notify_state: inRange ? "in_range" : "out_of_range",
+      last_notified_at: prev?.last_notified_at ?? "",
+      pair_flip: prevPairFlip,
+    });
+
+    const positionRow = db
+      .prepare("SELECT id, last_notified_at, pair_flip FROM positions WHERE chain_id_ref=? AND dex_name=? AND token_id=?")
+      .get(w.chain_id_ref, dex.name, dp.tokenId) as { id: number; last_notified_at: string; pair_flip?: number };
+
+    // ===== 越界告警触发判定 =====
+    const enteredOutOfRange =
+      !inRange && (prevState === "in_range" || prevState === "unknown");
+    const reEnteredRange =
+      inRange && prevState === "out_of_range";
+    const stillOutOfRangeAndExpired =
+      !inRange && prevState === "out_of_range" && shouldPush(positionRow.id, "out_of_range", "out_of_range");
+
+    const rangeTrigger = enteredOutOfRange || reEnteredRange || stillOutOfRangeAndExpired;
+
+    // ===== 发送告警（越界 + 波动各自独立发送）=====
+    if (rangeTrigger) {
+      const alertType = !inRange ? "out_of_range" : "re_in_range";
+      if (shouldPush(positionRow.id, alertType, alertType)) {
+        const n = buildNotification(w, chain.name, dex.name, dp, r, sym0, sym1, positionRow.pair_flip, price0Human);
+        const sendRes = await notifyAll(n);
+        alertsSent++;
+
+        db.prepare(
+          `INSERT INTO alerts (position_id, type, tick_at, message, channels)
+           VALUES (?, ?, ?, ?, ?)`
+        ).run(
+          positionRow.id, alertType, r.status.currentTick, n.body, JSON.stringify(sendRes.sent)
+        );
+        recordPush(positionRow.id, alertType, alertType);
+      }
+    }
+
+    // 波动告警（独立于越界告警，受 tick_move 冷却控制）
+    if (tickMoveTriggered) {
+      if (shouldPush(positionRow.id, "tick_move", "moved")) {
+        const n = buildTickMoveNotification(
+          w, chain.name, dex.name, dp, r, sym0, sym1,
+          prev.last_margin_lower, currMarginLower,
+          tickMoveDelta, tickMoveDirection, positionRow.pair_flip, price0Human
+        );
+        const sendRes = await notifyAll(n);
+        alertsSent++;
+
+        db.prepare(
+          `INSERT INTO alerts (position_id, type, tick_at, message, channels)
+           VALUES (?, ?, ?, ?, ?)`
+        ).run(
+          positionRow.id, "tick_move", r.status.currentTick, n.body, JSON.stringify(sendRes.sent)
+        );
+        recordPush(positionRow.id, "tick_move", "moved");
+      }
+    }
+
+    // CEX 价差告警（独立发送，每次超过阈值都发，不设冷却）
+    const muteKey = `${w.chain_id_ref}|${r.token0.toLowerCase()}|${r.token1.toLowerCase()}`;
+    if (!cexMutedPairs.has(muteKey)) {
+      const muted = db
+        .prepare("SELECT id FROM cex_alert_mutes WHERE chain_id_ref=? AND token0=? AND token1=?")
+        .get(w.chain_id_ref, r.token0.toLowerCase(), r.token1.toLowerCase());
+      if (muted) cexMutedPairs.add(muteKey);
+    }
+    if (cexPriceInfo && cexPriceInfo.exceedsThreshold && cexEnabled && !cexMutedPairs.has(muteKey)) {
+      if (shouldPush(positionRow.id, "cex_price", "exceeds_threshold")) {
+        const n = buildCexPriceNotification(
+          w, chain.name, dex.name, dp, r, sym0, sym1,
+          cexPriceInfo.payload, positionRow.pair_flip
+        );
+        const sendRes = await notifyAll(n);
+        alertsSent++;
+
+        db.prepare(
+          `INSERT INTO alerts (position_id, type, tick_at, message, channels)
+           VALUES (?, ?, ?, ?, ?)`
+        ).run(
+          positionRow.id, "cex_price", r.status.currentTick, n.body, JSON.stringify(sendRes.sent)
+        );
+        recordPush(positionRow.id, "cex_price", "exceeds_threshold");
+      }
+    }
+  } catch (e: any) {
+    errors.push(`position ${dp.tokenId} on chain ${w.chain_id_ref}: ${e?.message ?? e}`);
+  }
+
+  return { ...ctx, positions, outOfRange, alertsSent, errors };
 }
 
 function dedupeDiscovered(list: DiscoveredPosition[]): DiscoveredPosition[] {
@@ -483,6 +652,7 @@ async function recoverMissedPositions(
 
   return recovered;
 }
+
 
 export function buildNotification(
   w: WalletRow,

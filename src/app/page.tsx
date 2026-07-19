@@ -57,11 +57,13 @@ interface Position {
 
 interface MonitorState {
   knownRunning: boolean;
-  fullRunning: boolean;
+  fullRunning: boolean;  // 深度扫描（手动触发）运行中
+  fastRunning: boolean;  // 快速扫描（cron 自动）运行中
   fullCron: string;
   knownCron: string;
   lastKnown: any;
-  lastFull: any;
+  lastFull: any;   // 深度扫描上次结果
+  lastFast: any;   // 快速扫描上次结果
 }
 
 export default function DashboardPage() {
@@ -74,16 +76,36 @@ export default function DashboardPage() {
   const closed = (closedPositions ?? []).filter((p) => p.notify_state === "closed");
   const [showClosed, setShowClosed] = useState(false);
 
-  async function triggerScan() {
-    const r = await fetch("/api/monitor", { method: "POST" });
+  async function triggerScanDeep() {
+    const r = await fetch("/api/monitor", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode: "deep" }),
+    });
     const j = await r.json();
     if (!j.ok) alert(j.error);
-    // 扫描是异步的(可能耗时 1~2 分钟),先立即刷一次拿最新提交状态,
+    // 深度扫描是异步的(可能耗时 1~2 分钟),先立即刷一次拿最新提交状态,
     // 再在几秒后补刷一次,确保扫描完成后的结果能尽快呈现。
     reloadPos();
-    setTimeout(() => reloadPos(), 8_000);
-    setTimeout(() => reloadPos(), 30_000);
-    setTimeout(() => reloadPos(), 90_000);
+    reloadMon();
+    setTimeout(() => { reloadPos(); reloadMon(); }, 8_000);
+    setTimeout(() => { reloadPos(); reloadMon(); }, 30_000);
+    setTimeout(() => { reloadPos(); reloadMon(); }, 90_000);
+  }
+
+  async function triggerScanFast() {
+    const r = await fetch("/api/monitor", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode: "fast" }),
+    });
+    const j = await r.json();
+    if (!j.ok) alert(j.error);
+    // 快速扫描通常 1~3 秒,立即刷 + 几秒后补刷
+    reloadPos();
+    reloadMon();
+    setTimeout(() => { reloadPos(); reloadMon(); }, 3_000);
+    setTimeout(() => { reloadPos(); reloadMon(); }, 10_000);
   }
 
   return (
@@ -94,12 +116,14 @@ export default function DashboardPage() {
           <Stat label="监控仓位" value={list.length} />
           <Stat label="越界" value={outOfRange.length} danger={outOfRange.length > 0} />
           <div className="text-sm text-ink-soft">
-            <div>全量：{mon?.fullCron ? cronToLabel(mon.fullCron) : "—"}{mon?.fullRunning ? " (扫描中)" : ` ${timeAgo(mon?.lastFull?.at)}`}</div>
+            <div>全量(快)：{mon?.fullCron ? cronToLabel(mon.fullCron) : "—"}{mon?.fastRunning ? " (扫描中)" : ` ${timeAgo(mon?.lastFast?.at)}`}</div>
+            <div>全量(深)：{mon?.fullRunning ? "扫描中…" : `上次 ${timeAgo(mon?.lastFull?.at)}`}</div>
             <div>已知：{mon?.knownRunning ? "扫描中…" : `上次 ${timeAgo(mon?.lastKnown?.at)}`}</div>
           </div>
         </div>
         <div className="flex items-center gap-2">
-          <button className="btn-primary" onClick={triggerScan}>立即扫描</button>
+          <button className="btn-primary" onClick={triggerScanFast}>快速扫描</button>
+          <button className="btn-secondary" onClick={triggerScanDeep}>完整扫描</button>
         </div>
       </div>
 

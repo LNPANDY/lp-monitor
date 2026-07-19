@@ -80,3 +80,34 @@ export function getAlertCooldownMinutes(alertType: string): number {
   // 独立配置是用户显式设置的值 → 采用它
   return v;
 }
+
+// ===== 快速全量扫描配置 =====
+
+/**
+ * 快速全量扫描：首次扫描回溯多少小时。默认 1（1 小时）。
+ * 之后扫描走"上次扫描结束块-冗余"逻辑，与本值无关。
+ * 范围 1~24。
+ */
+export function getFullScanFirstHours(): number {
+  const v = Number(getSetting("fullscan_first_hours", ""));
+  return Number.isFinite(v) && v >= 1 && v <= 24 ? v : 1;
+}
+
+/**
+ * 快速全量扫描：每次扫描相对于上次扫描结束块的冗余秒数（防漏块）。
+ * 默认 10 秒。范围 1~120。
+ */
+export function getFullScanPaddingSec(): number {
+  const v = Number(getSetting("fullscan_padding_sec", ""));
+  return Number.isFinite(v) && v >= 1 && v <= 120 ? v : 10;
+}
+
+/**
+ * 快速全量扫描：兜底 ownerOf 反查的节流时间（分钟）。
+ * 同一仓位在 N 分钟内已反查过的，跳过。
+ * 默认 5 分钟。范围 1~60。
+ */
+export function getFullScanRecoverThrottleMin(): number {
+  const v = Number(getSetting("fullscan_recover_throttle_min", ""));
+  return Number.isFinite(v) && v >= 1 && v <= 60 ? v : 5;
+}

@@ -1,4 +1,4 @@
-import { ensureEnhancedScheduler, isKnownRunning, isFullRunning, lastKnownPositionsSummary, lastFullScanSummary, currentFullScanCron, rescheduleFullScan, triggerFullScan, triggerKnownPositionsScan, getKnownPositionsCron } from "@/lib/monitor/enhanced-scheduler";
+import { ensureEnhancedScheduler, isKnownRunning, isFullRunning, isFastRunning, lastKnownPositionsSummary, lastFullScanSummary, lastFastScanSummary, currentFullScanCron, rescheduleFullScan, triggerFullScan, triggerFastScan, triggerKnownPositionsScan, getKnownPositionsCron } from "@/lib/monitor/enhanced-scheduler";
 import { ok, fail, getBody } from "@/lib/api";
 
 export const dynamic = "force-dynamic";
@@ -9,16 +9,37 @@ export async function GET() {
   return ok({
     knownRunning: isKnownRunning(),
     fullRunning: isFullRunning(),
+    fastRunning: isFastRunning(),
     fullCron: currentFullScanCron(),
     knownCron: getKnownPositionsCron(),
     lastKnown: lastKnownPositionsSummary(),
     lastFull: lastFullScanSummary(),
+    lastFast: lastFastScanSummary(),
   });
 }
 
-/** 手动触发一次全量扫描。 */
-export async function POST() {
-  if (isFullRunning()) return fail("已有全量扫描在进行中", 409);
+/**
+ * 手动触发一次全量扫描。
+ * body: { mode?: "deep" | "fast" } —— 默认 "deep"（保留向后兼容；前端"立即扫描"按钮走 deep）。
+ *  - deep: 深度扫描，原版慢速逻辑（100k 块窗口 + 全量 ownerOf 兜底反查）
+ *  - fast: 快速扫描，与 cron 自动触发一致（动态窗口 + 节流并发兜底）
+ */
+export async function POST(req: Request) {
+  const b = await getBody<{ mode?: string }>(req).catch(() => ({ mode: "deep" } as any));
+  const mode = b?.mode === "fast" ? "fast" : "deep";
+
+  if (mode === "fast") {
+    if (isFastRunning() || isFullRunning()) return fail("已有扫描在进行中", 409);
+    try {
+      const summary = await triggerFastScan();
+      return ok(summary);
+    } catch (e: any) {
+      return fail(e?.message ?? "scan failed", 500);
+    }
+  }
+
+  // deep
+  if (isFullRunning() || isFastRunning()) return fail("已有扫描在进行中", 409);
   try {
     const summary = await triggerFullScan();
     return ok(summary);
