@@ -44,6 +44,10 @@ export async function PUT(req: Request) {
     const v = Number(body.push_cooldown_minutes);
     if (!Number.isFinite(v) || v < 1 || v > 60) return fail("push_cooldown_minutes 须为 1~60 的数值");
     setSetting("push_cooldown_minutes", String(v));
+    // 同步更新各告警类型的独立冷却配置，否则独立配置会覆盖全局默认
+    for (const type of ["cex_price", "out_of_range", "re_in_range", "tick_move"]) {
+      setSetting(`cooldown_${type}`, String(v));
+    }
   }
 
   return ok({
