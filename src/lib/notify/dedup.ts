@@ -29,7 +29,10 @@ export function shouldPush(positionId: number, alertType: string, currentState: 
   
   if (!lastPush) return true; // 首次推送
   
-  const lastMs = new Date(lastPush.last_push_time).getTime();
+  // SQLite datetime('now') 返回 UTC 时间字符串 'YYYY-MM-DD HH:MM:SS'（无时区后缀），
+  // V8 的 Date 会把无时区字符串按本地时区解析，导致时间偏差（如 UTC+8 会差 8 小时）。
+  // 这里把空格替换成 'T' 并补上 'Z' 后缀，强制按 UTC 解析。
+  const lastMs = new Date(lastPush.last_push_time.replace(' ', 'T') + 'Z').getTime();
   const cooldownMs = cooldownMin * 60 * 1000;
   
   // 状态相同且冷却时间未到 → 阻止推送
