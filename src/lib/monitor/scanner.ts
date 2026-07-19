@@ -201,7 +201,9 @@ export async function runFastScan(opts: {
         client, w.address as `0x${string}`, dexes, staking, fromBlock
       );
       const scanMs = Date.now() - tScan0;
-      console.log(`[scanner-fast] wallet ${w.address} chain ${chain.name}: incoming=${cands.incoming.length}, staking=${cands.staking.length}, outgoing=${cands.outgoing.length} (${scanMs}ms)`);
+      const stakingCnt = cands.candidates.filter(c => c.source === "staking").length;
+      const directCnt = cands.candidates.length - stakingCnt;
+      console.log(`[scanner-fast] wallet ${w.address} chain ${chain.name}: candidates=${cands.candidates.length} (direct=${directCnt}, staking=${stakingCnt}), outgoing=${cands.outgoing.length} (${scanMs}ms)`);
 
       // ===== outgoing: from=钱包 转出，DB 中已存在 → ownerOf 反查确认是否标 closed =====
       const tClosed0 = Date.now();
@@ -238,12 +240,10 @@ export async function runFastScan(opts: {
         outgoingClosed++;
       }
 
-      // ===== 处理新候选：DB 不存在的 tokenId → INSERT via processPosition =====
-      // 候选来源：incoming（mint/转入）+ staking（质押转入＝stake）
-      const allIncoming = [...cands.incoming, ...cands.staking];
-      const deduped = dedupeDiscovered(allIncoming);
+      // ===== 处理候选：DB 不存在的 INSERT；DB 已存在但 source 变了（旧 direct → 新 staking）UPDATE =====
       const tProc0 = Date.now();
       let processedNew = 0;
+      let sourceChanged = 0;
 
       // 预取本链 CEX 报价（processPosition 会用到）
       const chainMappings = cexMappingsByChain.get(w.chain_id_ref) ?? [];
@@ -261,16 +261,21 @@ export async function runFastScan(opts: {
         positions, discovered: discoveredCount, outOfRange, alertsSent, errors,
       };
 
-      for (const dp of deduped) {
+      for (const dp of cands.candidates) {
         const dex = dexes.find((d) => d.id === dp.dexId);
         if (!dex) continue;
         // 判断 DB 是否已存在
         const existing = db
-          .prepare("SELECT id, notify_state FROM positions WHERE chain_id_ref=? AND dex_name=? AND token_id=?")
-          .get(w.chain_id_ref, dex.name, dp.tokenId) as { id: number; notify_state: string } | undefined;
+          .prepare("SELECT id, notify_state, source FROM positions WHERE chain_id_ref=? AND dex_name=? AND token_id=?")
+          .get(w.chain_id_ref, dex.name, dp.tokenId) as { id: number; notify_state: string; source: string } | undefined;
         if (existing) {
-          // DB 已有：known 快扫负责状态更新；如已 closed 本次又复活 → 标 reopened
-          // fast scan 不再调 readRange 重复处理
+          // DB 已有：检查 source 是否发生了 direct ↔ staking 变化（后到事件覆盖）
+          if (existing.source !== dp.source) {
+            db.prepare(
+              `UPDATE positions SET source=?, staker_contract=?, staking_id=?, last_checked_at=? WHERE id=?`
+            ).run(dp.source, dp.stakerContract ?? "", dp.stakingId ?? null, nowIso, existing.id);
+            sourceChanged++;
+          }
           continue;
         }
         // DB 不存在 → 真新仓位，processPosition 处理（内部 INSERT）
@@ -278,12 +283,10 @@ export async function runFastScan(opts: {
         positions = r.positions; discoveredCount = r.discovered; outOfRange = r.outOfRange; alertsSent = r.alertsSent;
         newCount++;
         processedNew++;
-        // processPosition 内的 INSERT 可能先 closed 再判 in_range → 需要主动 reopened 检测
-        // 读 DB 当前 notify_state，如果还活着 (in_range/out_of_range) 并不属于 reopened（已计为 new）
       }
       const procMs = Date.now() - tProc0;
       const totalMs = Date.now() - tWallet0;
-      console.log(`[scanner-fast] result: chain=${chain.name} wallets=1 new=${processedNew} closed=${outgoingClosed} processing=${procMs}ms total=${totalMs}ms`);
+      console.log(`[scanner-fast] result: chain=${chain.name} wallets=1 new=${processedNew} source_changed=${sourceChanged} closed=${outgoingClosed} processing=${procMs}ms total=${totalMs}ms`);
     } catch (e: any) {
       errors.push(`wallet ${w.address}: ${e?.message ?? e}`);
     }

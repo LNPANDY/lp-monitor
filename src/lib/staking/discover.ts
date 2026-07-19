@@ -152,11 +152,17 @@ export async function findStakedPositions(
 const ZERO_ADDR = "0x0000000000000000000000000000000000000000";
 
 export interface RecentCandidates {
-  /** 新进钱包的候选：Mint(from=0→钱包) 或 转入(其他→钱包) */
-  incoming: DiscoveredPosition[];
-  /** 质押转出候选：from=钱包 → to 命中已知质押合约 */
-  staking: DiscoveredPosition[];
-  /** 转出场景：from=钱包 → to 非质押合约（可能 burn/转移，需标 closed 检查） */
+  /**
+   * 本次最终态为"在钱包或质押合约"的候选列表（去重后的最新状态）。
+   * - Mint / 转入到钱包 → source='direct'
+   * - 转入到质押合约 → source='staking'，附 stakerContract + stakingId
+   *
+   * 若同一 tokenId 窗口内先 Mint 再质押，最终态以质押为准（后到覆盖先到）。
+   * 若同一 tokenId 先转入钱包再转出到非钱包非质押，最终态是 outgoing，
+   * 不出现在 candidates 中，仅存于 outgoing。
+   */
+  candidates: DiscoveredPosition[];
+  /** 转出场景：from=钱包 → to 非质押合约，需要标 closed 检查 */
   outgoing: { tokenId: string; dexId: number; toAddr: string }[];
   /** 本次扫描的真实区块范围（最后一个事件所在块，用于下次窗口起点） */
   latestSeen?: bigint;
@@ -166,15 +172,16 @@ export interface RecentCandidates {
  * 快速扫描：基于 transfer 事件的最近窗口发现新仓位。
  *
  * 对每个 DEX 的 NPM 合约，一次 getLogs 拉窗口内所有 Transfer 事件，
- * 然后在客户端过滤出与本钱包有关的（包括 Mint 的 from=0x0 → to=钱包）：
+ * getLogs 默认按区块升序返回，所以按时间顺序遍历、
+ * 同一 tokenId 的事件**后到覆盖先到**，最终态即最后一次事件的归属。
  *
- *   to==钱包,  from==0x0        → Mint 新建 LP（归类 incoming）
- *   to==钱包,  from!=0x0         → 转入（归类 incoming）
- *   from==钱包, to==质押合约     → 质押（归类 staking，存留监控）
- *   from==钱包, to==其它         → 转出/销毁（归类 outgoing，需 ownerOf 反查确认标 closed）
+ * 事件分类（与本钱包有关的事件）：
+ *   to==钱包,  from==0x0        → Mint 新建 LP → source='direct'
+ *   to==钱包,  from!=0x0         → 转入          → source='direct'
+ *   from==钱包, to==质押合约     → 质押          → source='staking'
+ *   from==钱包, to==其它         → 转出           → 移入 outgoing，从候选表删除
  *
  * 不再 balanceOf 枚举全部 NFT（避免对历史 NFT 也 readRange）。
- * 不返回 latest 区块以避免多余 RPC：调用方用检出的事件里最大的 blockNumber 即可。
  */
 export async function findRecentPositionsByTransfer(
   client: PublicClient,
@@ -185,15 +192,17 @@ export async function findRecentPositionsByTransfer(
 ): Promise<RecentCandidates> {
   const stakingByAddr = new Map(staking.map((s) => [s.contract.toLowerCase(), s]));
   const walletLower = wallet.toLowerCase();
-  const ZERO_LOWER = ZERO_ADDR.toLowerCase();
 
   const transferEvent = parseAbiItem(
     "event Transfer(address indexed from, address indexed to, uint256 indexed tokenId)"
   );
 
-  const incoming: DiscoveredPosition[] = [];
-  const stakingOut: DiscoveredPosition[] = [];
-  const outgoing: { tokenId: string; dexId: number; toAddr: string }[] = [];
+  // 按 (dexId:tokenId) 去重的最终态表。覆盖顺序由 getLogs 的区块升序自然保证。
+  // value 可能是 DiscoveredPosition（仍在钱包/质押），或 outgoing 标记（已转出）。
+  type State =
+    | { kind: "direct" | "staking"; dp: DiscoveredPosition }
+    | { kind: "outgoing"; toAddr: string };
+  const finalState = new Map<string, State>();
   let latestSeen = fromBlock;
 
   for (const dex of dexes) {
@@ -217,29 +226,53 @@ export async function findRecentPositionsByTransfer(
       if (!tokenId) continue;
       if (l.blockNumber && BigInt(l.blockNumber) > latestSeen) latestSeen = BigInt(l.blockNumber);
 
-      // 与本钱包相关的四种情形
+      // 只处理与本钱包相关的事件
       const walletInvolved = fromAddr === walletLower || toAddr === walletLower;
       if (!walletInvolved) continue;
 
+      const key = `${dex.id}:${tokenId}`;
+
       if (toAddr === walletLower) {
-        // Mint（from=0）或转入：都是 incoming 候选
-        incoming.push({ tokenId, dexId: dex.id, source: "direct" });
+        // Mint (from=0x0) 或 转入：最终态为直接持有
+        finalState.set(key, {
+          kind: "direct",
+          dp: { tokenId, dexId: dex.id, source: "direct" },
+        });
         continue;
       }
-      // fromAddr === walletLower：转出场景
+      // fromAddr === walletLower：转出
       const s = stakingByAddr.get(toAddr);
       if (s) {
-        stakingOut.push({
-          tokenId, dexId: dex.id, source: "staking",
-          stakerContract: s.contract, stakingId: s.id,
+        // 质押合约：最终态为质押
+        finalState.set(key, {
+          kind: "staking",
+          dp: {
+            tokenId, dexId: dex.id, source: "staking",
+            stakerContract: s.contract, stakingId: s.id,
+          },
         });
       } else {
-        outgoing.push({ tokenId, dexId: dex.id, toAddr: toAddr });
+        // 其它地址：转出（可能在 DB 中，需走 closed 流程）
+        finalState.set(key, { kind: "outgoing", toAddr });
       }
     }
   }
 
-  return { incoming, staking: stakingOut, outgoing, latestSeen };
+  // 输出：actual candidate（仍在钱包或质押） + outgoing
+  // 一次遍历按 kind 分别填两个列表；key 拆 d得知 dexId/tokenId
+  const candidates: DiscoveredPosition[] = [];
+  const outgoing: { tokenId: string; dexId: number; toAddr: string }[] = [];
+  for (const [key, st] of finalState) {
+    const [dexIdStr, tokenId] = key.split(":");
+    const dexId = Number(dexIdStr);
+    if (st.kind === "outgoing") {
+      outgoing.push({ tokenId, dexId, toAddr: st.toAddr });
+    } else {
+      candidates.push(st.dp);
+    }
+  }
+
+  return { candidates, outgoing, latestSeen };
 }
 
 /** 简易并发限制器。 */
