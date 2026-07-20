@@ -207,6 +207,13 @@ export async function runFastDiscover(opts: {
             // 把 raw price 换算成整币单位价格（与 scanner.ts 的 rawToHumanPrice 等价）
             const price0HumanStr = rawToHumanPrice(r.status.price, dec0, dec1);
 
+            // 检查 pair_flips 表：该 token 对历史上是否被用户标记过翻转（与 scanner.ts 一致）
+            // 同一 (chain, dex, token0, token1) 的其他仓位之前被翻转过的，新仓位继承 pair_flip=1
+            const savedFlip = db
+              .prepare("SELECT 1 FROM pair_flips WHERE chain_id_ref=? AND (dex_name=? OR dex_name='') AND token0=? AND token1=?")
+              .get(chainIdRef, dex.name, r.token0.toLowerCase(), r.token1.toLowerCase());
+            const prevPairFlip = savedFlip ? 1 : 0;
+
             // INSERT 完整字段。新仓位首次录入直接用真实 margin 作 baseline（避免 known 触发假 tick_move）
             db.prepare(
               `INSERT INTO positions
@@ -222,7 +229,7 @@ export async function runFastDiscover(opts: {
               r.tickLower, r.tickUpper, dp.source, dp.stakerContract ?? "", dp.stakingId ?? null,
               r.status.currentTick, inRange ? 1 : 0, price0HumanStr, r.liquidity?.toString() ?? "",
               marginLower, marginUpper, "",
-              nowIso, inRange ? "in_range" : "out_of_range", "", 0
+              nowIso, inRange ? "in_range" : "out_of_range", "", prevPairFlip
             );
             newInserted++;
             walletNew++;
