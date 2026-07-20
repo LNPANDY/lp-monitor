@@ -18,3 +18,5 @@ data/*.db-wal
 *.log
 *.tsbuildinfo
 .DS_Store
+# VPS 部署时 update.sh 写入的依赖锁缓存（本地不需要，也不应纳入 git）
+.package-lock.hash
