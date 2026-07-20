@@ -20,7 +20,6 @@ import {
 import {
   findDirectPositions,
   findStakedPositions,
-  findRecentPositionsByTransfer,
   type DiscoveredPosition,
 } from "../staking/discover";
 import { ownerOf } from "../adapters/v3-fork";
@@ -149,163 +148,6 @@ export async function runScan(): Promise<ScanSummary> {
   };
 }
 
-/**
- * 快速全量扫描：默认 cron 调用的扫描模式。
- *
- * 与深度模式（runScan）的差异：
- *  1. transfer 扫描窗口由调度器传入（首次回溯 N 小时，之后距上次扫描 + 冗余）
- *  2. 兜底 ownerOf 反查走节流版（同一仓位 5 分钟内已反查过的跳过）+ 并发（限并 10）
- *  3. 其余（readRange、写库、告警、CEX 计算）与深度模式完全一致
- *
- * @param opts.fromBlockByChain 各链的 transfer 扫描起始区块（由调度器维护状态）
- * @param opts.recoverCheckRecord 各仓位上次 ownerOf 反查的时间戳记录（由调度器维护状态）
- */
-export async function runFastScan(opts: {
-  fromBlockByChain?: Record<number, bigint>;
-}): Promise<ScanSummary> {
-  const startedAt = Date.now();
-  const errors: string[] = [];
-  let positions = 0;
-  let discoveredCount = 0;
-  let newCount = 0;
-  let reopenedCount = 0;
-  let closedCount = 0;
-  let outOfRange = 0;
-  let alertsSent = 0;
-  const db = getDb();
-
-  const cexEnabled = isCexPriceEnabled();
-  const cexMappingsByChain = loadAllMappings();
-  const cexQuoteByAddr = new Map<string, CexQuote>();
-  const cexMutedPairs = new Set<string>();
-
-  const wallets = db.prepare("SELECT * FROM wallets WHERE enabled=1").all() as WalletRow[];
-  if (wallets.length === 0) {
-    return { wallets: 0, positions: 0, discovered: 0, new: 0, reopened: 0, closed: 0, outOfRange: 0, alertsSent: 0, errors, startedAt: new Date(startedAt).toISOString(), durationMs: Date.now() - startedAt };
-  }
-
-  for (const w of wallets) {
-    try {
-      const tWallet0 = Date.now();
-      const { client, chain } = getClient(w.chain_id_ref);
-      const dexes = listDexes(w.chain_id_ref, true);
-      const staking = listStaking(w.chain_id_ref, true);
-
-      // ===== transfer 扫描：只发现窗口内变化的仓位 =====
-      const fromBlock = opts.fromBlockByChain?.[w.chain_id_ref] ?? 0n;
-      const latest = await client.getBlockNumber();
-      console.log(`[scanner-fast] start: chain=${chain.name} (id=${w.chain_id_ref}), fromBlock=${fromBlock}, latest=${latest}`);
-
-      const tScan0 = Date.now();
-      const cands = await findRecentPositionsByTransfer(
-        client, w.address as `0x${string}`, dexes, staking, fromBlock
-      );
-      const scanMs = Date.now() - tScan0;
-      const stakingCnt = cands.candidates.filter(c => c.source === "staking").length;
-      const directCnt = cands.candidates.length - stakingCnt;
-      console.log(`[scanner-fast] wallet ${w.address} chain ${chain.name}: candidates=${cands.candidates.length} (direct=${directCnt}, staking=${stakingCnt}), outgoing=${cands.outgoing.length} (${scanMs}ms)`);
-
-      // ===== outgoing: from=钱包 转出，DB 中已存在 → ownerOf 反查确认是否标 closed =====
-      const tClosed0 = Date.now();
-      const stakingByAddr = new Map(staking.map((s) => [s.contract.toLowerCase(), s]));
-      const walletLower = w.address.toLowerCase();
-      const nowIso = new Date().toISOString();
-      let outgoingClosed = 0;
-      for (const out of cands.outgoing) {
-        const dex = dexes.find((d) => d.id === out.dexId);
-        if (!dex) continue;
-        // 查 DB 中是否存在该仓位
-        const existing = db
-          .prepare("SELECT id, notify_state FROM positions WHERE chain_id_ref=? AND dex_name=? AND token_id=?")
-          .get(w.chain_id_ref, dex.name, out.tokenId) as { id: number; notify_state: string } | undefined;
-        if (!existing) continue; // DB 没记录的转出场景无所谓
-        if (existing.notify_state === "closed") continue;
-        // ownerOf 反查确认 owner 是否还是本钱包或已知质押合约
-        let currentOwner: string | null = null;
-        try {
-          currentOwner = await ownerOf(client, dex.npm as `0x${string}`, BigInt(out.tokenId));
-        } catch {
-          continue;
-        }
-        if (!currentOwner) continue;
-        const ownerLower = currentOwner.toLowerCase();
-        if (ownerLower === walletLower) continue; // 还在钱包里
-        if (stakingByAddr.has(ownerLower)) continue; // 还在质押合约里
-        // owner 改为非本钱包非质押合约 → 真的转移，标 closed
-        db.prepare(
-          `UPDATE positions SET notify_state='closed', last_checked_at=?, last_in_range=0
-           WHERE id=?`
-        ).run(nowIso, existing.id);
-        closedCount++;
-        outgoingClosed++;
-      }
-
-      // ===== 处理候选：DB 不存在的 INSERT；DB 已存在但 source 变了（旧 direct → 新 staking）UPDATE =====
-      const tProc0 = Date.now();
-      let processedNew = 0;
-      let sourceChanged = 0;
-
-      // 预取本链 CEX 报价（processPosition 会用到）
-      const chainMappings = cexMappingsByChain.get(w.chain_id_ref) ?? [];
-      if (cexEnabled && chainMappings.length > 0) {
-        const needFetch = chainMappings.filter((m) => !cexQuoteByAddr.has(m.tokenAddr));
-        if (needFetch.length > 0) {
-          const byAddr = await buildQuotesByAddr(needFetch);
-          for (const [addr, quote] of byAddr) cexQuoteByAddr.set(addr, quote);
-        }
-      }
-
-      const ctx: ScanCtx = {
-        db, client, chain, w, dexes,
-        cexEnabled, cexQuoteByAddr, cexMutedPairs,
-        positions, discovered: discoveredCount, outOfRange, alertsSent, errors,
-      };
-
-      for (const dp of cands.candidates) {
-        const dex = dexes.find((d) => d.id === dp.dexId);
-        if (!dex) continue;
-        // 判断 DB 是否已存在
-        const existing = db
-          .prepare("SELECT id, notify_state, source FROM positions WHERE chain_id_ref=? AND dex_name=? AND token_id=?")
-          .get(w.chain_id_ref, dex.name, dp.tokenId) as { id: number; notify_state: string; source: string } | undefined;
-        if (existing) {
-          // DB 已有：检查 source 是否发生了 direct ↔ staking 变化（后到事件覆盖）
-          if (existing.source !== dp.source) {
-            db.prepare(
-              `UPDATE positions SET source=?, staker_contract=?, staking_id=?, last_checked_at=? WHERE id=?`
-            ).run(dp.source, dp.stakerContract ?? "", dp.stakingId ?? null, nowIso, existing.id);
-            sourceChanged++;
-          }
-          continue;
-        }
-        // DB 不存在 → 真新仓位，processPosition 处理（内部 INSERT）
-        const r = await processPosition(ctx, dp);
-        positions = r.positions; discoveredCount = r.discovered; outOfRange = r.outOfRange; alertsSent = r.alertsSent;
-        newCount++;
-        processedNew++;
-      }
-      const procMs = Date.now() - tProc0;
-      const totalMs = Date.now() - tWallet0;
-      console.log(`[scanner-fast] result: chain=${chain.name} wallets=1 new=${processedNew} source_changed=${sourceChanged} closed=${outgoingClosed} processing=${procMs}ms total=${totalMs}ms`);
-    } catch (e: any) {
-      errors.push(`wallet ${w.address}: ${e?.message ?? e}`);
-    }
-  }
-
-  return {
-    wallets: wallets.length,
-    positions,
-    discovered: discoveredCount,
-    new: newCount,
-    reopened: reopenedCount,
-    closed: closedCount,
-    outOfRange,
-    alertsSent,
-    errors,
-    startedAt: new Date(startedAt).toISOString(),
-    durationMs: Date.now() - startedAt,
-  };
-}
 
 /** 扫描上下文：processPosition 所需的运行时共享状态。 */
 interface ScanCtx {
@@ -326,7 +168,7 @@ interface ScanCtx {
 
 /**
  * 处理单个仓位：readRange → 写库 → 越界/波动/CEX 告警。
- * runScan 与 runFastScan 共用，确保两种模式行为等价。
+ * 仅供 runScan（深度扫描）使用。fast discover 走自己的路径（INSERT 占位 + known 扫描接力）。
  */
 async function processPosition(ctx: ScanCtx, dp: DiscoveredPosition): Promise<ScanCtx> {
   const { db, client, chain, w, dexes, cexEnabled, cexQuoteByAddr, cexMutedPairs } = ctx;

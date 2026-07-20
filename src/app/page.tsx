@@ -56,14 +56,12 @@ interface Position {
 }
 
 interface MonitorState {
-  knownRunning: boolean;
-  fullRunning: boolean;  // 深度扫描（手动触发）运行中
-  fastRunning: boolean;  // 快速扫描（cron 自动）运行中
+  combinedRunning: boolean;  // 合并扫描（fast+known，cron 自动）运行中
+  fullRunning: boolean;      // 深度扫描（手动触发）运行中
+  combinedCron: string;
   fullCron: string;
-  knownCron: string;
-  lastKnown: any;
-  lastFull: any;   // 深度扫描上次结果
-  lastFast: any;   // 快速扫描上次结果
+  lastCombined: any;  // 合并扫描上次结果（含 fast + known 各自摘要）
+  lastFull: any;      // 深度扫描上次结果
 }
 
 export default function DashboardPage() {
@@ -93,19 +91,19 @@ export default function DashboardPage() {
     setTimeout(() => { reloadPos(); reloadMon(); }, 90_000);
   }
 
-  async function triggerScanFast() {
+  async function triggerScanCombined() {
     const r = await fetch("/api/monitor", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ mode: "fast" }),
+      body: JSON.stringify({ mode: "combined" }),
     });
     const j = await r.json();
     if (!j.ok) alert(j.error);
-    // 快速扫描通常 1~3 秒,立即刷 + 几秒后补刷
+    // 合并扫描 5-15 秒，立即刷 + 几秒后补刷
     reloadPos();
     reloadMon();
-    setTimeout(() => { reloadPos(); reloadMon(); }, 3_000);
-    setTimeout(() => { reloadPos(); reloadMon(); }, 10_000);
+    setTimeout(() => { reloadPos(); reloadMon(); }, 5_000);
+    setTimeout(() => { reloadPos(); reloadMon(); }, 15_000);
   }
 
   return (
@@ -116,19 +114,18 @@ export default function DashboardPage() {
           <Stat label="监控仓位" value={list.length} />
           <Stat label="越界" value={outOfRange.length} danger={outOfRange.length > 0} />
           <div className="text-sm text-ink-soft">
-            <div>全量(快)：{mon?.fullCron ? cronToLabel(mon.fullCron) : "—"}{mon?.fastRunning ? " (扫描中)" : ` ${timeAgo(mon?.lastFast?.at)}`}</div>
-            <div>全量(深)：{mon?.fullRunning ? "扫描中…" : `上次 ${timeAgo(mon?.lastFull?.at)}`}</div>
-            <div>已知：{mon?.knownRunning ? "扫描中…" : `上次 ${timeAgo(mon?.lastKnown?.at)}`}</div>
+            <div>合并：{mon?.combinedCron ? cronToLabel(mon.combinedCron) : "—"}{mon?.combinedRunning ? " (扫描中)" : ` ${timeAgo(mon?.lastCombined?.startedAt)}`}</div>
+            <div>深度：{mon?.fullRunning ? "扫描中…" : `上次 ${timeAgo(mon?.lastFull?.at)}`}</div>
           </div>
         </div>
         <div className="flex items-center gap-2">
-          <button className="btn-primary" onClick={triggerScanFast}>快速扫描</button>
+          <button className="btn-primary" onClick={triggerScanCombined}>立即扫描</button>
           <button className="btn-secondary" onClick={triggerScanDeep}>完整扫描</button>
         </div>
       </div>
 
       {/* 扫描频率和告警阈值设置 */}
-      <ScanIntervalAndAlerts currentCron={mon?.fullCron ?? ""} knownCron={mon?.knownCron ?? ""} onChanged={() => reloadMon()} />
+      <ScanIntervalAndAlerts currentCron={mon?.combinedCron ?? ""} knownCron={mon?.combinedCron ?? ""} onChanged={() => reloadMon()} />
 
       {/* 链上资产统计 */}
       <PortfolioSection />
