@@ -402,11 +402,13 @@ function ScanIntervalAndAlerts({ combinedCron, onChanged }: { combinedCron: stri
     } finally { setBusy(false); }
   }
 
-  async function applyThreshold() {
+  async function applyThreshold(threshold?: number) {
     setBusy(true); setMsg("");
     try {
       const body: any = {};
-      if (tickThreshold !== "") body.tick_move_threshold = Number(tickThreshold);
+      // 优先用调用方传入的 threshold（select onChange），其次用 state tickThreshold
+      if (threshold !== undefined) body.tick_move_threshold = threshold;
+      else if (tickThreshold !== "") body.tick_move_threshold = Number(tickThreshold);
       const r = await fetch("/api/alert-settings", {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
@@ -482,7 +484,19 @@ function ScanIntervalAndAlerts({ combinedCron, onChanged }: { combinedCron: stri
           >
             {alertData?.tick_move_enabled ? "波动预警：开" : "波动预警：关"}
           </button>
-          <span className="text-xs text-ink-soft">阈值 {alertData?.tick_move_threshold ?? 10}%</span>
+
+          {/* 波动阈值下拉选择（1~10%） */}
+          <span className="text-xs text-ink-soft">阈值</span>
+          <select
+            className="input max-w-[80px] text-xs"
+            value={tickThreshold || (alertData?.tick_move_threshold ?? 5)}
+            disabled={busy}
+            onChange={(e) => { setTickThreshold(e.target.value); applyThreshold(Number(e.target.value)); }}
+          >
+            {[1,2,3,4,5,6,7,8,9,10].map(n => (
+              <option key={n} value={n}>{n}%</option>
+            ))}
+          </select>
 
           {/* CEX 价差推送开关（仅控制是否推送告警，不影响卡片中 CEX 数据展示） */}
           <button
@@ -493,24 +507,6 @@ function ScanIntervalAndAlerts({ combinedCron, onChanged }: { combinedCron: stri
             {alertData?.cex_price_enabled ? "CEX 推送：开" : "CEX 推送：关"}
           </button>
           <span className="text-xs text-ink-soft">超过费率 2 倍时提醒</span>
-
-          {/* 阈值设置 */}
-          <input
-            className="input max-w-[100px] text-xs"
-            type="number"
-            min={0}
-            max={100}
-            value={tickThreshold}
-            onChange={(e) => setTickThreshold(e.target.value)}
-            placeholder="波动阈值 %"
-          />
-          <button
-            className="btn-ghost text-xs"
-            disabled={busy || tickThreshold === ""}
-            onClick={applyThreshold}
-          >
-            应用阈值
-          </button>
         </div>
 
         {/* 推送冷却时间 */}
