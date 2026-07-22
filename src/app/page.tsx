@@ -1,7 +1,7 @@
 "use client";
 import { useState } from "react";
 import useSWR from "swr";
-import { fetcher, short, timeAgo, fmtFull } from "@/components/util";
+import { fetcher, authHeaders, short, timeAgo, fmtFull } from "@/components/util";
 
 /** 将常见的 cron 表达式转为人类可读标签 */
 function cronToLabel(cron: string): string {
@@ -85,7 +85,7 @@ export default function DashboardPage() {
   async function triggerScanDeep() {
     const r = await fetch("/api/monitor", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: authHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify({ mode: "deep" }),
     });
     const j = await r.json();
@@ -102,7 +102,7 @@ export default function DashboardPage() {
   async function triggerScanCombined() {
     const r = await fetch("/api/monitor", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: authHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify({ mode: "combined" }),
     });
     const j = await r.json();
@@ -359,7 +359,7 @@ function ScanIntervalAndAlerts({ combinedCron, onChanged }: { combinedCron: stri
       const body: any = intervalSec >= 60
         ? { intervalMin: Math.floor(intervalSec / 60) }
         : { cron: `*/${intervalSec} * * * * *` };
-      const r = await fetch("/api/monitor", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+      const r = await fetch("/api/monitor", { method: "PUT", headers: authHeaders({ "Content-Type": "application/json" }), body: JSON.stringify(body) });
       const j = await r.json();
       if (!j.ok) throw new Error(j.error);
       setMsg(`✅ 扫描频率已更新`);
@@ -375,7 +375,7 @@ function ScanIntervalAndAlerts({ combinedCron, onChanged }: { combinedCron: stri
     try {
       const r = await fetch("/api/alert-settings", {
         method: "PUT",
-        headers: { "Content-Type": "application/json" },
+        headers: authHeaders({ "Content-Type": "application/json" }),
         body: JSON.stringify({ tick_move_enabled: alertData?.tick_move_enabled ? "0" : "1" }),
       });
       const j = await r.json();
@@ -391,7 +391,7 @@ function ScanIntervalAndAlerts({ combinedCron, onChanged }: { combinedCron: stri
     try {
       const r = await fetch("/api/alert-settings", {
         method: "PUT",
-        headers: { "Content-Type": "application/json" },
+        headers: authHeaders({ "Content-Type": "application/json" }),
         body: JSON.stringify({ cex_price_enabled: alertData?.cex_price_enabled ? "0" : "1" }),
       });
       const j = await r.json();
@@ -411,7 +411,7 @@ function ScanIntervalAndAlerts({ combinedCron, onChanged }: { combinedCron: stri
       else if (tickThreshold !== "") body.tick_move_threshold = Number(tickThreshold);
       const r = await fetch("/api/alert-settings", {
         method: "PUT",
-        headers: { "Content-Type": "application/json" },
+        headers: authHeaders({ "Content-Type": "application/json" }),
         body: JSON.stringify(body),
       });
       const j = await r.json();
@@ -429,7 +429,7 @@ function ScanIntervalAndAlerts({ combinedCron, onChanged }: { combinedCron: stri
     try {
       const r = await fetch("/api/alert-settings", {
         method: "PUT",
-        headers: { "Content-Type": "application/json" },
+        headers: authHeaders({ "Content-Type": "application/json" }),
         body: JSON.stringify({ push_cooldown_minutes: minutes }),
       });
       const j = await r.json();
@@ -555,7 +555,7 @@ function FlipButton({ positionId, currentFlip, onFlipped }: { positionId: number
     try {
       const response = await fetch(`/api/positions/${positionId}/pair-flip`, {
         method: "PUT",
-        headers: { "Content-Type": "application/json" },
+        headers: authHeaders({ "Content-Type": "application/json" }),
         body: JSON.stringify({ flip: !flip })
       });
       const result = await response.json();
@@ -599,7 +599,7 @@ function CexAlertMuteButton({ positionId, currentMuted, onToggled }: { positionI
     try {
       const response = await fetch(`/api/positions/${positionId}/cex-alert-mute`, {
         method: "PUT",
-        headers: { "Content-Type": "application/json" },
+        headers: authHeaders({ "Content-Type": "application/json" }),
         body: JSON.stringify({ mute: !muted })
       });
       const result = await response.json();

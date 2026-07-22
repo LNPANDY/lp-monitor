@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 import Link from "next/link";
 import { ExtensionGuard } from "@/components/extension-guard";
 import { WalletConnect } from "@/components/wallet-connect";
+import { TokenBridge } from "@/components/token-bridge";
 import "./globals.css";
 
 export const metadata: Metadata = {
@@ -13,6 +14,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
   return (
     <html lang="zh-CN">
       <body>
+        <TokenBridge />
         <ExtensionGuard />
         <header className="border-b border-slate-200 bg-white">
           <div className="mx-auto flex max-w-6xl items-center justify-between px-6 py-3">

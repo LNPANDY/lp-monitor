@@ -18,9 +18,26 @@ export function timeAgo(iso?: string) {
   return `${Math.floor(s / 86400)}d 前`;
 }
 
-/** SWR fetcher。统一处理 { ok, data } 返回结构。 */
+/**
+ * 从浏览器全局取 API Token（由 TokenBridge 注入，由 NEXT_PUBLIC_API_TOKEN 环境变量提供）。
+ * 用 window.__API_TOKEN__ 简单可靠，不依赖 localStorage（SSR 不友好）。
+ */
+function getAuthToken(): string {
+  if (typeof window === "undefined") return "";
+  return (window as any).__API_TOKEN__ ?? "";
+}
+
+/** 构造请求 headers，如有 token 则带 Authorization。 */
+export function authHeaders(extra?: Record<string, string>): Record<string, string> {
+  const token = getAuthToken();
+  const h: Record<string, string> = { ...extra };
+  if (token) h["Authorization"] = `Bearer ${token}`;
+  return h;
+}
+
+/** SWR fetcher。统一处理 { ok, data } 返回结构。GET 也带 header 确保 middleware 不拦。 */
 export async function fetcher<T = any>(url: string): Promise<T> {
-  const r = await fetch(url);
+  const r = await fetch(url, { headers: authHeaders() });
   const j = await r.json();
   if (!j.ok) throw new Error(j.error || "request failed");
   return j.data as T;

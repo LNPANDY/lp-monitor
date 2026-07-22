@@ -1,5 +1,6 @@
 "use client";
 import { useState } from "react";
+import { authHeaders } from "./util";
 
 /**
  * 仓位流动性分析结果（场景A 直持 / 场景B 质押），与后端 LiquidityResult 对齐。
@@ -55,6 +56,7 @@ export function LiquidityButton({ positionId, staking }: Props) {
     try {
       const r = await fetch(`/api/positions/${positionId}/liquidity${force ? "?force=1" : ""}`, {
         method: "POST",
+        headers: authHeaders(),
       });
       const j = await r.json();
       if (!j.ok) throw new Error(j.error || "分析失败");

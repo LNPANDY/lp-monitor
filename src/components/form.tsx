@@ -1,10 +1,11 @@
 "use client";
+import { authHeaders } from "@/components/util";
 
-/** 统一 POST/PATCH/DELETE 封装。 */
+/** 统一 POST/PATCH/DELETE 封装。自动带 Authorization header。 */
 export async function api(url: string, method: string = "POST", body?: any) {
   const r = await fetch(url, {
     method,
-    headers: body ? { "Content-Type": "application/json" } : undefined,
+    headers: authHeaders(body ? { "Content-Type": "application/json" } : undefined),
     body: body ? JSON.stringify(body) : undefined,
   });
   const j = await r.json();

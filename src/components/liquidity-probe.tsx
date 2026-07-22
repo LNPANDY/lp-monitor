@@ -1,7 +1,7 @@
 "use client";
 import { useState } from "react";
 import useSWR, { mutate } from "swr";
-import { fetcher, short } from "./util";
+import { fetcher, authHeaders, short } from "./util";
 
 /**
  * 最小区间探针结果（场景C），与后端 MinRangeProbeResult 对齐。
@@ -149,7 +149,7 @@ export function LiquidityProbe() {
       if (force) body.force = true;
       const r = await fetch("/api/liquidity-probe", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: authHeaders({ "Content-Type": "application/json" }),
         body: JSON.stringify(body),
       });
       const j = await r.json();
@@ -176,7 +176,7 @@ export function LiquidityProbe() {
         : npm;
       const r = await fetch("/api/liquidity-probe/pair-flip", {
         method: "PUT",
-        headers: { "Content-Type": "application/json" },
+        headers: authHeaders({ "Content-Type": "application/json" }),
         body: JSON.stringify({
           chain_id: Number(chainId),
           token0: result.token0,
@@ -215,7 +215,7 @@ export function LiquidityProbe() {
 
       const r = await fetch("/api/liquidity-favorites", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: authHeaders({ "Content-Type": "application/json" }),
         body: JSON.stringify({
           chain_id: Number(chainId),
           pool,
@@ -272,7 +272,7 @@ export function LiquidityProbe() {
 
   async function deleteFavorite(id: number) {
     try {
-      await fetch(`/api/liquidity-favorites/${id}`, { method: "DELETE" });
+      await fetch(`/api/liquidity-favorites/${id}`, { method: "DELETE", headers: authHeaders() });
       reloadFav();
     } catch {
       // ignore
