@@ -5,6 +5,26 @@ import { resolveTokens } from "@/lib/chains/tokens";
 
 export const dynamic = "force-dynamic";
 
+/**
+ * EVM 地址校验：0x 开头 + 40 位十六进制字符。空串允许（staker/npm 可选）。
+ * 防止 SQL 注入/XSS/命令注入 payload 被写入 DB（攻击者会将恶意字符串塞入 pool_addr/staker_addr）。
+ */
+function isValidEvmAddress(addr: string): boolean {
+  if (addr === "") return true; // 可选字段允许空
+  return /^0x[a-f0-9]{40}$/i.test(addr);
+}
+
+/**
+ * label 校验：允许中文/字母/数字/常见符号，最长 50 字符，禁止脚本/SQL 关键字注入。
+ */
+function isValidLabel(label: string): boolean {
+  if (label === "") return true;
+  if (label.length > 50) return false;
+  // 禁止 < > （XSS）、; （SQL）/管道/反引号（命令注入）
+  if (/[<>;`|]/.test(label)) return false;
+  return true;
+}
+
 interface FavoriteRow {
   id: number;
   chain_id_ref: number;
@@ -103,11 +123,18 @@ export async function POST(req: Request) {
         const chain = db.prepare("SELECT id FROM chains WHERE key=?").get(item.chain_key) as { id: number } | null;
         if (!chain) continue;
         
-        const poolAddr = String(item.pool_addr).trim().toLowerCase();
+        const poolAddrOriginal = String(item.pool_addr).trim().toLowerCase();
         const stakerAddr = String(item.staker_addr || "").trim().toLowerCase();
         const npmAddr = String(item.npm_addr || "").trim().toLowerCase();
         const label = String(item.label || "").trim();
         const sortOrder = Number(item.sort_order) || 0;
+
+        // 入参校验：拒绝非法地址和可疑 label
+        if (!isValidEvmAddress(poolAddrOriginal)) continue;
+        if (!isValidEvmAddress(stakerAddr)) continue;
+        if (!isValidEvmAddress(npmAddr)) continue;
+        if (!isValidLabel(label)) continue;
+        const poolAddr = poolAddrOriginal; // 校验通过后赋值
         
 // 检查是否已存在 - 使用 try/catch 避免 TypeScript 类型错误
         let existing: { id: number } | null = null;
@@ -146,16 +173,22 @@ export async function POST(req: Request) {
   const b = await getBody<{ chain_id?: number; label?: string; pool?: string; staker?: string; npm?: string; sort_order?: number }>(req);
   if (!b.chain_id) return fail("缺少 chain_id");
   if (!b.pool) return fail("缺少 pool 地址");
-  const db = getDb();
   const pool = String(b.pool).trim().toLowerCase();
   const staker = String(b.staker || "").trim().toLowerCase();
   const npm = String(b.npm || "").trim().toLowerCase();
+  const label = String(b.label || "").trim();
   const sortOrder = Number(b.sort_order) || 0;
+  // 入参校验：拒绝非法地址和可疑 label
+  if (!isValidEvmAddress(pool)) return fail("pool 地址格式非法");
+  if (!isValidEvmAddress(staker)) return fail("staker 地址格式非法");
+  if (!isValidEvmAddress(npm)) return fail("npm 地址格式非法");
+  if (!isValidLabel(label)) return fail("label 含非法字符");
+  const db = getDb();
   try {
     const info = db.prepare(
       `INSERT INTO liquidity_favorites (chain_id_ref, label, pool_addr, staker_addr, npm_addr, sort_order)
        VALUES (?,?,?,?,?,?)`
-    ).run(Number(b.chain_id), String(b.label || "").trim(), pool, staker, npm, sortOrder);
+    ).run(Number(b.chain_id), label, pool, staker, npm, sortOrder);
     return ok({ id: info.lastInsertRowid });
   } catch {
     return fail("该 chain+pool+staker 组合已收藏");
