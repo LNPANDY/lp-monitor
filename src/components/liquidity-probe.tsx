@@ -316,9 +316,6 @@ export function LiquidityProbe() {
   const displayCexQuote1 = result?.cex
     ? (flip ? result.cex.token0Price : result.cex.token1Price) ?? 0
     : 0;
-  const displayCexQuoteLabel = result?.cex
-    ? (flip ? result.cex.token1Quote || result.cex.token0Quote : result.cex.token0Quote || result.cex.token1Quote) || ""
-    : "";
   // 翻转后流动性 amount0/amount1 也要交换：amount0 对应 token0，翻转后显示口径为 token1/token0
   const displayAmount0 = result ? (flip ? result.liquidity.amount1 : result.liquidity.amount0) : "";
   const displayAmount1 = result ? (flip ? result.liquidity.amount0 : result.liquidity.amount1) : "";
@@ -439,11 +436,11 @@ export function LiquidityProbe() {
                     {f.label || pairLabel}
                   </button>
                   <button
-                    className={f.monitor_cex ? "text-primary" : "text-ink-soft hover:text-primary"}
+                    className={`rounded px-1 ${f.monitor_cex ? "bg-primary text-white" : "bg-slate-200 text-ink-soft hover:bg-primary/20"}`}
                     title={f.monitor_cex ? "快速扫描监控：开（点击关闭）" : "快速扫描监控：关（点击开启，池价与 CEX 差价过大时推送提醒）"}
                     onClick={() => toggleFavoriteMonitor(f)}
                   >
-                    📡
+                    {f.monitor_cex ? "监控中" : "监控"}
                   </button>
                   <button
                     className="text-ink-soft hover:text-warn"
@@ -492,11 +489,9 @@ export function LiquidityProbe() {
               </PRow>
             )}
             {result.cex && displayCexQuote0 > 0 && displayCexQuote1 > 0 && (
-              <PRow label="CEX 报价">
+              <PRow label={`CEX 报价比值 (${displayToken0Cex}/${displayToken1Cex})`}>
                 <span>
-                  {displayToken0Cex}: {fmtFull(displayCexQuote0)}{displayCexQuoteLabel ? " " + displayCexQuoteLabel : ""}
-                  {" · "}
-                  {displayToken1Cex}: {fmtFull(displayCexQuote1)}
+                  {fmtFull(displayCexQuote0)} / {fmtFull(displayCexQuote1)} = <span className="font-semibold">{fmtFull(displayCexRate)}</span>
                 </span>
               </PRow>
             )}
