@@ -195,35 +195,41 @@ function DexesSection() {
   const { data: chains } = useSWR<any[]>("/api/chains", fetcher);
   const [chainId, setChainId] = useState<number | "">("");
   const { data: dexes } = useSWR<any[]>(chainId ? `/api/dexes?chain_id=${chainId}` : "/api/dexes", fetcher);
-  const [form, setForm] = useState({ name: "", factory: "", npm: "", type: "v3-fork" });
+  const [form, setForm] = useState({ name: "", factory: "", npm: "", type: "v3-fork", stateview: "" });
   const [err, setErr] = useState("");
 
   async function add() {
     setErr("");
-    try { await api("/api/dexes", "POST", { chain_id: Number(chainId), ...form }); setForm({ name: "", factory: "", npm: "", type: "v3-fork" }); mutate(chainId ? `/api/dexes?chain_id=${chainId}` : "/api/dexes"); }
+    try { await api("/api/dexes", "POST", { chain_id: Number(chainId), ...form }); setForm({ name: "", factory: "", npm: "", type: "v3-fork", stateview: "" }); mutate(chainId ? `/api/dexes?chain_id=${chainId}` : "/api/dexes"); }
     catch (e: any) { setErr(e.message); }
   }
 
   return (
     <section className="card p-5">
       <h2 className="mb-1 text-base font-semibold">DEX（集中流动性）</h2>
-      <p className="mb-3 text-xs text-ink-soft">兼容 Uniswap V3 NPM 的 DEX，填 factory + NPM 地址即可接入。</p>
+      <p className="mb-3 text-xs text-ink-soft">v3-fork：兼容 Uniswap V3 NPM 的 DEX，填 factory + NPM。v4：factory 填 PoolManager、npm 填 PositionManager，并需配置 StateView 地址。</p>
       <div className="mb-3"><Field label="按链筛选"><select className="input" value={chainId} onChange={(e) => setChainId(e.target.value ? Number(e.target.value) : "")}><option value="">全部链</option>{(chains ?? []).map((c: any) => <option key={c.id} value={c.id}>{c.name}</option>)}</select></Field></div>
       <div className="mb-3 grid grid-cols-2 gap-3 md:grid-cols-4">
-        <Field label="名称"><input className="input" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} placeholder="PancakeSwap V3" /></Field>
-        <Field label="Factory"><input className="input" value={form.factory} onChange={(e) => setForm({ ...form, factory: e.target.value })} placeholder="0x…" /></Field>
-        <Field label="NPM"><input className="input" value={form.npm} onChange={(e) => setForm({ ...form, npm: e.target.value })} placeholder="0x…" /></Field>
-        <Field label="类型"><select className="input" value={form.type} onChange={(e) => setForm({ ...form, type: e.target.value })}><option value="v3-fork">v3-fork</option></select></Field>
+        <Field label="名称"><input className="input" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} placeholder="Uniswap V4" /></Field>
+        <Field label={form.type === "v4" ? "PoolManager" : "Factory"}><input className="input" value={form.factory} onChange={(e) => setForm({ ...form, factory: e.target.value })} placeholder="0x…" /></Field>
+        <Field label={form.type === "v4" ? "PositionManager" : "NPM"}><input className="input" value={form.npm} onChange={(e) => setForm({ ...form, npm: e.target.value })} placeholder="0x…" /></Field>
+        <Field label="类型"><select className="input" value={form.type} onChange={(e) => setForm({ ...form, type: e.target.value })}><option value="v3-fork">v3-fork</option><option value="v4">v4</option></select></Field>
       </div>
-      <div className="mb-3 flex gap-2"><button className="btn-primary" onClick={add} disabled={!chainId || !form.name || !form.factory || !form.npm}>添加 DEX</button>{err && <span className="self-center text-sm text-warn">{err}</span>}</div>
+      {form.type === "v4" && (
+        <div className="mb-3">
+          <Field label="StateView 地址（v4 必填，读池状态用，跨链地址不同）"><input className="input" value={form.stateview} onChange={(e) => setForm({ ...form, stateview: e.target.value })} placeholder="0x…" /></Field>
+        </div>
+      )}
+      <div className="mb-3 flex gap-2"><button className="btn-primary" onClick={add} disabled={!chainId || !form.name || !form.factory || !form.npm || (form.type === "v4" && !form.stateview)}>添加 DEX</button>{err && <span className="self-center text-sm text-warn">{err}</span>}</div>
       <div className="space-y-2">
         {(dexes ?? []).map((d: any) => (
           <EditableRow
             key={d.id}
             fields={[
               { key: "name", label: "名称" },
-              { key: "factory", label: "Factory 地址" },
-              { key: "npm", label: "NPM 地址" },
+              { key: "factory", label: d.type === "v4" ? "PoolManager 地址" : "Factory 地址" },
+              { key: "npm", label: d.type === "v4" ? "PositionManager 地址" : "NPM 地址" },
+              ...(d.type === "v4" ? [{ key: "stateview", label: "StateView 地址" }] : []),
             ]}
             values={d}
             onSave={async (u) => { await api(`/api/dexes/${d.id}`, "PATCH", u); mutate(chainId ? `/api/dexes?chain_id=${chainId}` : "/api/dexes"); }}
@@ -231,6 +237,7 @@ function DexesSection() {
               <div className="flex items-center gap-2">
                 <span className="font-medium">{d.name}</span>
                 <span className="text-ink-soft">{d.chain_name}</span>
+                <span className="rounded bg-slate-100 px-1 text-xs text-ink-soft">{d.type}</span>
                 <span className="font-mono text-xs text-ink-soft">factory {short(d.factory)}</span>
               </div>
             }

@@ -178,7 +178,7 @@ async function processPosition(ctx: ScanCtx, dp: DiscoveredPosition): Promise<Sc
     const dex = dexes.find((d) => d.id === dp.dexId);
     if (!dex) return ctx;
     const adapter = getAdapter(dex.type);
-    const r = await adapter.readRange(client, { factory: dex.factory, npm: dex.npm }, BigInt(dp.tokenId));
+    const r = await adapter.readRange(client, { factory: dex.factory, npm: dex.npm, stateview: dex.stateview }, BigInt(dp.tokenId));
 
     const nowIso = new Date().toISOString();
     discovered++;  // 所有成功读到 readRange 的都计入 discovered（含 closed/unreadable）

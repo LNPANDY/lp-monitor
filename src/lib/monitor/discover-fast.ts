@@ -180,7 +180,7 @@ export async function runFastDiscover(opts: {
             }
             // DB 不存在 → 用 adapter.readRange 拿完整状态
             const adapter = getAdapter(dex.type);
-            const r = await adapter.readRange(client, { factory: dex.factory, npm: dex.npm }, BigInt(dp.tokenId));
+            const r = await adapter.readRange(client, { factory: dex.factory, npm: dex.npm, stateview: dex.stateview }, BigInt(dp.tokenId));
             if (r.kind === "unreadable") {
               // 只更新 last_checked_at 留给以后 readRange 成功时 INSERT；DB 没记录时不写
               continue;

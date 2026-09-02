@@ -365,7 +365,8 @@ async function getPositionStatus(
 
   const posData = await adapter.readRange(client, {
     factory: dex.factory || "",
-    npm: dex.npm || ""
+    npm: dex.npm || "",
+    stateview: dex.stateview || ""
   }, BigInt(position.token_id));
 
   // 获取 decimals

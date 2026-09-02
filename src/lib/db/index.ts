@@ -315,6 +315,8 @@ function migrate(db: DB) {
   safeAddColumn(db, "staking_contracts", "dex_id", "INTEGER REFERENCES dexes(id) ON DELETE SET NULL");
   // liquidity_favorites 快速扫描监控开关：加入后每次合并扫描对该池做 CEX 价差对比
   safeAddColumn(db, "liquidity_favorites", "monitor_cex", "INTEGER NOT NULL DEFAULT 0");
+  // dexes 表 Uniswap v4 支持：StateView lens 合约地址（v4 池状态读取，跨链地址不同需配置）
+  safeAddColumn(db, "dexes", "stateview", "TEXT NOT NULL DEFAULT ''");
 
   // push_states 重建迁移：加 entity_type 区分仓位/收藏池实体
   migratePushStatesEntityType(db);

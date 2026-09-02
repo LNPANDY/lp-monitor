@@ -4,9 +4,10 @@ export interface DexRow {
   id: number;
   chain_id_ref: number;
   name: string;
-  type: string; // 'v3-fork'
+  type: string; // 'v3-fork' | 'v4'
   factory: string;
-  npm: string; // NonfungiblePositionManager
+  npm: string; // v3: NonfungiblePositionManager；v4: PositionManager
+  stateview?: string; // v4: StateView lens 合约地址（读池状态用，跨链地址不同）
   enabled: number;
 }
 

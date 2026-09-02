@@ -21,6 +21,9 @@ export interface TokenMeta {
 
 const _mem = new Map<string, TokenMeta>(); // key: `${chainDbId}:${addressLower}`
 
+/** 零地址：v4 池的 currency0 可能为原生币（v3 包装为 WETH，v4 直接用 address(0)） */
+export const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
+
 /** 批量解析多个 token 的元数据（带缓存）。失败的 token 回退为地址缩写。 */
 export async function resolveTokens(
   client: PublicClient,
@@ -34,6 +37,18 @@ export async function resolveTokens(
     const addr = raw.toLowerCase();
     const key = `${chainDbId}:${addr}`;
     if (_mem.has(key)) { out.set(addr, _mem.get(key)!); continue; }
+    // 零地址特判：v4 原生币，用链配置的 symbol + 18 decimals，不写 tokens 表（chains 表是配置源）
+    if (addr === ZERO_ADDRESS) {
+      const chain = db.prepare("SELECT symbol, name FROM chains WHERE id=?").get(chainDbId) as { symbol: string; name: string } | undefined;
+      const m: TokenMeta = {
+        address: addr,
+        symbol: chain?.symbol || "ETH",
+        name: `Native ${chain?.symbol || "ETH"}`,
+        decimals: 18,
+      };
+      _mem.set(key, m); out.set(addr, m);
+      continue;
+    }
     const row = db.prepare("SELECT * FROM tokens WHERE chain_id_ref=? AND address=?").get(chainDbId, addr) as any;
     if (row && row.symbol) {
       const m = { address: addr, symbol: row.symbol, name: row.name, decimals: row.decimals };
