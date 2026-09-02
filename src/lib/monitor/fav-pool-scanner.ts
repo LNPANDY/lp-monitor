@@ -193,9 +193,9 @@ export async function scanFavoritePools(): Promise<FavPoolScanSummary> {
           ).get(chainIdRef, dexName, token0.toLowerCase(), token1.toLowerCase());
           if (flipRow) flipped = true;
 
-          // 6. 静音检查（与仓位推送一致）
-          const muteKey = `${token0.toLowerCase()}|${token1.toLowerCase()}`;
-          if (mutedPairs.has(muteKey)) continue;
+          // 6. 不做静音检查：收藏池是用户手动逐个开启监控的白名单，
+          //    cex_alert_mutes 静音表是给仓位自动推送降噪用的；想停某收藏池
+          //    的推送直接关闭其 monitor_cex 开关即可。
 
           // 7. 超阈值 → 推送（fav_cex_price 冷却，entity_type=fav_pool）
           if (cexPriceInfo && cexPriceInfo.exceedsThreshold) {
