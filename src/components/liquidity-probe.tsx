@@ -436,11 +436,11 @@ export function LiquidityProbe() {
                     {f.label || pairLabel}
                   </button>
                   <button
-                    className={`rounded px-1 ${f.monitor_cex ? "bg-primary text-white" : "bg-slate-200 text-ink-soft hover:bg-primary/20"}`}
-                    title={f.monitor_cex ? "快速扫描监控：开（点击关闭）" : "快速扫描监控：关（点击开启，池价与 CEX 差价过大时推送提醒）"}
+                    className={`rounded px-1 ${f.monitor_cex ? "bg-[#b8860b] text-white" : "bg-slate-200 text-ink-soft hover:bg-slate-300"}`}
+                    title={f.monitor_cex ? "快速扫描监控：已开启（点击取消）" : "快速扫描监控：未开启（点击开启，池价与 CEX 差价过大时推送提醒）"}
                     onClick={() => toggleFavoriteMonitor(f)}
                   >
-                    {f.monitor_cex ? "监控中" : "监控"}
+                    {f.monitor_cex ? "已监控" : "监控"}
                   </button>
                   <button
                     className="text-ink-soft hover:text-warn"
