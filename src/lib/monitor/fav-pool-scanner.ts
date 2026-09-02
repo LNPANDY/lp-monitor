@@ -74,18 +74,36 @@ function buildFavCexNotification(opts: {
   cexQuote1?: CexQuote;
 }): { title: string; body: string } {
   const { chainName, poolAddr, label, sym0, sym1, payload, flipped, cexQuote0, cexQuote1 } = opts;
-  const pairLabel = flipped ? `${sym1}/${sym0}` : `${sym0}/${sym1}`;
+  const fmtFull = (n: number) => {
+    if (!Number.isFinite(n)) return "—";
+    let s = Math.abs(n) < 1 ? n.toFixed(18) : n.toFixed(8);
+    if (s.indexOf(".") >= 0) s = s.replace(/0+$/, "").replace(/\.$/, "");
+    return s;
+  };
+
+  // 翻转处理与仓位版 buildCexPriceNotification 完全一致：
+  // 展示口径变为「1 sym1 = ? sym0」，汇率取倒数，符号/CEX symbol/报价全部换侧
+  const label0 = flipped ? sym1 : sym0;
+  const label1 = flipped ? sym0 : sym1;
+  const pairLabel = `${label0}/${label1}`;
   const name = label || pairLabel;
+  const dexRate = flipped ? 1 / payload.dexRate : payload.dexRate;
+  const cexRate = flipped ? 1 / payload.cexRate : payload.cexRate;
+  const cexSym0 = flipped ? payload.token1CexSymbol : payload.token0CexSymbol;
+  const cexSym1 = flipped ? payload.token0CexSymbol : payload.token1CexSymbol;
   const pct = (payload.absDiff * 100).toFixed(2);
   const direction = payload.diff > 0 ? "DEX 高于 CEX" : "DEX 低于 CEX";
-  const q0 = cexQuote0 ? `${payload.token0CexSymbol}=${cexQuote0.price}${cexQuote0.quote ? " " + cexQuote0.quote : ""}` : payload.token0CexSymbol;
-  const q1 = cexQuote1 ? `${payload.token1CexSymbol}=${cexQuote1.price}${cexQuote1.quote ? " " + cexQuote1.quote : ""}` : payload.token1CexSymbol;
+  // 报价跟随换侧：展示顺序与 label0/label1 对应
+  const q0Raw = flipped ? cexQuote1 : cexQuote0;
+  const q1Raw = flipped ? cexQuote0 : cexQuote1;
+  const q0 = q0Raw ? `${cexSym0}=${q0Raw.price}${q0Raw.quote ? " " + q0Raw.quote : ""}` : cexSym0;
+  const q1 = q1Raw ? `${cexSym1}=${q1Raw.price}${q1Raw.quote ? " " + q1Raw.quote : ""}` : cexSym1;
   return {
     title: `收藏池价差预警 ${name} · ${chainName}`,
     body: [
       `${name} 池价与 CEX 价差 ${pct}%（${direction}），超过动态阈值`,
-      `DEX: 1 ${sym0} = ${payload.dexRate.toPrecision(8)} ${sym1}`,
-      `CEX: 1 ${sym0} = ${payload.cexRate.toPrecision(8)} ${sym1}`,
+      `DEX: 1 ${label0} = ${fmtFull(dexRate)} ${label1}`,
+      `CEX: 1 ${label0} = ${fmtFull(cexRate)} ${label1}`,
       `报价: ${q0} · ${q1}`,
       `池子: ${poolAddr}`,
     ].join("\n"),
@@ -183,14 +201,20 @@ export async function scanFavoritePools(): Promise<FavPoolScanSummary> {
           );
 
           // 5. pair_flip（与探针 API 同款宽匹配）
+          //    dexName 通过 npm_addr 反查；npm_addr 为空时 dexName=''，
+          //    此时需匹配该 token 对的全部翻转记录（不限 dex），否则永远匹配不上
           let flipped = false;
           const dexRow = fav.npm_addr
             ? db.prepare("SELECT name FROM dexes WHERE chain_id_ref=? AND LOWER(npm)=LOWER(?)").get(chainIdRef, fav.npm_addr) as { name: string } | undefined
             : undefined;
           const dexName = dexRow?.name ?? "";
-          const flipRow = db.prepare(
-            "SELECT id FROM pair_flips WHERE chain_id_ref=? AND (dex_name=? OR dex_name='') AND token0=? AND token1=?"
-          ).get(chainIdRef, dexName, token0.toLowerCase(), token1.toLowerCase());
+          const flipRow = dexName
+            ? db.prepare(
+                "SELECT id FROM pair_flips WHERE chain_id_ref=? AND (dex_name=? OR dex_name='') AND token0=? AND token1=?"
+              ).get(chainIdRef, dexName, token0.toLowerCase(), token1.toLowerCase())
+            : db.prepare(
+                "SELECT id FROM pair_flips WHERE chain_id_ref=? AND token0=? AND token1=?"
+              ).get(chainIdRef, token0.toLowerCase(), token1.toLowerCase());
           if (flipRow) flipped = true;
 
           // 6. 不做静音检查：收藏池是用户手动逐个开启监控的白名单，
