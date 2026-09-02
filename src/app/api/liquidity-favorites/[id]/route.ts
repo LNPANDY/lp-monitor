@@ -3,9 +3,9 @@ import { ok, fail, getBody } from "@/lib/api";
 
 export const dynamic = "force-dynamic";
 
-/** 更新收藏（label / staker / npm / sort_order 任一）。 */
+/** 更新收藏（label / staker / npm / sort_order / monitor_cex 任一）。 */
 export async function PATCH(req: Request, { params }: { params: { id: string } }) {
-  const b = await getBody<{ label?: string; pool?: string; staker?: string; npm?: string; sort_order?: number }>(req);
+  const b = await getBody<{ label?: string; pool?: string; staker?: string; npm?: string; sort_order?: number; monitor_cex?: number }>(req);
   const db = getDb();
   const sets: string[] = [];
   const args: any[] = [];
@@ -14,6 +14,7 @@ export async function PATCH(req: Request, { params }: { params: { id: string } }
   if (b.staker !== undefined) { sets.push("staker_addr=?"); args.push(String(b.staker).trim().toLowerCase()); }
   if (b.npm !== undefined) { sets.push("npm_addr=?"); args.push(String(b.npm).trim().toLowerCase()); }
   if (b.sort_order !== undefined) { sets.push("sort_order=?"); args.push(Number(b.sort_order) || 0); }
+  if (b.monitor_cex !== undefined) { sets.push("monitor_cex=?"); args.push(b.monitor_cex ? 1 : 0); }
   if (sets.length === 0) return fail("无更新字段");
   args.push(params.id);
   db.prepare(`UPDATE liquidity_favorites SET ${sets.join(", ")} WHERE id=?`).run(...args);

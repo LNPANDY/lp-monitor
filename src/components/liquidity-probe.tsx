@@ -38,6 +38,11 @@ interface CexPricePayload {
   diff: number;
   absDiff: number;
   exceedsThreshold?: boolean;
+  // CEX 单边报价（"CEX 报价"行显示用）
+  token0Price?: number;
+  token1Price?: number;
+  token0Quote?: string;
+  token1Quote?: string;
 }
 
 interface Chain {
@@ -67,6 +72,7 @@ interface Favorite {
   token0_symbol?: string;
   token1_symbol?: string;
   fee?: number | null;
+  monitor_cex?: number;
 }
 
 /** 展开小数，避免科学计数法 */
@@ -279,6 +285,20 @@ export function LiquidityProbe() {
     }
   }
 
+  /** 切换收藏池的快速扫描监控开关（monitor_cex） */
+  async function toggleFavoriteMonitor(f: Favorite) {
+    try {
+      await fetch(`/api/liquidity-favorites/${f.id}`, {
+        method: "PATCH",
+        headers: authHeaders({ "Content-Type": "application/json" }),
+        body: JSON.stringify({ monitor_cex: f.monitor_cex ? 0 : 1 }),
+      });
+      reloadFav();
+    } catch {
+      // ignore
+    }
+  }
+
   // 探针结果：翻转后的展示计算
   const displaySym0 = result ? (flip ? result.token1Symbol : result.token0Symbol) : "";
   const displaySym1 = result ? (flip ? result.token0Symbol : result.token1Symbol) : "";
@@ -289,6 +309,16 @@ export function LiquidityProbe() {
   const displayCexRate = result?.cex ? (flip ? 1 / result.cex.cexRate : result.cex.cexRate) : 0;
   const displayToken0Cex = result?.cex ? (flip ? result.cex.token1CexSymbol : result.cex.token0CexSymbol) : "";
   const displayToken1Cex = result?.cex ? (flip ? result.cex.token0CexSymbol : result.cex.token1CexSymbol) : "";
+  // CEX 单边报价（跟随翻转换侧：displayToken0Cex 对应取对侧 token 的报价）
+  const displayCexQuote0 = result?.cex
+    ? (flip ? result.cex.token1Price : result.cex.token0Price) ?? 0
+    : 0;
+  const displayCexQuote1 = result?.cex
+    ? (flip ? result.cex.token0Price : result.cex.token1Price) ?? 0
+    : 0;
+  const displayCexQuoteLabel = result?.cex
+    ? (flip ? result.cex.token1Quote || result.cex.token0Quote : result.cex.token0Quote || result.cex.token1Quote) || ""
+    : "";
   // 翻转后流动性 amount0/amount1 也要交换：amount0 对应 token0，翻转后显示口径为 token1/token0
   const displayAmount0 = result ? (flip ? result.liquidity.amount1 : result.liquidity.amount0) : "";
   const displayAmount1 = result ? (flip ? result.liquidity.amount0 : result.liquidity.amount1) : "";
@@ -395,7 +425,11 @@ export function LiquidityProbe() {
               return (
                 <span
                   key={f.id}
-                  className="inline-flex items-center gap-1 rounded border border-slate-200 bg-slate-50 px-2 py-1 text-xs"
+                  className={`inline-flex items-center gap-1 rounded border px-2 py-1 text-xs ${
+                    f.monitor_cex
+                      ? "border-primary/50 bg-primary/10"
+                      : "border-slate-200 bg-slate-50"
+                  }`}
                 >
                   <button
                     className="hover:text-ink"
@@ -403,6 +437,13 @@ export function LiquidityProbe() {
                     onClick={() => applyFavoriteAndProbe(f)}
                   >
                     {f.label || pairLabel}
+                  </button>
+                  <button
+                    className={f.monitor_cex ? "text-primary" : "text-ink-soft hover:text-primary"}
+                    title={f.monitor_cex ? "快速扫描监控：开（点击关闭）" : "快速扫描监控：关（点击开启，池价与 CEX 差价过大时推送提醒）"}
+                    onClick={() => toggleFavoriteMonitor(f)}
+                  >
+                    📡
                   </button>
                   <button
                     className="text-ink-soft hover:text-warn"
@@ -448,6 +489,15 @@ export function LiquidityProbe() {
             {result.cex && displayToken0Cex && displayToken1Cex && (
               <PRow label={`CEX 汇率 (${displayToken0Cex}÷${displayToken1Cex})`}>
                 <span>1 {displaySym0} = {fmtFull(displayCexRate)} {displaySym1}</span>
+              </PRow>
+            )}
+            {result.cex && displayCexQuote0 > 0 && displayCexQuote1 > 0 && (
+              <PRow label="CEX 报价">
+                <span>
+                  {displayToken0Cex}: {fmtFull(displayCexQuote0)}{displayCexQuoteLabel ? " " + displayCexQuoteLabel : ""}
+                  {" · "}
+                  {displayToken1Cex}: {fmtFull(displayCexQuote1)}
+                </span>
               </PRow>
             )}
             {result.cex && (

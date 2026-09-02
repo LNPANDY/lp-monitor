@@ -30,6 +30,39 @@ function safeAddColumn(db: DB, table: string, column: string, type: string) {
   }
 }
 
+/**
+ * push_states 重建迁移：老表 UNIQUE(position_id, alert_type) 无法区分
+ * 仓位实体与收藏池实体（两者的 id 空间独立，可能撞号）。
+ * 重建为 UNIQUE(entity_type, position_id, alert_type)，旧数据自动带 entity_type='position'。
+ * 幂等：检测 entity_type 列存在即跳过。
+ */
+function migratePushStatesEntityType(db: DB) {
+  const cols = db.prepare("PRAGMA table_info(push_states)").all() as { name: string }[];
+  if (cols.some((c) => c.name === "entity_type")) return; // 已迁移
+  try {
+    db.exec(`
+      CREATE TABLE push_states_new (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        entity_type   TEXT NOT NULL DEFAULT 'position',
+        position_id   INTEGER NOT NULL,
+        alert_type    TEXT NOT NULL,
+        last_push_time TEXT   NOT NULL DEFAULT (datetime('now')),
+        last_alert_state TEXT NOT NULL DEFAULT '',
+        UNIQUE(entity_type, position_id, alert_type)
+      );
+      INSERT INTO push_states_new (entity_type, position_id, alert_type, last_push_time, last_alert_state)
+        SELECT 'position', position_id, alert_type, last_push_time, COALESCE(last_alert_state, '') FROM push_states;
+      DROP TABLE push_states;
+      ALTER TABLE push_states_new RENAME TO push_states;
+      CREATE INDEX IF NOT EXISTS idx_push_states_position ON push_states(position_id);
+      CREATE INDEX IF NOT EXISTS idx_push_states_time ON push_states(last_push_time);
+    `);
+  } catch (e) {
+    // 迁移失败不阻塞启动（表可能刚好被并发迁移）
+    console.error("[db] push_states entity_type migration failed:", e);
+  }
+}
+
 function migrate(db: DB) {
   db.exec(`
     CREATE TABLE IF NOT EXISTS chains (
@@ -243,12 +276,16 @@ function migrate(db: DB) {
     );
 
     -- 推送状态记录：用于控制相同告警的推送频次，避免重复推送
+    -- entity_type 区分实体：'position'=仓位 | 'fav_pool'=流动性探针收藏池
+    -- position_id 列语义为实体 id（仓位 id 或收藏 id）
     CREATE TABLE IF NOT EXISTS push_states (
       id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      entity_type   TEXT NOT NULL DEFAULT 'position',
       position_id   INTEGER NOT NULL,
-      alert_type    TEXT NOT NULL,               -- 'cex_diff' | 'tick_move' | 'out_of_range' | 're_in_range' | 'closed'
+      alert_type    TEXT NOT NULL,               -- 'cex_price' | 'tick_move' | 'out_of_range' | 're_in_range' | 'closed' | 'fav_cex_price'
       last_push_time TEXT   NOT NULL DEFAULT (datetime('now')),
-      UNIQUE(position_id, alert_type)
+      last_alert_state TEXT NOT NULL DEFAULT '',
+      UNIQUE(entity_type, position_id, alert_type)
     );
     CREATE INDEX IF NOT EXISTS idx_push_states_position ON push_states(position_id);
     CREATE INDEX IF NOT EXISTS idx_push_states_time ON push_states(last_push_time);
@@ -276,6 +313,11 @@ function migrate(db: DB) {
   safeAddColumn(db, "token_symbols", "inverted", "INTEGER NOT NULL DEFAULT 0");
   // staking_contracts 关联 DEX：合约直查时需要知道用哪个 DEX 的 NPM ABI
   safeAddColumn(db, "staking_contracts", "dex_id", "INTEGER REFERENCES dexes(id) ON DELETE SET NULL");
+  // liquidity_favorites 快速扫描监控开关：加入后每次合并扫描对该池做 CEX 价差对比
+  safeAddColumn(db, "liquidity_favorites", "monitor_cex", "INTEGER NOT NULL DEFAULT 0");
+
+  // push_states 重建迁移：加 entity_type 区分仓位/收藏池实体
+  migratePushStatesEntityType(db);
 
   seedDefaults(db);
 }

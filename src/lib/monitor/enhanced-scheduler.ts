@@ -18,12 +18,14 @@ import cron from "node-cron";
 import { scanKnownPositions, type KnownPositionsSummary } from "./known-positions-scanner";
 import { runScan, type ScanSummary } from "./scanner";
 import { runFastDiscover, type FastDiscoverSummary } from "./discover-fast";
+import { scanFavoritePools, type FavPoolScanSummary } from "./fav-pool-scanner";
 import { getScanCron } from "../db/settings";
 import { getSetting, setSetting } from "../db/settings";
 
 /** 合并扫描的统一摘要 */
 export interface CombinedScanSummary {
   fast: FastDiscoverSummary | null;  // 可能因 fast 内部异常而 null
+  favPools?: FavPoolScanSummary;      // 收藏池监控（Step 1.5，失败时缺省）
   known: KnownPositionsSummary | null; // 同上
   startedAt: string;
   durationMs: number;
@@ -206,6 +208,7 @@ async function runCombinedScanWrapper() {
   const startedAt = Date.now();
 
   let fastSummary: FastDiscoverSummary | null = null;
+  let favPoolsSummary: FavPoolScanSummary | null = null;
   let knownSummary: KnownPositionsSummary | null = null;
   let combinedError: string | undefined;
 
@@ -220,6 +223,15 @@ async function runCombinedScanWrapper() {
     s.hasFastScanFirstDone = true;
     console.log(`[scheduler-enhanced] fast discover done: new=${fastSummary.newInserted} source_changed=${fastSummary.sourceChanged} closed=${fastSummary.closed} (${Date.now()-tFast0}ms)`);
 
+    // ===== Step 1.5: 收藏池监控（CEX 价差告警，独立 try/catch 失败不影响后续步骤）=====
+    const tFav0 = Date.now();
+    try {
+      favPoolsSummary = await scanFavoritePools();
+      console.log(`[scheduler-enhanced] fav pools done: checked=${favPoolsSummary.checked} alerted=${favPoolsSummary.alerted} (${Date.now()-tFav0}ms)`);
+    } catch (e: any) {
+      console.error("[scheduler-enhanced] fav pools scan failed:", e);
+    }
+
     // ===== Step 2: known scan =====
     const tKnown0 = Date.now();
     knownSummary = await scanKnownPositions();
@@ -233,6 +245,7 @@ async function runCombinedScanWrapper() {
 
   const summary: CombinedScanSummary = {
     fast: fastSummary,
+    favPools: favPoolsSummary ?? undefined,
     known: knownSummary,
     startedAt: new Date(startedAt).toISOString(),
     durationMs: Date.now() - startedAt,

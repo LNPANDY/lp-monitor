@@ -119,6 +119,11 @@ export async function POST(req: Request) {
           diff,
           absDiff,
           exceedsThreshold: absDiff >= threshold,
+          // CEX 单边报价（前端"CEX 报价"行显示用）
+          token0Price: q0.price,
+          token1Price: q1.price,
+          token0Quote: q0.quote,
+          token1Quote: q1.quote,
         };
       }
     }
