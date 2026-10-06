@@ -1,7 +1,7 @@
 "use client";
 import { useState } from "react";
 import useSWR, { mutate } from "swr";
-import { fetcher, short, fmtFull } from "@/components/util";
+import { fetcher, authHeaders, short, fmtFull } from "@/components/util";
 import { api, Field } from "@/components/form";
 import { EditableRow } from "@/components/editable-row";
 
@@ -48,7 +48,7 @@ function IoSection() {
     reader.onload = async () => {
       try {
         const bundle = JSON.parse(String(reader.result));
-        const r = await fetch("/api/config", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(bundle) });
+        const r = await fetch("/api/config", { method: "POST", headers: authHeaders({ "Content-Type": "application/json" }), body: JSON.stringify(bundle) });
         const j = await r.json(); if (!j.ok) throw new Error(j.error);
         const d = j.data;
         let extraInfo = "";
@@ -331,7 +331,7 @@ function ScanSettingsSection() {
     try {
       const r = await fetch("/api/scan-settings", {
         method: "PUT",
-        headers: { "Content-Type": "application/json" },
+        headers: authHeaders({ "Content-Type": "application/json" }),
         body: JSON.stringify(updates)
       });
       const j = await r.json();
