@@ -3,6 +3,9 @@ import { useState } from "react";
 import useSWR from "swr";
 import { fetcher, authHeaders, short, timeAgo, fmtFull } from "@/components/util";
 
+/** 推送冷却可选值（分钟） */
+const COOLDOWN_OPTIONS = [2, 5, 10, 20, 30, 60];
+
 /** 将常见的 cron 表达式转为人类可读标签 */
 function cronToLabel(cron: string): string {
   const m = cron.trim();
@@ -424,17 +427,18 @@ function ScanIntervalAndAlerts({ combinedCron, onChanged }: { combinedCron: stri
     } finally { setBusy(false); }
   }
 
-  async function applyPushCooldown(minutes: number) {
+  /** 更新某一类告警的推送冷却（三类分组：CEX价差 / 区间状态 / 区间波动） */
+  async function applyCooldown(field: "cooldown_cex" | "cooldown_range_state" | "cooldown_tick_move", minutes: number) {
     setBusy(true); setMsg("");
     try {
       const r = await fetch("/api/alert-settings", {
         method: "PUT",
         headers: authHeaders({ "Content-Type": "application/json" }),
-        body: JSON.stringify({ push_cooldown_minutes: minutes }),
+        body: JSON.stringify({ [field]: minutes }),
       });
       const j = await r.json();
       if (!j.ok) throw new Error(j.error);
-      setMsg(`✅ 推送冷却时间已更新为 ${minutes} 分钟`);
+      setMsg(`✅ 冷却时间已更新为 ${minutes} 分钟`);
       mutateAlerts();
     } catch (e: any) {
       setMsg(`❌ ${e.message}`);
@@ -509,22 +513,42 @@ function ScanIntervalAndAlerts({ combinedCron, onChanged }: { combinedCron: stri
           <span className="text-xs text-ink-soft">超过费率 2 倍时提醒</span>
         </div>
 
-        {/* 推送冷却时间 */}
-        <div className="flex items-center gap-2">
+        {/* 推送冷却时间：三类分组，各自独立控制 */}
+        <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
           <span className="text-sm font-medium">推送冷却：</span>
-          <select
-            className="input max-w-[120px] text-xs"
-            value={alertData?.push_cooldown_minutes || 2}
-            onChange={(e) => applyPushCooldown(Number(e.target.value))}
-            disabled={busy}
-          >
-            <option value="2">2分钟</option>
-            <option value="5">5分钟</option>
-            <option value="10">10分钟</option>
-            <option value="20">20分钟</option>
-            <option value="30">30分钟</option>
-          </select>
-          <span className="text-xs text-ink-soft">相同告警间隔</span>
+          <label className="flex items-center gap-1 text-xs">
+            <span className="text-ink-soft">CEX价差</span>
+            <select
+              className="input max-w-[92px] text-xs"
+              value={alertData?.cooldown_cex ?? 2}
+              onChange={(e) => applyCooldown("cooldown_cex", Number(e.target.value))}
+              disabled={busy}
+            >
+              {COOLDOWN_OPTIONS.map((m) => <option key={m} value={m}>{m}分钟</option>)}
+            </select>
+          </label>
+          <label className="flex items-center gap-1 text-xs">
+            <span className="text-ink-soft">区间状态</span>
+            <select
+              className="input max-w-[92px] text-xs"
+              value={alertData?.cooldown_range_state ?? 30}
+              onChange={(e) => applyCooldown("cooldown_range_state", Number(e.target.value))}
+              disabled={busy}
+            >
+              {COOLDOWN_OPTIONS.map((m) => <option key={m} value={m}>{m}分钟</option>)}
+            </select>
+          </label>
+          <label className="flex items-center gap-1 text-xs">
+            <span className="text-ink-soft">区间波动</span>
+            <select
+              className="input max-w-[92px] text-xs"
+              value={alertData?.cooldown_tick_move ?? 10}
+              onChange={(e) => applyCooldown("cooldown_tick_move", Number(e.target.value))}
+              disabled={busy}
+            >
+              {COOLDOWN_OPTIONS.map((m) => <option key={m} value={m}>{m}分钟</option>)}
+            </select>
+          </label>
         </div>
       </div>
 

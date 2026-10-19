@@ -321,56 +321,12 @@ function StakingSection() {
 
 /* ============ 扫描设置 ============ */
 function ScanSettingsSection() {
-  const { data: settings, mutate } = useSWR<any>("/api/scan-settings", fetcher);
-  const [busy, setBusy] = useState(false);
-  const [msg, setMsg] = useState("");
-
-  const handleSave = async (updates: any) => {
-    setMsg("");
-    setBusy(true);
-    try {
-      const r = await fetch("/api/scan-settings", {
-        method: "PUT",
-        headers: authHeaders({ "Content-Type": "application/json" }),
-        body: JSON.stringify(updates)
-      });
-      const j = await r.json();
-      if (!j.ok) throw new Error(j.error);
-      setMsg("✅ 设置已保存");
-      mutate();
-    } catch (e: any) {
-      setMsg(`❌ 保存失败：${e.message}`);
-    } finally {
-      setBusy(false);
-    }
-  };
-
   return (
     <section className="card p-5">
       <h2 className="mb-1 text-base font-semibold">扫描设置</h2>
-      <p className="mb-3 text-xs text-ink-soft">配置扫描相关参数</p>
-
-      <div className="space-y-4">
-        <div>
-          <label className="block mb-1 text-sm font-medium">
-            默认推送冷却（分钟）
-          </label>
-          <input
-            type="number"
-            min="1"
-            max="60"
-            value={settings?.push_cooldown_minutes || 2}
-            onChange={(e) => handleSave({ push_cooldown_minutes: Number(e.target.value) })}
-            className="input"
-          />
-          <p className="mt-1 text-xs text-ink-soft">
-            默认推送冷却时间，1-60分钟。各类告警可单独配置覆盖此值。
-          </p>
-        </div>
-      </div>
-
-      {busy && <span className="text-sm text-ink-soft">保存中…</span>}
-      {msg && <p className="mt-2 text-sm">{msg}</p>}
+      <p className="text-xs text-ink-soft">
+        推送冷却（CEX价差 / 区间状态 / 区间波动）统一在<strong>仪表盘</strong>的告警区配置。
+      </p>
     </section>
   );
 }
