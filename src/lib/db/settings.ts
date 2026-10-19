@@ -53,31 +53,21 @@ export function getPushCooldownMinutes(): number {
 
 /**
  * 获取指定告警类型的冷却时间（分钟）。
- * 优先级：用户显式配置的独立 cooldown_<type> > 全局 push_cooldown_minutes > 默认值 2。
+ * 优先级：独立配置 cooldown_<type> > 全局 push_cooldown_minutes > 默认 2。
  *
- * 说明：历史上部署时用 safeAddColumn 写入了硬编码默认值（cex_price=2, out_of_range=30,
- * tick_move=10, re_in_range=30）。这些"默认值"在 app_settings 表里与用户显式设置的值
- * 无法区分。为了让前端修改的全局冷却（push_cooldown_minutes）能立即生效，
- * 这里对"等于历史硬编码默认值"的独立配置做回退：只要独立配置等于历史默认值，
- * 就忽略它，回退到全局配置。用户若再次通过 API 修改，写入的值（除非正好等于
- * 历史默认）会被视为显式配置而生效。
+ * 说明：早期为防止历史硬编码默认值（cex_price=2, out_of_range=30, tick_move=10,
+ * re_in_range=30）覆盖用户在 UI 上改的全局冷却，曾对"等于历史默认值"的独立配置
+ * 做回退。但前端改全局冷却时已同步写入所有类型配置（见 alert-settings API），
+ * 该回退反而导致用户想要的 30 分钟越界冷却被降级成全局的 2 分钟，
+ * 故移除。现在独立配置优先，不存在才回退全局。
  */
-const HISTORICAL_DEFAULTS: Record<string, number> = {
-  cex_price: 2,
-  out_of_range: 30,
-  re_in_range: 30,
-  tick_move: 10,
-};
-
 export function getAlertCooldownMinutes(alertType: string): number {
   const globalCooldown = getPushCooldownMinutes();
   const key = `cooldown_${alertType}`;
   const v = Number(getSetting(key, ""));
   // 独立配置为空/非法 → 回退全局
   if (!Number.isFinite(v) || v <= 0) return globalCooldown;
-  // 独立配置等于历史硬编码默认值 → 视为"未显式设置"，回退全局
-  if (HISTORICAL_DEFAULTS[alertType] === v) return globalCooldown;
-  // 独立配置是用户显式设置的值 → 采用它
+  // 独立配置存在 → 采用它
   return v;
 }
 

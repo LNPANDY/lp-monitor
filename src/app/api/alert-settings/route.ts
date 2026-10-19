@@ -44,10 +44,10 @@ export async function PUT(req: Request) {
     const v = Number(body.push_cooldown_minutes);
     if (!Number.isFinite(v) || v < 1 || v > 60) return fail("push_cooldown_minutes 须为 1~60 的数值");
     setSetting("push_cooldown_minutes", String(v));
-    // 同步更新各告警类型的独立冷却配置，否则独立配置会覆盖全局默认
-    for (const type of ["cex_price", "out_of_range", "re_in_range", "tick_move"]) {
-      setSetting(`cooldown_${type}`, String(v));
-    }
+    // 同步 cex_price 的独立冷却（该下拉的实际语义就是控制 CEX 价差推送频率）。
+    // 不覆盖 out_of_range/tick_move 等类型：越界告警有独立的 30 分钟设计冷却，
+    // 被全局值覆盖会导致重复推送。
+    setSetting("cooldown_cex_price", String(v));
   }
 
   return ok({
