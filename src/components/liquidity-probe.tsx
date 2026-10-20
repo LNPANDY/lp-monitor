@@ -2,6 +2,7 @@
 import { useState } from "react";
 import useSWR, { mutate } from "swr";
 import { fetcher, authHeaders, short } from "./util";
+import { MintPositionPanel } from "./mint-position-panel";
 
 /**
  * 最小区间探针结果（场景C），与后端 MinRangeProbeResult 对齐。
@@ -114,6 +115,7 @@ export function LiquidityProbe() {
   const [npm, setNpm] = useState("");
   const [result, setResult] = useState<ProbeResult | null>(null);
   const [loading, setLoading] = useState(false);
+  const [showMint, setShowMint] = useState(false);
   const [error, setError] = useState("");
   const [favMsg, setFavMsg] = useState("");
   // 翻转状态（来自后端返回，或本地切换暂存）
@@ -525,7 +527,21 @@ export function LiquidityProbe() {
             <button className="btn-ghost text-xs" onClick={handleFlip} disabled={flipLoading}>
               {flipLoading ? "翻转中…" : flip ? "🔄 取消翻转" : "🔄 翻转交易对"}
             </button>
+            <button
+              className="btn-primary text-xs"
+              onClick={() => setShowMint((v) => !v)}
+            >
+              {showMint ? "收起创建面板" : "＋ 创建仓位"}
+            </button>
           </div>
+
+          {showMint && (
+            <MintPositionPanel
+              chainId={Number(chainId)}
+              pool={pool}
+              onClose={() => setShowMint(false)}
+            />
+          )}
         </div>
       )}
     </div>
