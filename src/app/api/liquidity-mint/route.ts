@@ -76,6 +76,8 @@ export async function POST(req: Request) {
   const b = await getBody<{
     chain_id?: number;
     pool?: string;
+    /** 钱包地址：传了才会查授权额度 */
+    wallet?: string;
     /** 可选：指定区间（不传则用当前 tick 所在的最小 tickSpacing 窗口） */
     tick_lower?: number;
     tick_upper?: number;
@@ -151,18 +153,56 @@ export async function POST(req: Request) {
       }
     }
 
-    // 5. 可用质押合约（供前端选择）
-    const staking = listStaking(b.chain_id, true).map((s) => ({
-      id: s.id,
-      platform: s.platform,
-      pair_label: s.pair_label,
-      contract: s.contract,
-    }));
+    // 5. 质押合约：按 token 对自动匹配（不返回全部，避免用户选错）
+    //    匹配规则：staking_contracts.pair_label 含 token0/token1 的 symbol（大小写不敏感）
+    const sym0 = (m0?.symbol ?? "").toLowerCase();
+    const sym1 = (m1?.symbol ?? "").toLowerCase();
+    const allStaking = listStaking(b.chain_id, true);
+    const matchedStaking = allStaking.filter((s) => {
+      const label = (s.pair_label || "").toLowerCase();
+      if (!label) return false;
+      // pair_label 形如 "W0G/USDC"、"WBTC / W0G"、"W0G/WETH 0.3"
+      // 两边 symbol 都要出现在 label 里（顺序无关）
+      return label.includes(sym0) && label.includes(sym1);
+    });
 
-    // 6. 匹配的 DEX（用于拿到 npm 地址）：由前端传入 npm 或按链取启用的 v3 DEX
+    // 6. 匹配的 DEX（v3）：用 factory 反查池子所属 factory，避免用户选错
     const dexes = db.prepare(
       "SELECT id, name, type, factory, npm, stateview FROM dexes WHERE chain_id_ref=? AND enabled=1 AND type='v3-fork'"
     ).all(b.chain_id) as any[];
+
+    // 用池子的 factory() 精确定位 DEX
+    let poolFactory = "";
+    try {
+      poolFactory = await client.readContract({
+        address: pool,
+        abi: [{ name: "factory", type: "function", stateMutability: "view", inputs: [], outputs: [{ name: "", type: "address" }] }] as const,
+        functionName: "factory",
+      }) as string;
+    } catch { /* 部分池子无 factory view，回退到全部 */ }
+    const matchedDex = poolFactory
+      ? dexes.find((d) => d.factory.toLowerCase() === poolFactory.toLowerCase())
+      : undefined;
+
+    // 7. 授权状态（需要钱包地址才查）
+    let approvals: {
+      token0: { allowance: string; sufficient: boolean; decimals: number };
+      token1: { allowance: string; sufficient: boolean; decimals: number };
+    } | null = null;
+    if (b.wallet && /^0x[a-fA-F0-9]{40}$/.test(b.wallet) && matchedDex) {
+      const dec0 = m0?.decimals ?? 18;
+      const dec1 = m1?.decimals ?? 18;
+      const need0 = compute ? BigInt(compute.amount0) : 0n;
+      const need1 = compute ? BigInt(compute.amount1) : 0n;
+      const [a0, a1] = await Promise.all([
+        readAllowance(client, token0, b.wallet, matchedDex.npm),
+        readAllowance(client, token1, b.wallet, matchedDex.npm),
+      ]);
+      approvals = {
+        token0: { allowance: a0.toString(), sufficient: a0 >= need0, decimals: dec0 },
+        token1: { allowance: a1.toString(), sufficient: a1 >= need1, decimals: dec1 },
+      };
+    }
 
     return ok({
       chain: { id: chain.id, name: chain.name, chain_id: chain.chain_id },
@@ -185,8 +225,17 @@ export async function POST(req: Request) {
         isMinimal: tickLower === floorTick(currentTick, spacing) && tickUpper === tickLower + spacing,
       },
       compute,
-      staking,
-      dexes: dexes.map((d) => ({ id: d.id, name: d.name, npm: d.npm })),
+      /** 自动匹配的质押合约（可能为空 = 该 token 对无质押平台） */
+      matchedStaking: matchedStaking.map((s) => ({
+        id: s.id,
+        platform: s.platform,
+        pair_label: s.pair_label,
+        contract: s.contract,
+      })),
+      /** 自动匹配的 DEX（按池子 factory 精确匹配） */
+      dex: matchedDex ? { id: matchedDex.id, name: matchedDex.name, npm: matchedDex.npm } : null,
+      /** 授权状态（需传 wallet 且能匹配 DEX） */
+      approvals,
     });
   } catch (e: any) {
     return fail(`读取池子状态失败：${e?.message ?? e}`, 502);
@@ -194,8 +243,7 @@ export async function POST(req: Request) {
 }
 
 /** 人类可读金额 → 原始单位 BigInt（支持小数，最多 decimals 位） */
-function parseHumanAmount(input: string, decimals: number): bigint {
-  const s = input.trim();
+function parseHumanAmount(input: string, decimals: number): bigint {  const s = input.trim();
   if (!s) return 0n;
   if (!/^\d*\.?\d*$/.test(s)) return 0n;
   const [intPart, fracPart = ""] = s.split(".");
@@ -214,4 +262,36 @@ function formatRaw(v: bigint, decimals: number): string {
   const intPart = s.slice(0, s.length - decimals);
   const fracPart = s.slice(s.length - decimals).replace(/0+$/, "");
   return fracPart ? `${intPart}.${fracPart}` : intPart;
+}
+
+/** 查询 ERC20 授权额度（失败返回 0n，前端会按"需要授权"处理） */
+async function readAllowance(
+  client: any,
+  token: string,
+  owner: string,
+  spender: string
+): Promise<bigint> {
+  try {
+    const abi = [
+      {
+        name: "allowance",
+        type: "function",
+        stateMutability: "view",
+        inputs: [
+          { name: "owner", type: "address" },
+          { name: "spender", type: "address" },
+        ],
+        outputs: [{ name: "", type: "uint256" }],
+      },
+    ] as const;
+    const v = await client.readContract({
+      address: token as `0x${string}`,
+      abi,
+      functionName: "allowance",
+      args: [owner as `0x${string}`, spender as `0x${string}`],
+    });
+    return v as bigint;
+  } catch {
+    return 0n;
+  }
 }

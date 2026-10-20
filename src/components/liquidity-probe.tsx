@@ -334,7 +334,24 @@ export function LiquidityProbe() {
       <div className="mb-2 flex items-center gap-2">
         <h2 className="text-sm font-semibold">🔬 最小区间流动性探针</h2>
         <span className="text-xs text-ink-soft">给定池子，算 fee→tickSpacing 最小窗口的流动性与价格区间</span>
+        <button
+          className="ml-auto btn-primary text-xs"
+          onClick={() => setShowMint((v) => !v)}
+        >
+          {showMint ? "收起创建面板" : "＋ 直接创建仓位"}
+        </button>
       </div>
+
+      {/* 创建仓位面板：独立入口，不依赖探针检测 */}
+      {showMint && (
+        <div className="mb-3">
+          <MintPositionPanel
+            chainId={Number(chainId) || 0}
+            pool={pool}
+            onClose={() => setShowMint(false)}
+          />
+        </div>
+      )}
 
       <div className="flex flex-wrap items-end gap-2">
         <label className="text-xs">
@@ -527,21 +544,7 @@ export function LiquidityProbe() {
             <button className="btn-ghost text-xs" onClick={handleFlip} disabled={flipLoading}>
               {flipLoading ? "翻转中…" : flip ? "🔄 取消翻转" : "🔄 翻转交易对"}
             </button>
-            <button
-              className="btn-primary text-xs"
-              onClick={() => setShowMint((v) => !v)}
-            >
-              {showMint ? "收起创建面板" : "＋ 创建仓位"}
-            </button>
           </div>
-
-          {showMint && (
-            <MintPositionPanel
-              chainId={Number(chainId)}
-              pool={pool}
-              onClose={() => setShowMint(false)}
-            />
-          )}
         </div>
       )}
     </div>
