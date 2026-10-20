@@ -348,9 +348,10 @@ export function MintPositionPanel({
               </div>
               {data.compute.shareAfter !== undefined && data.compute.shareAfter > 0 && (
                 <div className="mt-1 border-t border-slate-200 pt-1">
-                  添加后区间流动性占比：<strong className="text-primary">{(data.compute.shareAfter * 100).toFixed(4)}%</strong>
+                  添加后流动性占比：<strong className="text-primary">{(data.compute.shareAfter * 100).toFixed(4)}%</strong>
                   <span className="ml-1 text-ink-soft">
-                    （池子当前流动性 {abbrevLiquidity(data.compute.poolLiquidity)}，你的 {abbrevLiquidity(data.compute.liquidity)}）
+                    （{data.compute.liquiditySource === "staking" ? "质押池" : "池子"}流动性 {abbrevLiquidity(data.compute.poolLiquidity)}，
+                    你的 {abbrevLiquidity(data.compute.liquidity)}）
                   </span>
                 </div>
               )}

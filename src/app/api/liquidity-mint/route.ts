@@ -125,7 +125,45 @@ export async function POST(req: Request) {
     const m0 = tokenMap.get(token0.toLowerCase());
     const m1 = tokenMap.get(token1.toLowerCase());
 
-    // 4. 单侧金额反算（可选）
+    // 4. 质押合约：按 token 对自动匹配（不返回全部，避免用户选错）
+    //    匹配规则：staking_contracts.pair_label 含 token0/token1 的 symbol。
+    //    需要 symbol 别名归一化：链上 symbol 可能是 "USDC.e"/"WETH.e"，而用户配置的
+    //    pair_label 常写 "USDC"/"WETH"。这里按基础名（去掉 .e/.b/.c 等后缀）比对。
+    const normSym = (s: string) => (s || "").toLowerCase().replace(/\.(e|b|c|m|w)$/i, "").trim();
+    const base0 = normSym(m0?.symbol ?? "");
+    const base1 = normSym(m1?.symbol ?? "");
+    const allStaking = listStaking(b.chain_id, true);
+    const matchedStaking = allStaking.filter((s) => {
+      const rawLabel = (s.pair_label || "").toLowerCase();
+      if (!rawLabel) return false;
+      // 把 label 里的每个 token 名也做归一化，便于 "USDC" 匹配 "USDC.e"
+      // label 形如 "W0G/USDC"、"WBTC / W0G"、"W0G/WETH 0.3"
+      const labelBases = rawLabel
+        .split(/[\/\s,]+/)
+        .map((t) => normSym(t))
+        .filter((t) => t && !/^\d+(\.\d+)?%?$/.test(t)); // 排除 "0.3" 这类费率后缀
+      return labelBases.includes(base0) && labelBases.includes(base1);
+    });
+
+    // 5. 匹配的 DEX（v3）：用 factory 反查池子所属 factory，避免用户选错
+    const dexes = db.prepare(
+      "SELECT id, name, type, factory, npm, stateview FROM dexes WHERE chain_id_ref=? AND enabled=1 AND type='v3-fork'"
+    ).all(b.chain_id) as any[];
+
+    // 用池子的 factory() 精确定位 DEX
+    let poolFactory = "";
+    try {
+      poolFactory = await client.readContract({
+        address: pool,
+        abi: [{ name: "factory", type: "function", stateMutability: "view", inputs: [], outputs: [{ name: "", type: "address" }] }] as const,
+        functionName: "factory",
+      }) as string;
+    } catch { /* 部分池子无 factory view，回退到全部 */ }
+    const matchedDex = poolFactory
+      ? dexes.find((d) => d.factory.toLowerCase() === poolFactory.toLowerCase())
+      : undefined;
+
+    // 6. 单侧金额反算（可选）
     let compute: {
       liquidity: string;
       amount0: string;
@@ -134,8 +172,10 @@ export async function POST(req: Request) {
       amount1Human: string;
       /** 添加后在该区间的流动性占比（0~1） */
       shareAfter?: number;
-      /** 池子当前活跃流动性（原始单位） */
+      /** 对比基准的流动性（质押池总和 或 池子活跃流动性） */
       poolLiquidity?: string;
+      /** 流动性来源：staking=质押合约内同区间总和；pool=池子当前活跃流动性 */
+      liquiditySource?: "staking" | "pool";
     } | null = null;
     if (b.input_side && b.input_amount) {
       const dec0 = m0?.decimals ?? 18;
@@ -147,15 +187,36 @@ export async function POST(req: Request) {
         const sqrtUpper = tickToSqrtPriceX96(tickUpper);
         const r = computeLiquidityFromAmount(sqrtPriceX96, sqrtLower, sqrtUpper, b.input_side, amountRaw);
 
-        // 池子当前活跃流动性：用于算添加后的占比
+        // 池子流动性：有质押平台时用「质押合约在同池同区间内的流动性总和」，
+        // 否则回退到 pool.liquidity()（当前 tick 的活跃流动性）。
+        // 这样占比反映的是「你在质押池中的份额」，而不是把整个池子都算上。
         let poolLiquidity = 0n;
-        try {
-          poolLiquidity = await client.readContract({
-            address: pool,
-            abi: [{ name: "liquidity", type: "function", stateMutability: "view", inputs: [], outputs: [{ name: "", type: "uint128" }] }] as const,
-            functionName: "liquidity",
-          }) as bigint;
-        } catch { /* 部分池子无 liquidity view */ }
+        let liquiditySource: "staking" | "pool" = "pool";
+        if (matchedStaking.length > 0 && matchedDex) {
+          const stakedLiq = await sumStakedLiquidity(
+            client,
+            matchedDex.npm as `0x${string}`,
+            matchedStaking[0].contract as `0x${string}`,
+            token0,
+            token1,
+            Number(fee),
+            tickLower,
+            tickUpper
+          );
+          if (stakedLiq > 0n) {
+            poolLiquidity = stakedLiq;
+            liquiditySource = "staking";
+          }
+        }
+        if (poolLiquidity === 0n) {
+          try {
+            poolLiquidity = await client.readContract({
+              address: pool,
+              abi: [{ name: "liquidity", type: "function", stateMutability: "view", inputs: [], outputs: [{ name: "", type: "uint128" }] }] as const,
+              functionName: "liquidity",
+            }) as bigint;
+          } catch { /* 部分池子无 liquidity view */ }
+        }
 
         // 占比近似：mine / (poolActive + mine)
         // 说明：pool.liquidity() 是当前 tick 的活跃流动性；
@@ -173,40 +234,10 @@ export async function POST(req: Request) {
           amount1Human: formatRaw(r.amount1, dec1),
           shareAfter,
           poolLiquidity: poolLiquidity.toString(),
+          liquiditySource,
         };
       }
     }
-
-    // 5. 质押合约：按 token 对自动匹配（不返回全部，避免用户选错）
-    //    匹配规则：staking_contracts.pair_label 含 token0/token1 的 symbol（大小写不敏感）
-    const sym0 = (m0?.symbol ?? "").toLowerCase();
-    const sym1 = (m1?.symbol ?? "").toLowerCase();
-    const allStaking = listStaking(b.chain_id, true);
-    const matchedStaking = allStaking.filter((s) => {
-      const label = (s.pair_label || "").toLowerCase();
-      if (!label) return false;
-      // pair_label 形如 "W0G/USDC"、"WBTC / W0G"、"W0G/WETH 0.3"
-      // 两边 symbol 都要出现在 label 里（顺序无关）
-      return label.includes(sym0) && label.includes(sym1);
-    });
-
-    // 6. 匹配的 DEX（v3）：用 factory 反查池子所属 factory，避免用户选错
-    const dexes = db.prepare(
-      "SELECT id, name, type, factory, npm, stateview FROM dexes WHERE chain_id_ref=? AND enabled=1 AND type='v3-fork'"
-    ).all(b.chain_id) as any[];
-
-    // 用池子的 factory() 精确定位 DEX
-    let poolFactory = "";
-    try {
-      poolFactory = await client.readContract({
-        address: pool,
-        abi: [{ name: "factory", type: "function", stateMutability: "view", inputs: [], outputs: [{ name: "", type: "address" }] }] as const,
-        functionName: "factory",
-      }) as string;
-    } catch { /* 部分池子无 factory view，回退到全部 */ }
-    const matchedDex = poolFactory
-      ? dexes.find((d) => d.factory.toLowerCase() === poolFactory.toLowerCase())
-      : undefined;
 
     // 7. 授权状态（需要钱包地址才查）
     let approvals: {
@@ -315,6 +346,106 @@ async function readAllowance(
       args: [owner as `0x${string}`, spender as `0x${string}`],
     });
     return v as bigint;
+  } catch {
+    return 0n;
+  }
+}
+
+/**
+ * 汇总质押合约在同一池子、同一 tick 区间内的 LP 流动性总和。
+ *
+ * 实现：枚举 vault 在 NPM 上持有的全部 NFT（balanceOf + tokenOfOwnerByIndex），
+ * 读每个 NFT 的 positions()，筛选 token0/token1/fee 匹配且 tick 区间相同的，累加 liquidity。
+ *
+ * 失败返回 0n（调用方会回退到 pool.liquidity()）。
+ */
+async function sumStakedLiquidity(
+  client: any,
+  npm: `0x${string}`,
+  vault: `0x${string}`,
+  token0: string,
+  token1: string,
+  fee: number,
+  tickLower: number,
+  tickUpper: number
+): Promise<bigint> {
+  try {
+    const balance = await client.readContract({
+      address: npm,
+      abi: [{ name: "balanceOf", type: "function", stateMutability: "view", inputs: [{ name: "owner", type: "address" }], outputs: [{ name: "", type: "uint256" }] }] as const,
+      functionName: "balanceOf",
+      args: [vault],
+    }) as bigint;
+    if (balance === 0n) return 0n;
+
+    // 枚举 tokenId（限制上限避免 RPC 爆炸）
+    const maxScan = balance > 200n ? 200n : balance;
+    const ids: bigint[] = [];
+    for (let i = 0n; i < maxScan; i++) {
+      try {
+        const id = await client.readContract({
+          address: npm,
+          abi: [{ name: "tokenOfOwnerByIndex", type: "function", stateMutability: "view", inputs: [{ name: "owner", type: "address" }, { name: "index", type: "uint256" }], outputs: [{ name: "", type: "uint256" }] }] as const,
+          functionName: "tokenOfOwnerByIndex",
+          args: [vault, i],
+        }) as bigint;
+        ids.push(id);
+      } catch { break; }
+    }
+    if (ids.length === 0) return 0n;
+
+    const t0 = token0.toLowerCase();
+    const t1 = token1.toLowerCase();
+    const positionsAbi = [
+      {
+        name: "positions",
+        type: "function",
+        stateMutability: "view",
+        inputs: [{ name: "tokenId", type: "uint256" }],
+        outputs: [
+          { name: "nonce", type: "uint96" },
+          { name: "operator", type: "address" },
+          { name: "token0", type: "address" },
+          { name: "token1", type: "address" },
+          { name: "fee", type: "uint24" },
+          { name: "tickLower", type: "int24" },
+          { name: "tickUpper", type: "int24" },
+          { name: "liquidity", type: "uint128" },
+          { name: "feeGrowthInside0LastX128", type: "uint256" },
+          { name: "feeGrowthInside1LastX128", type: "uint256" },
+          { name: "tokensOwed0", type: "uint128" },
+          { name: "tokensOwed1", type: "uint128" },
+        ],
+      },
+    ] as const;
+
+    let total = 0n;
+    // 并发读取（限并 8）
+    const chunkSize = 8;
+    for (let i = 0; i < ids.length; i += chunkSize) {
+      const chunk = ids.slice(i, i + chunkSize);
+      const results = await Promise.all(
+        chunk.map(async (id) => {
+          try {
+            return await client.readContract({
+              address: npm,
+              abi: positionsAbi,
+              functionName: "positions",
+              args: [id],
+            }) as readonly any[];
+          } catch { return null; }
+        })
+      );
+      for (const r of results) {
+        if (!r) continue;
+        if (String(r[2]).toLowerCase() !== t0) continue;
+        if (String(r[3]).toLowerCase() !== t1) continue;
+        if (Number(r[4]) !== fee) continue;
+        if (Number(r[5]) !== tickLower || Number(r[6]) !== tickUpper) continue;
+        total += BigInt(r[7]);
+      }
+    }
+    return total;
   } catch {
     return 0n;
   }
