@@ -170,14 +170,14 @@ export async function POST(req: Request) {
       amount1: string;
       amount0Human: string;
       amount1Human: string;
-      /** 添加后在该区间的流动性占比（0~1），分母=池子当前活跃流动性 */
+      /** 添加后占比（0~1）：有质押平台时分母=vault 窗口流动性，否则=池子活跃流动性 */
       shareAfter?: number;
-      /** 池子当前活跃流动性 */
+      /** 池子当前活跃流动性（参考） */
       poolLiquidity?: string;
-      /** 该区间内已质押的流动性总和（参考） */
+      /** vault 内覆盖目标窗口的流动性总和（主分母） */
       stakedLiquidity?: string;
-      /** 相对质押池的占比（参考） */
-      shareInStaking?: number;
+      /** 相对整个池子活跃流动性的占比（参考） */
+      shareInPool?: number;
     } | null = null;
     if (b.input_side && b.input_amount) {
       const dec0 = m0?.decimals ?? 18;
@@ -189,20 +189,10 @@ export async function POST(req: Request) {
         const sqrtUpper = tickToSqrtPriceX96(tickUpper);
         const r = computeLiquidityFromAmount(sqrtPriceX96, sqrtLower, sqrtUpper, b.input_side, amountRaw);
 
-        // 分母用「池子当前活跃流动性」= 该 tick 处所有 LP 的流动性总和
-        // （包含质押的 + 直接持有的 + 其他 vault 的）。
-        // 说明：pool.liquidity() 是当前 tick 处的活跃流动性；若目标区间不含当前 tick，
-        // 该值不代表目标区间的真实流动性。
-        let poolLiquidity = 0n;
-        try {
-          poolLiquidity = await client.readContract({
-            address: pool,
-            abi: [{ name: "liquidity", type: "function", stateMutability: "view", inputs: [], outputs: [{ name: "", type: "uint128" }] }] as const,
-            functionName: "liquidity",
-          }) as bigint;
-        } catch { /* 部分池子无 liquidity view */ }
-
-        // 额外统计：该区间内「已质押」的流动性（仅作参考展示，不参与主占比）
+        // 分母口径说明：
+        //   有质押平台时 → 用「vault 内 tick 范围覆盖目标窗口的 LP 流动性总和」
+        //     （与探针「窗口流动性」完全一致，这是你真正竞争的规模）
+        //   无质押平台时 → 回退到 pool.liquidity()（该 tick 所有 LP 的流动性）
         let stakedLiquidity = 0n;
         if (matchedStaking.length > 0 && matchedDex) {
           stakedLiquidity = await sumStakedLiquidity(
@@ -217,14 +207,24 @@ export async function POST(req: Request) {
           );
         }
 
+        let poolLiquidity = 0n;
+        try {
+          poolLiquidity = await client.readContract({
+            address: pool,
+            abi: [{ name: "liquidity", type: "function", stateMutability: "view", inputs: [], outputs: [{ name: "", type: "uint128" }] }] as const,
+            functionName: "liquidity",
+          }) as bigint;
+        } catch { /* 部分池子无 liquidity view */ }
+
         const mine = r.liquidity;
-        // 主占比：相对池子在该 tick 的活跃流动性（这才是真实的市场份额）
-        const shareAfter = mine > 0n && (poolLiquidity + mine) > 0n
-          ? Number(mine) / Number(poolLiquidity + mine)
+        // 主占比：优先用质押池窗口流动性（与探针一致），否则用池子活跃流动性
+        const baseLiquidity = stakedLiquidity > 0n ? stakedLiquidity : poolLiquidity;
+        const shareAfter = mine > 0n && (baseLiquidity + mine) > 0n
+          ? Number(mine) / Number(baseLiquidity + mine)
           : 0;
-        // 参考占比：相对「质押池同区间流动性 + 自己」（看质押竞争程度）
-        const shareInStaking = mine > 0n && stakedLiquidity > 0n
-          ? Number(mine) / Number(stakedLiquidity + mine)
+        // 参考：相对整个池子当前 tick 活跃流动性的占比
+        const shareInPool = mine > 0n && poolLiquidity > 0n
+          ? Number(mine) / Number(poolLiquidity + mine)
           : 0;
 
         compute = {
@@ -236,7 +236,7 @@ export async function POST(req: Request) {
           shareAfter,
           poolLiquidity: poolLiquidity.toString(),
           stakedLiquidity: stakedLiquidity.toString(),
-          shareInStaking,
+          shareInPool,
         };
       }
     }
@@ -443,7 +443,9 @@ async function sumStakedLiquidity(
         if (String(r[2]).toLowerCase() !== t0) continue;
         if (String(r[3]).toLowerCase() !== t1) continue;
         if (Number(r[4]) !== fee) continue;
-        if (Number(r[5]) !== tickLower || Number(r[6]) !== tickUpper) continue;
+        // 与探针口径一致：只统计「tick 范围完全覆盖目标窗口」的仓位
+        // （区间比窗口大的仓位也覆盖了窗口，同样在窗口内竞争手续费）
+        if (Number(r[5]) > tickLower || Number(r[6]) < tickUpper) continue;
         total += BigInt(r[7]);
       }
     }

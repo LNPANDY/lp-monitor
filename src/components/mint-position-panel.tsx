@@ -349,15 +349,19 @@ export function MintPositionPanel({
               {data.compute.shareAfter !== undefined && data.compute.shareAfter > 0 && (
                 <div className="mt-1 border-t border-slate-200 pt-1">
                   <div>
-                    添加后占池子流动性：<strong className="text-primary">{(data.compute.shareAfter * 100).toFixed(4)}%</strong>
+                    添加后占比：<strong className="text-primary">{(data.compute.shareAfter * 100).toFixed(2)}%</strong>
                     <span className="ml-1 text-ink-soft">
-                      （池子 {abbrevLiquidity(data.compute.poolLiquidity)}，你的 {abbrevLiquidity(data.compute.liquidity)}）
+                      （
+                      {data.compute.stakedLiquidity && data.compute.stakedLiquidity !== "0"
+                        ? `质押池窗口 ${abbrevLiquidity(data.compute.stakedLiquidity)}`
+                        : `池子 ${abbrevLiquidity(data.compute.poolLiquidity)}`}
+                      ，你的 {abbrevLiquidity(data.compute.liquidity)}）
                     </span>
                   </div>
-                  {data.compute.shareInStaking !== undefined && data.compute.shareInStaking > 0 && (
+                  {data.compute.shareInPool !== undefined && data.compute.shareInPool > 0 && data.compute.stakedLiquidity !== "0" && (
                     <div className="mt-0.5 text-ink-soft">
-                      其中质押池同区间：{abbrevLiquidity(data.compute.stakedLiquidity)}
-                      ，你占该质押池 <strong className="text-amber-700">{(data.compute.shareInStaking * 100).toFixed(2)}%</strong>
+                      占整个池子活跃流动性 {abbrevLiquidity(data.compute.poolLiquidity)} 的{" "}
+                      <strong className="text-emerald-700">{(data.compute.shareInPool * 100).toFixed(2)}%</strong>
                     </div>
                   )}
                 </div>
