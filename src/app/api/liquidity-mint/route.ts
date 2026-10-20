@@ -132,23 +132,47 @@ export async function POST(req: Request) {
       amount1: string;
       amount0Human: string;
       amount1Human: string;
+      /** 添加后在该区间的流动性占比（0~1） */
+      shareAfter?: number;
+      /** 池子当前活跃流动性（原始单位） */
+      poolLiquidity?: string;
     } | null = null;
     if (b.input_side && b.input_amount) {
       const dec0 = m0?.decimals ?? 18;
       const dec1 = m1?.decimals ?? 18;
       const sideDec = b.input_side === "token0" ? dec0 : dec1;
-      // 人类可读金额 → 原始单位 BigInt
       const amountRaw = parseHumanAmount(b.input_amount, sideDec);
       if (amountRaw > 0n) {
         const sqrtLower = tickToSqrtPriceX96(tickLower);
         const sqrtUpper = tickToSqrtPriceX96(tickUpper);
         const r = computeLiquidityFromAmount(sqrtPriceX96, sqrtLower, sqrtUpper, b.input_side, amountRaw);
+
+        // 池子当前活跃流动性：用于算添加后的占比
+        let poolLiquidity = 0n;
+        try {
+          poolLiquidity = await client.readContract({
+            address: pool,
+            abi: [{ name: "liquidity", type: "function", stateMutability: "view", inputs: [], outputs: [{ name: "", type: "uint128" }] }] as const,
+            functionName: "liquidity",
+          }) as bigint;
+        } catch { /* 部分池子无 liquidity view */ }
+
+        // 占比近似：mine / (poolActive + mine)
+        // 说明：pool.liquidity() 是当前 tick 的活跃流动性；
+        // 若目标区间不含当前 tick，该区间可能无活跃流动性，实际占比会更高
+        const mine = r.liquidity;
+        const shareAfter = mine > 0n && (poolLiquidity + mine) > 0n
+          ? Number(mine) / Number(poolLiquidity + mine)
+          : 0;
+
         compute = {
           liquidity: r.liquidity.toString(),
           amount0: r.amount0.toString(),
           amount1: r.amount1.toString(),
           amount0Human: formatRaw(r.amount0, dec0),
           amount1Human: formatRaw(r.amount1, dec1),
+          shareAfter,
+          poolLiquidity: poolLiquidity.toString(),
         };
       }
     }

@@ -247,7 +247,7 @@ export function MintPositionPanel({
         {onClose && <button className="text-xs text-ink-soft hover:text-ink" onClick={onClose}>关闭</button>}
       </div>
 
-      {/* 池子地址：未预填时手动输入（跳过探针检测） */}
+      {/* 未选池子时提示从收藏列表选择 */}
       {!data ? (
         <div className="space-y-2">
           <div className="flex items-center gap-2">
@@ -263,18 +263,16 @@ export function MintPositionPanel({
               ))}
             </select>
           </div>
-          <div className="flex items-center gap-2">
-            <span className="text-ink-soft">池子地址</span>
-            <input
-              className="input max-w-[340px]"
-              value={pool}
-              onChange={(e) => setPool(e.target.value)}
-              placeholder="0x…（无需先做探针检测）"
-            />
-            <button className="btn-primary text-xs" disabled={busy || !pool || !chainId} onClick={() => fetchPool()}>
-              {busy ? "读取中…" : "读取池子"}
-            </button>
-          </div>
+          {initialPool ? (
+            <div className="text-ink-soft">
+              已选择池子 <span className="font-mono">{initialPool.slice(0, 12)}…</span>
+              {busy && <span className="ml-2">读取中…</span>}
+            </div>
+          ) : (
+            <div className="rounded bg-amber-50 p-2 text-amber-700">
+              👇 请在下方「收藏」列表点击一个交易对开始创建
+            </div>
+          )}
           {msg && <p>{msg}</p>}
         </div>
       ) : (
@@ -348,6 +346,14 @@ export function MintPositionPanel({
               <div>需要 {data.pool.token1Symbol}: <strong>{data.compute.amount1Human}</strong>
                 {data.approvals?.token1?.sufficient && <span className="ml-1 text-emerald-600">（已授权，跳过 approve）</span>}
               </div>
+              {data.compute.shareAfter !== undefined && data.compute.shareAfter > 0 && (
+                <div className="mt-1 border-t border-slate-200 pt-1">
+                  添加后区间流动性占比：<strong className="text-primary">{(data.compute.shareAfter * 100).toFixed(4)}%</strong>
+                  <span className="ml-1 text-ink-soft">
+                    （池子当前流动性 {abbrevLiquidity(data.compute.poolLiquidity)}，你的 {abbrevLiquidity(data.compute.liquidity)}）
+                  </span>
+                </div>
+              )}
             </div>
           )}
 
@@ -376,4 +382,27 @@ export function MintPositionPanel({
       {msg && <p className="mt-2">{msg}</p>}
     </div>
   );
+}
+
+/** 把大整数 liquidity 缩写成可读形式（1.23e18 → 1.23Q / 1.23T / 1.23B / 1.23M / 1.23K） */
+function abbrevLiquidity(v?: string): string {
+  if (!v) return "0";
+  try {
+    const n = BigInt(v);
+    if (n === 0n) return "0";
+    const s = n.toString();
+    const units: [number, string][] = [
+      [18, "Q"], [15, "P"], [12, "T"], [9, "B"], [6, "M"], [3, "K"],
+    ];
+    for (const [exp, suffix] of units) {
+      if (s.length > exp) {
+        const intPart = s.slice(0, s.length - exp);
+        const frac = s.slice(s.length - exp, s.length - exp + 2).replace(/0+$/, "");
+        return `${intPart}${frac ? "." + frac : ""}${suffix}`;
+      }
+    }
+    return s;
+  } catch {
+    return v;
+  }
 }

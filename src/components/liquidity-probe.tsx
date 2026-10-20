@@ -116,6 +116,9 @@ export function LiquidityProbe() {
   const [result, setResult] = useState<ProbeResult | null>(null);
   const [loading, setLoading] = useState(false);
   const [showMint, setShowMint] = useState(false);
+  // 创建仓位面板选中的池子（点击收藏带入）
+  const [mintPool, setMintPool] = useState("");
+  const [mintChainId, setMintChainId] = useState(0);
   const [error, setError] = useState("");
   const [favMsg, setFavMsg] = useState("");
   // 翻转状态（来自后端返回，或本地切换暂存）
@@ -342,13 +345,14 @@ export function LiquidityProbe() {
         </button>
       </div>
 
-      {/* 创建仓位面板：独立入口，不依赖探针检测 */}
+      {/* 创建仓位面板：从收藏列表选择交易对后带入 */}
       {showMint && (
         <div className="mb-3">
           <MintPositionPanel
-            chainId={Number(chainId) || 0}
-            pool={pool}
-            onClose={() => setShowMint(false)}
+            key={`${mintChainId}-${mintPool}`}
+            chainId={mintChainId || Number(chainId) || 0}
+            pool={mintPool}
+            onClose={() => { setShowMint(false); setMintPool(""); }}
           />
         </div>
       )}
@@ -449,8 +453,20 @@ export function LiquidityProbe() {
                 >
                   <button
                     className="hover:text-ink"
-                    title={`${f.chain_name} · ${dexName} · ${f.pool_addr}${f.staker_addr ? " · " + f.staker_addr : ""}`}
-                    onClick={() => applyFavoriteAndProbe(f)}
+                    title={
+                      showMint
+                        ? `${f.chain_name} · ${dexName} · 点击带入创建仓位`
+                        : `${f.chain_name} · ${dexName} · ${f.pool_addr}${f.staker_addr ? " · " + f.staker_addr : ""}`
+                    }
+                    onClick={() => {
+                      if (showMint) {
+                        // 创建模式：点击收藏直接带入创建面板（不跑探针）
+                        setMintPool(f.pool_addr);
+                        setMintChainId(f.chain_id_ref);
+                      } else {
+                        applyFavoriteAndProbe(f);
+                      }
+                    }}
                   >
                     {f.label || pairLabel}
                   </button>
