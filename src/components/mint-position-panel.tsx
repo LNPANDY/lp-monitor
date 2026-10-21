@@ -193,19 +193,20 @@ export function MintPositionPanel({
         slippagePct: 0.5,
       });
       const hm = await sendTx(mint);
+      // 等 mint 回执，从 Transfer(from=0x0) 事件解析出准确的 tokenId
+      // （不能用 balanceOf-1 查 tokenOfOwnerByIndex：若历史上有 burn/转出，
+      //   Enumerable index 会重排，最后 mint 的不一定是最大 index）
+      const tokenId = await waitForMintTokenId(npm, address, hm);
       setStep(2, { status: "done", hash: hm });
 
       // Step 4: 质押（自动匹配到才做）
       if (staker) {
-        setStep(3, { status: "loading" });
-        await new Promise((r) => setTimeout(r, 2000));
-        const tokenId = await findLatestTokenId(npm, address);
         if (!tokenId) {
           setStep(3, { status: "error" });
-          setMsg(`✅ 仓位已创建（tokenId 查询失败，请手动质押）`);
+          setMsg(`✅ 仓位已创建（未能从回执解析 tokenId，请手动质押）`);
         } else {
           const approveNft = buildNftApproveCalldata(npm, staker, tokenId);
-          await sendTx(approveNft);
+          const ha = await sendTx(approveNft);
           await new Promise((r) => setTimeout(r, 1500));
           const dep = buildStakeDepositCalldata(staker, tokenId);
           const hd = await sendTx(dep);
@@ -213,7 +214,7 @@ export function MintPositionPanel({
           setMsg(`✅ 创建并质押成功！tokenId=${tokenId}`);
         }
       } else {
-        setMsg("✅ 仓位创建成功");
+        setMsg(`✅ 仓位创建成功${tokenId ? `，tokenId=${tokenId}` : ""}`);
       }
     } catch (e: any) {
       setSteps((prev) => prev.map((s) => (s.status === "loading" ? { ...s, status: "error" } : s)));
@@ -224,20 +225,50 @@ export function MintPositionPanel({
   }
 
   /** 查询钱包在 NPM 上最新的 tokenId（mint 后用于质押） */
-  async function findLatestTokenId(npm: string, owner: string): Promise<bigint | null> {
-    try {
-      const provider = (window as any).okxwallet || (window as any).ethereum;
-      if (!provider) return null;
-      const balData = "0x70a08231" + owner.toLowerCase().replace("0x", "").padStart(64, "0");
-      const balHex = await provider.request({ method: "eth_call", params: [{ to: npm, data: balData }, "latest"] });
-      const bal = BigInt(balHex);
-      if (bal === 0n) return null;
-      const idxData = "0x2f745c59" + owner.toLowerCase().replace("0x", "").padStart(64, "0") + (bal - 1n).toString(16).padStart(64, "0");
-      const idHex = await provider.request({ method: "eth_call", params: [{ to: npm, data: idxData }, "latest"] });
-      return BigInt(idHex);
-    } catch {
-      return null;
+  /**
+   * 等 mint 交易回执，从 Transfer(from=0x0, to=钱包) 事件解析 tokenId。
+   *
+   * ERC721 mint 必然发出 Transfer(address(0) → recipient, tokenId) 事件，
+   * 这是获取"本次 mint 的 tokenId"唯一可靠的方式。
+   *
+   * 轮询 eth_getTransactionReceipt 直到 status=0x1 且含目标事件，超时 60 秒。
+   * 失败回退：尝试 tokenOfOwnerByIndex（最后一次 mint 的兜底，可能不准）。
+   */
+  async function waitForMintTokenId(npm: string, owner: string, txHash: string): Promise<bigint | null> {
+    const provider = (window as any).okxwallet || (window as any).ethereum;
+    if (!provider) return null;
+    const TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+    const fromZeroTopic = "0x" + "0".repeat(64);
+    const toTopic = "0x" + owner.toLowerCase().replace("0x", "").padStart(64, "0");
+    const start = Date.now();
+
+    while (Date.now() - start < 60_000) {
+      try {
+        const receipt = await provider.request({ method: "eth_getTransactionReceipt", params: [txHash] });
+        if (receipt && (receipt as any).status === "0x1") {
+          const logs = (receipt as any).logs ?? [];
+          for (const log of logs) {
+            if ((log.address ?? "").toLowerCase() !== npm.toLowerCase()) continue;
+            const topics: string[] = log.topics ?? [];
+            if (topics[0] !== TRANSFER_TOPIC) continue;
+            if (topics[1] !== fromZeroTopic) continue;
+            if (topics[2] !== toTopic) continue;
+            // 标准 ERC721 Transfer：from/to/tokenId 全部 indexed，
+            // tokenId 在 topics[3]（data 为空）
+            if (topics.length > 3) {
+              const tokenId = BigInt(topics[3]);
+              if (tokenId > 0n) return tokenId;
+            }
+          }
+          // 回执成功但没找到事件（不应该发生），跳出轮询
+          return null;
+        }
+      } catch {
+        // 轮询失败继续等
+      }
+      await new Promise((r) => setTimeout(r, 1200));
     }
+    return null;
   }
 
   return (
