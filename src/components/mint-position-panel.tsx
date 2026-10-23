@@ -158,14 +158,31 @@ export function MintPositionPanel({
     const setStep = (i: number, patch: Partial<(typeof steps)[0]>) =>
       setSteps((prev) => prev.map((s, idx) => (idx === i ? { ...s, ...patch } : s)));
 
+    /** 带重试的发送：用户取消或失败时询问是否重试（最多 3 次） */
+    const sendWithRetry = async (tx: { to: string; data: string }, label: string): Promise<string> => {
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          return await sendTx(tx);
+        } catch (e: any) {
+          if (attempt === 3) throw e;
+          const shouldRetry = confirm(`${label} 失败：${e?.message ?? e}\n\n是否重试（第 ${attempt + 1}/3 次）？`);
+          if (!shouldRetry) throw e;
+        }
+      }
+      throw new Error("unreachable");
+    };
+
     try {
       await switchChain(data.chain.chain_id);
+
+      // mint 前记录钱包已有的 tokenId 集合（余额对比法的基准）
+      const beforeIds = await listOwnedTokenIds(npm, address);
 
       // Step 1: approve token0（额度够则跳过）
       if (!skip0) {
         setStep(0, { status: "loading" });
         const a0 = buildApproveCalldata(data.pool.token0, npm, MAX_UINT256);
-        const h0 = await sendTx(a0);
+        const h0 = await sendWithRetry(a0, `授权 ${data.pool.token0Symbol}`);
         setStep(0, { status: "done", hash: h0 });
         await new Promise((r) => setTimeout(r, 1200));
       }
@@ -174,7 +191,7 @@ export function MintPositionPanel({
       if (!skip1) {
         setStep(1, { status: "loading" });
         const a1 = buildApproveCalldata(data.pool.token1, npm, MAX_UINT256);
-        const h1 = await sendTx(a1);
+        const h1 = await sendWithRetry(a1, `授权 ${data.pool.token1Symbol}`);
         setStep(1, { status: "done", hash: h1 });
         await new Promise((r) => setTimeout(r, 1200));
       }
@@ -192,26 +209,32 @@ export function MintPositionPanel({
         recipient: address,
         slippagePct: 0.5,
       });
-      const hm = await sendTx(mint);
-      // 等 mint 回执，从 Transfer(from=0x0) 事件解析出准确的 tokenId
-      // （不能用 balanceOf-1 查 tokenOfOwnerByIndex：若历史上有 burn/转出，
-      //   Enumerable index 会重排，最后 mint 的不一定是最大 index）
-      const tokenId = await waitForMintTokenId(npm, address, hm);
+      const hm = await sendWithRetry(mint, "创建仓位");
+      // tokenId 三级解析：回执事件 → 余额对比 diff → 失败提示手动
+      const tokenId = (await waitForMintTokenId(npm, address, hm))
+        ?? (await diffNewTokenId(npm, address, beforeIds));
       setStep(2, { status: "done", hash: hm });
 
       // Step 4: 质押（自动匹配到才做）
       if (staker) {
         if (!tokenId) {
           setStep(3, { status: "error" });
-          setMsg(`✅ 仓位已创建（未能从回执解析 tokenId，请手动质押）`);
+          setMsg(`✅ 仓位已创建（未能解析 tokenId，请手动质押）`);
         } else {
-          const approveNft = buildNftApproveCalldata(npm, staker, tokenId);
-          const ha = await sendTx(approveNft);
-          await new Promise((r) => setTimeout(r, 1500));
-          const dep = buildStakeDepositCalldata(staker, tokenId);
-          const hd = await sendTx(dep);
-          setStep(3, { status: "done", hash: hd });
-          setMsg(`✅ 创建并质押成功！tokenId=${tokenId}`);
+          setStep(3, { status: "loading" });
+          try {
+            // 质押 = approve NFT + deposit，每步带重试；用户在重试弹窗拒绝则整体抛出
+            const approveNft = buildNftApproveCalldata(npm, staker, tokenId);
+            await sendWithRetry(approveNft, "授权 NFT 给质押合约");
+            await new Promise((r) => setTimeout(r, 1500));
+            const dep = buildStakeDepositCalldata(staker, tokenId);
+            const hd = await sendWithRetry(dep, "质押");
+            setStep(3, { status: "done", hash: hd });
+            setMsg(`✅ 创建并质押成功！tokenId=${tokenId}`);
+          } catch (e: any) {
+            setStep(3, { status: "error" });
+            setMsg(`⚠️ 仓位已创建（tokenId=${tokenId}），质押未完成：${e?.message ?? e}\n可刷新面板后到仓位卡片单独质押`);
+          }
         }
       } else {
         setMsg(`✅ 仓位创建成功${tokenId ? `，tokenId=${tokenId}` : ""}`);
@@ -234,6 +257,56 @@ export function MintPositionPanel({
    * 轮询 eth_getTransactionReceipt 直到 status=0x1 且含目标事件，超时 60 秒。
    * 失败回退：尝试 tokenOfOwnerByIndex（最后一次 mint 的兜底，可能不准）。
    */
+
+  /**
+   * 枚举钱包在 NPM 上持有的全部 tokenId（ERC721 Enumerable，上限 50 个防 RPC 爆炸）。
+   * 失败返回 null（余额对比法不可用时由调用方处理）。
+   */
+  async function listOwnedTokenIds(npm: string, owner: string): Promise<Set<string> | null> {
+    try {
+      const provider = (window as any).okxwallet || (window as any).ethereum;
+      if (!provider) return null;
+      const call = (data: string) => provider.request({ method: "eth_call", params: [{ to: npm, data }, "latest"] });
+      const pad = (v: string) => v.toLowerCase().replace("0x", "").padStart(64, "0");
+      const balData = "0x70a08231" + pad(owner);
+      const bal = BigInt(await call(balData));
+      if (bal === 0n) return new Set();
+      const ids = new Set<string>();
+      // 扫描策略：新 mint 的 tokenId 位于最大 index（Enumerable 追加在尾部），
+      // 先扫尾部 20 个（够 diff 出新 id），不足再补头部
+      const tailScan = bal > 20n ? 20n : bal;
+      for (let i = bal - 1n; i >= bal - tailScan; i--) {
+        try {
+          const idData = "0x2f745c59" + pad(owner) + i.toString(16).padStart(64, "0");
+          ids.add(BigInt(await call(idData)).toString());
+        } catch { break; }
+      }
+      return ids;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * 余额对比法：mint 后轮询钱包 tokenId 集合，diff 出新出现的那个。
+   * 适用于 OKX 等 eth_getTransactionReceipt 拿不到回执的钱包。
+   * 轮询 30 秒。
+   */
+  async function diffNewTokenId(npm: string, owner: string, before: Set<string> | null): Promise<bigint | null> {
+    if (!before) return null;
+    const start = Date.now();
+    while (Date.now() - start < 30_000) {
+      const now = await listOwnedTokenIds(npm, owner);
+      if (now) {
+        for (const id of now) {
+          if (!before.has(id)) return BigInt(id);
+        }
+      }
+      await new Promise((r) => setTimeout(r, 2000));
+    }
+    return null;
+  }
+
   async function waitForMintTokenId(npm: string, owner: string, txHash: string): Promise<bigint | null> {
     const provider = (window as any).okxwallet || (window as any).ethereum;
     if (!provider) return null;
