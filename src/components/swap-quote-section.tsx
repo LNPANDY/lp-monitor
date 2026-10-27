@@ -22,7 +22,7 @@ interface DexWithQuoter {
 }
 
 interface QuoteResult {
-  chain: { id: number; name: string };
+  chain: { id: number; name: string; chain_id: number };
   dexName: string;
   pool: string;
   fee: number;
@@ -125,7 +125,8 @@ export function SwapQuoteSection() {
       if (!j.ok) throw new Error(j.error);
       setQuote(j.data);
       setBalances((j.data as QuoteResult).balances ?? null);
-      // 把另一侧的数量填回输入框（用户没在编辑那侧时）
+      // 把另一侧的数量填回输入框（用户没在编辑那侧时），并标记为自动回填
+      autoFillTsRef.current = Date.now();
       if (dir === "in") {
         setAmountOut(trimNum(j.data.amountOutHuman));
       } else {
@@ -140,9 +141,13 @@ export function SwapQuoteSection() {
 
   // 防抖自动报价
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // doQuote 成功后自动回填另一侧数量时置位，防抖 effect 检测到则跳过（避免二次报价）
+  const autoFillTsRef = useRef(0);
   useEffect(() => {
     if (debounceRef.current) clearTimeout(debounceRef.current);
     debounceRef.current = setTimeout(() => {
+      // 自动回填后的 1 秒内不触发报价（那是回填引发的 effect，不是用户输入）
+      if (Date.now() - autoFillTsRef.current < 1000) return;
       const amount = editingSide === "in" ? amountIn : amountOut;
       if (amount && Number(amount) > 0) doQuote(amount, editingSide);
     }, 700);
@@ -171,7 +176,7 @@ export function SwapQuoteSection() {
     // 授权检查提示（不做静默 approve，用户自行确认额度）
     setSwapping(true); setErr(""); setTxHash("");
     try {
-      await switchChain(quote.chain.id);
+      await switchChain(quote.chain.chain_id);
       // 输出是 wrapped native（isNative 且地址非原生——报价时已映射为 wrapped）时自动 unwrap
       // 判定：tokenOut 的 symbol 与链原生 symbol 前缀匹配（W0G/0G、WETH/ETH）
       const outIsWrappedNative = quote.tokenOut.symbol.toUpperCase().startsWith("W") &&

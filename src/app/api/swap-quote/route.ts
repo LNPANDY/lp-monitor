@@ -293,7 +293,7 @@ export async function POST(req: Request) {
     }
 
     return ok({
-      chain: { id: chain.id, name: chain.name },
+      chain: { id: chain.id, name: chain.name, chain_id: chain.chain_id },
       dexName: dexRow.name,
       pool: pool.toLowerCase(),
       fee,
