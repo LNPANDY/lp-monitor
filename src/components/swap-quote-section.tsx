@@ -48,6 +48,7 @@ interface QuoteResult {
     executionPriceInStable: number;
     diffPct: number;
     cexSymbolLabel: string;
+    displayPrice: number;
   } | null;
 }
 
@@ -383,7 +384,11 @@ export function SwapQuoteSection() {
           </div>
           <div className="flex items-center justify-between border-t border-slate-200 py-1">
             <span className="text-ink-soft">成交价</span>
-            <span>1 {quote.tokenIn.symbol} ≈ {fmtNum(quote.executionPrice ?? 0)} {quote.tokenOut.symbol}</span>
+            {quote.cexCompare ? (
+              <span>1 {quote.cexCompare.otherSymbol} ≈ {fmtNum(quote.cexCompare.displayPrice)} {quote.cexCompare.stableSymbol}</span>
+            ) : (
+              <span>1 {quote.tokenIn.symbol} ≈ {fmtNum(quote.executionPrice ?? 0)} {quote.tokenOut.symbol}</span>
+            )}
           </div>
           {quote.priceImpactPct !== null && quote.priceImpactPct !== undefined && (
             <div className="flex items-center justify-between border-t border-slate-200 py-1">

@@ -304,6 +304,8 @@ export async function POST(req: Request) {
       executionPriceInStable: number; // DEX 成交价换算到同一口径
       diffPct: number;    // (exec - cex) / cex × 100
       cexSymbolLabel: string;
+      /** 统一展示口径：1 otherSymbol = ? stableSymbol（供成交价行用，不管交易方向） */
+      displayPrice: number;
     } | null = null;
     try {
       const stableMappings = db.prepare(
@@ -343,23 +345,23 @@ export async function POST(req: Request) {
               //     cexPrice = 1 / otherQuote.price（1 stable = ? other → 取倒数同口径）
               const stableSymbol = stableMap.token_symbol || "stable";
               const otherSymbol = stableSide === "in" ? symOut : symIn;
-              let cexPrice: number;
-              let execInStable: number;
-              if (stableSide === "out") {
-                cexPrice = otherQuote.price;
-                execInStable = executionPrice;
-              } else {
-                cexPrice = 1 / otherQuote.price;
-                execInStable = 1 / executionPrice;
-              }
-              const diffPct = (execInStable - cexPrice) / cexPrice * 100;
+              // 统一口径："1 otherSymbol = ? stableSymbol"（与交易方向无关）
+              //   stable 在 out 侧：exec 就是该口径
+              //   stable 在 in 侧：exec 是 1 stable = ? other，取倒数
+              const displayPrice = stableSide === "out"
+                ? executionPrice
+                : 1 / executionPrice;
+              // CEX 同口径价：otherQuote.price 本身就是 1 other = ? stable
+              const cexPrice = otherQuote.price;
+              const diffPct = (displayPrice - cexPrice) / cexPrice * 100;
               cexCompare = {
                 stableSymbol,
                 otherSymbol,
                 cexPrice,
-                executionPriceInStable: execInStable,
+                executionPriceInStable: displayPrice,
                 diffPct,
                 cexSymbolLabel: otherQuote.symbol,
+                displayPrice,
               };
             }
           }
