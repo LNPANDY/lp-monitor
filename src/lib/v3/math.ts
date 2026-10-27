@@ -20,6 +20,9 @@ export const FEE_TO_TICK_SPACING: Record<number, number> = {
   10000: 200,
 };
 
+/** 标准 fee 档位（0.01% / 0.05% / 0.3% / 1%），兑换找池子时遍历用 */
+export const FEE_TIERS: number[] = [100, 500, 3000, 10000];
+
 // ==================== tick ↔ sqrtPriceX96 ====================
 
 /**

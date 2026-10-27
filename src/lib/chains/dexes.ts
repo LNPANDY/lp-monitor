@@ -9,6 +9,8 @@ export interface DexRow {
   npm: string; // v3: NonfungiblePositionManager；v4: PositionManager
   stateview?: string; // v4: StateView lens 合约地址（读池状态用，跨链地址不同）
   quoter?: string; // v3: QuoterV2 合约地址（兑换报价用）
+  router02?: string; // SwapRouter02（exactInputSingle struct 签名）
+  swaprouter?: string; // SwapRouter V1（exactInputSingle 平铺签名）
   enabled: number;
 }
 

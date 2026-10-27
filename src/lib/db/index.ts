@@ -319,6 +319,9 @@ function migrate(db: DB) {
   safeAddColumn(db, "dexes", "stateview", "TEXT NOT NULL DEFAULT ''");
   // dexes 表 QuoterV2 地址：代币兑换报价用（V3 fork 单跳报价）
   safeAddColumn(db, "dexes", "quoter", "TEXT NOT NULL DEFAULT ''");
+  // dexes 表 SwapRouter 地址：代币兑换执行用（router02=struct 签名 / swaprouter=平铺签名，二者填其一）
+  safeAddColumn(db, "dexes", "router02", "TEXT NOT NULL DEFAULT ''");
+  safeAddColumn(db, "dexes", "swaprouter", "TEXT NOT NULL DEFAULT ''");
 
   // push_states 重建迁移：加 entity_type 区分仓位/收藏池实体
   migratePushStatesEntityType(db);

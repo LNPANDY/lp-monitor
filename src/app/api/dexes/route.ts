@@ -17,7 +17,7 @@ export async function GET(req: Request) {
 /** 添加自定义 DEX。body: { chain_id, name, factory, npm, type?, stateview? }
  *  v4: factory=PoolManager, npm=PositionManager, stateview=StateView lens（必填） */
 export async function POST(req: Request) {
-  const b = await getBody<{ chain_id?: number; name?: string; factory?: string; npm?: string; type?: string; stateview?: string; quoter?: string }>(req);
+  const b = await getBody<{ chain_id?: number; name?: string; factory?: string; npm?: string; type?: string; stateview?: string; quoter?: string; router02?: string; swaprouter?: string }>(req);
   if (!b.chain_id || !b.name || !b.factory || !b.npm) return fail("chain_id/name/factory/npm 必填");
   if (!/^0x[a-fA-F0-9]{40}$/.test(b.factory)) return fail("factory 地址非法");
   if (!/^0x[a-fA-F0-9]{40}$/.test(b.npm)) return fail("npm 地址非法");
@@ -25,6 +25,10 @@ export async function POST(req: Request) {
   // v4 必须配置 StateView（读池状态），地址格式校验
   const quoter = (b.quoter || "").trim().toLowerCase();
   if (quoter && !/^0x[a-fA-F0-9]{40}$/.test(quoter)) return fail("quoter 地址非法");
+  const router02 = (b.router02 || "").trim().toLowerCase();
+  if (router02 && !/^0x[a-fA-F0-9]{40}$/.test(router02)) return fail("router02 地址非法");
+  const swaprouter = (b.swaprouter || "").trim().toLowerCase();
+  if (swaprouter && !/^0x[a-fA-F0-9]{40}$/.test(swaprouter)) return fail("swaprouter 地址非法");
   let stateview = (b.stateview || "").trim().toLowerCase();
   if (type === "v4") {
     if (!stateview) return fail("v4 需要配置 StateView 地址");
@@ -33,8 +37,8 @@ export async function POST(req: Request) {
   const db = getDb();
   try {
     const info = db.prepare(
-      `INSERT INTO dexes (chain_id_ref, name, type, factory, npm, stateview, quoter, enabled) VALUES (?,?,?,?,?,?,?,1)`
-    ).run(b.chain_id, b.name.trim(), type, b.factory.toLowerCase(), b.npm.toLowerCase(), stateview, quoter);
+      `INSERT INTO dexes (chain_id_ref, name, type, factory, npm, stateview, quoter, router02, swaprouter, enabled) VALUES (?,?,?,?,?,?,?,?,?,1)`
+    ).run(b.chain_id, b.name.trim(), type, b.factory.toLowerCase(), b.npm.toLowerCase(), stateview, quoter, router02, swaprouter);
     return ok({ id: info.lastInsertRowid });
   } catch (e: any) {
     if (String(e?.message).includes("UNIQUE")) return fail("该链上已存在此 factory", 409);
