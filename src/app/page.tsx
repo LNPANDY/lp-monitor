@@ -673,8 +673,8 @@ function FlipButton({ positionId, currentFlip, onFlipped }: { positionId: number
       disabled={loading}
       className={`text-xs px-2 py-1 rounded ${
         flip
-          ? "bg-blue-100 text-blue-700 hover:bg-blue-200"
-          : "bg-slate-100 text-slate-600 hover:bg-slate-200"
+          ? "bg-brand-cyan/15 text-brand-cyan hover:bg-brand-cyan/25"
+          : "bg-white/[0.06] text-slate-300 hover:bg-white/[0.12]"
       } transition-colors`}
     >
       {loading ? "..." : (flip ? "还原" : "翻转")}

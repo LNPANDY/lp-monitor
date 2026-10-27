@@ -50,9 +50,11 @@ body {
 .btn-primary:hover { filter: brightness(1.1); }
 .btn-primary:active { filter: brightness(0.95); }
 .btn-ghost {
-  @apply btn border border-white/10 bg-white/[0.04] text-slate-200;
+  @apply btn border border-white/10 bg-white/[0.04];
   @apply hover:border-white/20 hover:bg-white/[0.08];
+  color: #cbd5e1;
 }
+.btn-ghost:hover { color: #e2e8f0; }
 .btn-danger {
   @apply btn bg-warn/90 text-white hover:bg-warn;
   box-shadow: 0 2px 12px -2px rgba(220, 38, 38, 0.35);
