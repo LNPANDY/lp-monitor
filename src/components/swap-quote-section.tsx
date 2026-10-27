@@ -353,7 +353,7 @@ export function SwapQuoteSection() {
           {quote.availableFees.map((f) => (
             <button
               key={f.fee}
-              className={`rounded px-1.5 py-0.5 ${f.fee === quote.fee ? "bg-ink text-white" : "border border-white/10 bg-white/[0.04] hover:bg-white/[0.08]"}`}
+              className={`rounded px-1.5 py-0.5 ${f.fee === quote.fee ? "bg-brand-cyan/20 text-brand-cyan border border-brand-cyan/40" : "border border-white/10 bg-white/[0.04] text-slate-300 hover:bg-white/[0.08]"}`}
               onClick={() => { setFeeOverride(f.fee); }}
             >
               {f.fee / 10000}%（流动性 {abbrev(f.liquidity)}）
