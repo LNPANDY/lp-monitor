@@ -87,10 +87,12 @@ export async function POST(req: Request) {
     token_in_addr?: string;
     token_out_addr?: string;
     amount_in?: string;
-    /** 目标输出数量（反向输入模式）：想要得到多少 tokenOut，后端迭代反算 amountIn */
+    /** 目标输出数量（反向输入模式）：想要得到多少 tokenOut */
     target_out?: string;
     slippage_pct?: number;
     fee?: number;
+    /** 钱包地址：传了就返回两个 token 的余额（兑换面板显示用） */
+    wallet?: string;
   }>(req);
 
   if (!b.chain_id || !b.token_in_addr || !b.token_out_addr || !b.amount_in) {
@@ -259,6 +261,35 @@ export async function POST(req: Request) {
     // router：优先 router02（struct 签名），回退 swaprouter
     const routerAddr = dexRow.router02 || dexRow.swaprouter || "";
 
+    // 余额查询（wallet 传入时）：native 用 getBalance，ERC20 用 balanceOf
+    let balances: { in: string; out: string } | null = null;
+    if (b.wallet && /^0x[a-fA-F0-9]{40}$/.test(b.wallet)) {
+      try {
+        const readBal = async (tokenAddr: string, isNative: boolean): Promise<bigint> => {
+          try {
+            if (isNative) {
+              return await client.getBalance({ address: b.wallet as `0x${string}` });
+            }
+            return await client.readContract({
+              address: tokenAddr as `0x${string}`,
+              abi: [{ name: "balanceOf", type: "function", stateMutability: "view", inputs: [{ name: "owner", type: "address" }], outputs: [{ name: "", type: "uint256" }] }] as const,
+              functionName: "balanceOf",
+              args: [b.wallet as `0x${string}`],
+            }) as bigint;
+          } catch { return 0n; }
+        };
+        // 注意：__native__ 显示原生余额，wrapped 侧读合约余额（用户实际持有的可能两者都有，
+        // 这里按面板口径：选了原生币显示原生余额，选了 wrapped 显示 wrapped 余额）
+        const inIsNativeToken = b.token_in_addr?.toLowerCase() === "__native__";
+        const outIsNativeToken = b.token_out_addr?.toLowerCase() === "__native__";
+        const [bin, bout] = await Promise.all([
+          readBal(inMeta.addr, inIsNativeToken),
+          readBal(outMeta.addr, outIsNativeToken),
+        ]);
+        balances = { in: bin.toString(), out: bout.toString() };
+      } catch { balances = null; }
+    }
+
     return ok({
       chain: { id: chain.id, name: chain.name },
       dexName: dexRow.name,
@@ -279,6 +310,7 @@ export async function POST(req: Request) {
       router: routerAddr
         ? { addr: routerAddr, kind: dexRow.router02 ? "router02" : "swaprouter" }
         : null,
+      balances,
     });
   } catch (e: any) {
     const msg = String(e?.message ?? e);

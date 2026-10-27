@@ -39,6 +39,7 @@ interface QuoteResult {
   priceImpactPct: number | null;
   gasEstimate: string;
   router: { addr: string; kind: "router02" | "swaprouter" } | null;
+  balances?: { in: string; out: string } | null;
 }
 
 /**
@@ -85,6 +86,8 @@ export function SwapQuoteSection() {
   const [swapping, setSwapping] = useState(false);
   const [err, setErr] = useState("");
   const [txHash, setTxHash] = useState("");
+  // 两个 token 的钱包余额（报价返回）
+  const [balances, setBalances] = useState<{ in: string; out: string } | null>(null);
 
   const tokenInMeta = chainTokens.find((t) => t.token_symbol === inSym);
   const tokenOutMeta = chainTokens.find((t) => t.token_symbol === outSym);
@@ -104,6 +107,7 @@ export function SwapQuoteSection() {
         token_out_addr: tokenOutMeta.token_addr,
         slippage_pct: slippage,
         ...(feeOverride ? { fee: feeOverride } : {}),
+        ...(address ? { wallet: address } : {}),
       };
       if (dir === "in") {
         body.amount_in = amount;
@@ -119,6 +123,7 @@ export function SwapQuoteSection() {
       const j = await r.json();
       if (!j.ok) throw new Error(j.error);
       setQuote(j.data);
+      setBalances((j.data as QuoteResult).balances ?? null);
       // 把另一侧的数量填回输入框（用户没在编辑那侧时）
       if (dir === "in") {
         setAmountOut(trimNum(j.data.amountOutHuman));
@@ -231,10 +236,15 @@ export function SwapQuoteSection() {
                 onChange={(e) => { setEditingSide("in"); setAmountIn(e.target.value); }}
                 placeholder="0.0"
               />
-              <select className="input max-w-[110px]" value={inSym} onChange={(e) => { setInSym(e.target.value); setQuote(null); }}>
+              <select className="input max-w-[110px]" value={inSym} onChange={(e) => { setInSym(e.target.value); setQuote(null); setBalances(null); }}>
                 {chainTokens.map((t) => <option key={t.token_symbol} value={t.token_symbol}>{t.token_symbol}</option>)}
               </select>
             </div>
+            {balances && tokenInMeta && (
+              <div className="mt-0.5 text-[11px] text-ink-soft">
+                余额：{fmtBalance(balances.in, quote?.tokenIn?.decimals ?? 18)}
+              </div>
+            )}
           </label>
 
           {/* 交换按钮 */}
@@ -254,10 +264,15 @@ export function SwapQuoteSection() {
                 onChange={(e) => { setEditingSide("out"); setAmountOut(e.target.value); }}
                 placeholder="0.0"
               />
-              <select className="input max-w-[110px]" value={outSym} onChange={(e) => { setOutSym(e.target.value); setQuote(null); }}>
+              <select className="input max-w-[110px]" value={outSym} onChange={(e) => { setOutSym(e.target.value); setQuote(null); setBalances(null); }}>
                 {chainTokens.map((t) => <option key={t.token_symbol} value={t.token_symbol}>{t.token_symbol}</option>)}
               </select>
             </div>
+            {balances && tokenOutMeta && (
+              <div className="mt-0.5 text-[11px] text-ink-soft">
+                余额：{fmtBalance(balances.out, quote?.tokenOut?.decimals ?? 18)}
+              </div>
+            )}
           </label>
 
           {/* 滑点 + 兑换按钮 */}
@@ -370,4 +385,16 @@ function fmtNum(n: number): string {
   if (!Number.isFinite(n)) return "—";
   if (n >= 1) return n.toLocaleString(undefined, { maximumFractionDigits: 6 });
   return n.toPrecision(6).replace(/0+$/, "").replace(/\.$/, "");
+}
+
+/** raw 余额 → 可读（截断到 6 位有效小数） */
+function fmtBalance(raw: string, decimals?: number): string {
+  try {
+    const n = BigInt(raw);
+    const d = BigInt(decimals ?? 18);
+    const base = 10n ** d;
+    const intPart = n / base;
+    const frac = (n % base).toString().padStart(Number(d), "0").slice(0, 6).replace(/0+$/, "");
+    return frac ? `${intPart}.${frac}` : `${intPart}`;
+  } catch { return "0"; }
 }

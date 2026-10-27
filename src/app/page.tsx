@@ -3,6 +3,7 @@ import { useState, useEffect } from "react";
 import useSWR from "swr";
 import { fetcher, authHeaders, short, timeAgo, fmtFull } from "@/components/util";
 import { SwapQuoteSection } from "@/components/swap-quote-section";
+import { useWallet } from "@/lib/wallet/use-wallet";
 
 /** 推送冷却可选值（分钟） */
 const COOLDOWN_OPTIONS = [2, 5, 10, 20, 30, 60];
@@ -224,8 +225,14 @@ interface PortfolioResult {
 
 function PortfolioSection() {
   const { data: chains } = useSWR<any[]>("/api/chains", fetcher);
+  const { address: walletAddr } = useWallet();
   const [chainId, setChainId] = useState<number | "">("");
   const [addr, setAddr] = useState("");
+  // 钱包连接后自动填入地址（且用户尚未手动输入过时）
+  useEffect(() => {
+    if (walletAddr && !addr) setAddr(walletAddr);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [walletAddr]);
   // 手动触发：点「统计」后才请求，避免无输入时自动拉链上数据。
   // query 里带一个自增 seq，每次点击都产生全新的 SWR key，从而：
   //  ① 不复用上次的 SWR 缓存数据（避免先显示旧数据再后台刷新）
