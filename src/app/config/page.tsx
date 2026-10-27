@@ -512,7 +512,7 @@ function CexMappingSection() {
                   ) : (
                     <span className="font-mono text-sm">
                       {m.cex_symbol}
-                      {m.inverted === 1 && <span className="ml-1 text-xs text-blue-600 bg-blue-50 px-1.5 py-0.5 rounded" title="取倒数翻转">翻转</span>}
+                      {m.inverted === 1 && <span className="ml-1 text-xs text-brand-cyan bg-brand-cyan/10 px-1.5 py-0.5 rounded" title="取倒数翻转">翻转</span>}
                     </span>
                   )}
                   <span className="text-ink-soft">{m.chain_name}</span>

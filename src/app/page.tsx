@@ -717,8 +717,8 @@ function CexAlertMuteButton({ positionId, currentMuted, onToggled }: { positionI
       title={muted ? "点击恢复该交易对的 CEX 差价预警" : "点击静音该交易对的 CEX 差价预警"}
       className={`text-xs px-2 py-1 rounded ${
         muted
-          ? "bg-orange-100 text-orange-700 hover:bg-orange-200"
-          : "bg-emerald-50 text-ok hover:bg-emerald-100"
+          ? "bg-warn/15 text-warn hover:bg-warn/25"
+          : "bg-ok/15 text-ok hover:bg-ok/25"
       } transition-colors`}
     >
       {loading ? "..." : (muted ? "预警:关" : "预警:开")}
