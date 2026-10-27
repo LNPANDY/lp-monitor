@@ -718,7 +718,7 @@ function CexAlertMuteButton({ positionId, currentMuted, onToggled }: { positionI
       className={`text-xs px-2 py-1 rounded ${
         muted
           ? "bg-orange-100 text-orange-700 hover:bg-orange-200"
-          : "bg-emerald-50 text-emerald-700 hover:bg-emerald-100"
+          : "bg-emerald-50 text-ok hover:bg-emerald-100"
       } transition-colors`}
     >
       {loading ? "..." : (muted ? "预警:关" : "预警:开")}
@@ -760,7 +760,7 @@ function PositionCard({ p, highlight, closed, onFlipped }: { p: Position; highli
             <div className="flex items-center gap-2">
               <span className="font-semibold">{pair}</span>
               {p.pair_flip === 1 && (
-                <span className="text-xs text-blue-600 bg-blue-50 px-1.5 py-0.5 rounded" title="交易对已翻转">
+                <span className="text-xs text-brand-cyan bg-brand-cyan/10 px-1.5 py-0.5 rounded" title="交易对已翻转">
                   翻转
                 </span>
               )}

@@ -16,21 +16,21 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
       <body>
         <TokenBridge />
         <ExtensionGuard />
-        <header className="border-b border-slate-200 bg-white">
+        <header className="glass-header sticky top-0 z-40">
           <div className="mx-auto flex max-w-6xl items-center justify-between px-6 py-3">
             <Link href="/" className="flex items-center gap-2 font-semibold">
               <span className="text-lg">💧</span>
-              <span>LP Monitor</span>
+              <span className="text-brand-gradient">LP Monitor</span>
             </Link>
-            <nav className="flex items-center gap-4 text-sm">
-              <Link href="/" className="hover:underline">仪表盘</Link>
-              <Link href="/alerts" className="hover:underline">告警</Link>
-              <Link href="/config" className="hover:underline">配置</Link>
+            <nav className="flex items-center gap-4 text-sm text-slate-300">
+              <Link href="/" className="hover:text-white transition-colors">仪表盘</Link>
+              <Link href="/alerts" className="hover:text-white transition-colors">告警</Link>
+              <Link href="/config" className="hover:text-white transition-colors">配置</Link>
               <WalletConnect />
             </nav>
           </div>
         </header>
-        <main className="mx-auto max-w-6xl px-6 py-6">{children}</main>
+        <main className="mx-auto max-w-6xl px-4 py-6 md:px-6">{children}</main>
       </body>
     </html>
   );

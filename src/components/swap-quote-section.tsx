@@ -297,7 +297,7 @@ export function SwapQuoteSection() {
           {/* 交换按钮：与输入行垂直居中（label 标题 20px + 输入框 38px 的一半） */}
           <div className="pt-[26px] md:pt-[26px]">
             <button
-              className="rounded border border-slate-300 bg-white px-1.5 py-1.5 text-xs hover:bg-slate-100"
+              className="rounded border border-white/10 bg-white/[0.04] px-1.5 py-1.5 text-xs hover:bg-white/[0.08]"
               title="交换方向"
               onClick={swapSides}
             >⇄</button>
@@ -353,7 +353,7 @@ export function SwapQuoteSection() {
           {quote.availableFees.map((f) => (
             <button
               key={f.fee}
-              className={`rounded px-1.5 py-0.5 ${f.fee === quote.fee ? "bg-ink text-white" : "border border-slate-300 bg-white hover:bg-slate-100"}`}
+              className={`rounded px-1.5 py-0.5 ${f.fee === quote.fee ? "bg-ink text-white" : "border border-white/10 bg-white/[0.04] hover:bg-white/[0.08]"}`}
               onClick={() => { setFeeOverride(f.fee); }}
             >
               {f.fee / 10000}%（流动性 {abbrev(f.liquidity)}）
@@ -365,7 +365,7 @@ export function SwapQuoteSection() {
       {quoting && <p className="text-sm text-ink-soft">报价中…（自动找池子 + Quoter 调用）</p>}
       {err && <p className="text-sm text-warn">{err}</p>}
       {txHash && (
-        <p className="text-sm text-emerald-700">
+        <p className="text-sm text-ok">
           ✅ 兑换交易已提交：<span className="font-mono">{short(txHash)}</span>
         </p>
       )}
@@ -400,7 +400,7 @@ export function SwapQuoteSection() {
               </span>
               <span className={Math.abs(quote.cexCompare.diffPct) > 1 ? "text-warn font-semibold" : ""}>
                 CEX {quote.cexCompare.cexPrice.toPrecision(6)} · DEX {quote.cexCompare.executionPriceInStable.toPrecision(6)}{" "}
-                <span className={quote.cexCompare.diffPct >= 0 ? "text-emerald-600" : "text-red-600"}>
+                <span className={quote.cexCompare.diffPct >= 0 ? "text-ok" : "text-warn"}>
                   {quote.cexCompare.diffPct >= 0 ? "+" : ""}{quote.cexCompare.diffPct.toFixed(2)}%
                 </span>
               </span>

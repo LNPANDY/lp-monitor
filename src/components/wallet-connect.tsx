@@ -19,7 +19,7 @@ export function WalletConnect() {
           <span className="hidden text-[11px] text-ink-soft sm:inline">{walletName}</span>
         )}
         <button
-          className="rounded border border-slate-200 bg-white px-2.5 py-1 text-xs hover:bg-slate-50"
+          className="rounded border border-white/10 bg-white/[0.04] px-2.5 py-1 text-xs hover:bg-white/[0.08]"
           title={`${address} · 点击断开`}
           onClick={disconnect}
         >
@@ -32,7 +32,7 @@ export function WalletConnect() {
   return (
     <div className="flex items-center gap-2">
       <button
-        className="rounded bg-ink px-3 py-1 text-xs text-white hover:bg-ink/90 disabled:opacity-50"
+        className="btn-primary rounded px-3 py-1 text-xs"
         disabled={status === "connecting"}
         onClick={connect}
       >

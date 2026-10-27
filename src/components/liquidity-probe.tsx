@@ -500,7 +500,7 @@ export function LiquidityProbe() {
             <span className="tag-muted">{result.fee / 10000}%</span>
             <span className="tag-muted">ts {result.tickSpacing}</span>
             {flip && (
-              <span className="text-xs text-blue-600 bg-blue-50 px-1.5 py-0.5 rounded" title="交易对已翻转">
+              <span className="text-xs text-brand-cyan bg-brand-cyan/10 px-1.5 py-0.5 rounded" title="交易对已翻转">
                 翻转
               </span>
             )}

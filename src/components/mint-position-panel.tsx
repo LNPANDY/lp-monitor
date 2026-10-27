@@ -373,7 +373,7 @@ export function MintPositionPanel({
               {busy && <span className="ml-2">读取中…</span>}
             </div>
           ) : (
-            <div className="rounded bg-amber-50 p-2 text-amber-700">
+            <div className="rounded bg-brand-violet/10 p-2 text-brand-violet">
               👇 请在下方「收藏」列表点击一个交易对开始创建
             </div>
           )}
@@ -391,14 +391,14 @@ export function MintPositionPanel({
               刷新 tick
             </button>
             {data.dex ? (
-              <span className="rounded bg-emerald-100 px-1.5 py-0.5 text-emerald-700">
+              <span className="rounded bg-ok/15 px-1.5 py-0.5 text-ok">
                 {data.dex.name}
               </span>
             ) : (
               <span className="rounded bg-warn/20 px-1.5 py-0.5 text-warn">未匹配 DEX</span>
             )}
             {data.matchedStaking?.length > 0 ? (
-              <span className="rounded bg-amber-100 px-1.5 py-0.5 text-amber-700">
+              <span className="rounded bg-brand-violet/15 px-1.5 py-0.5 text-brand-violet">
                 质押 → {data.matchedStaking[0].pair_label || data.matchedStaking[0].platform}
               </span>
             ) : (
