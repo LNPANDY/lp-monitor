@@ -1,7 +1,8 @@
 "use client";
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import useSWR from "swr";
 import { fetcher, authHeaders, short, timeAgo, fmtFull } from "@/components/util";
+import { SwapQuoteSection } from "@/components/swap-quote-section";
 
 /** 推送冷却可选值（分钟） */
 const COOLDOWN_OPTIONS = [2, 5, 10, 20, 30, 60];
@@ -141,6 +142,9 @@ export default function DashboardPage() {
       {/* 链上资产统计 */}
       <PortfolioSection />
 
+      {/* 代币兑换报价（QuoterV2） */}
+      <SwapQuoteSection />
+
       {/* 流动性探针（场景C + 收藏） */}
       <LiquidityProbe />
 
@@ -227,12 +231,50 @@ function PortfolioSection() {
   //  ① 不复用上次的 SWR 缓存数据（避免先显示旧数据再后台刷新）
   //  ② isLoading=true，明确展示「统计中…」
   const [query, setQuery] = useState<{ chainId: number; addr: string; seq: number } | null>(null);
+  // 最近查询记录（localStorage，最多 10 条）
+  const [history, setHistory] = useState<{ chainId: number; chainName: string; address: string; ts: number }[]>([]);
   // ERC20 代币列表折叠状态（默认展开）
   const [erc20Open, setErc20Open] = useState(true);
   const { data, error, isLoading } = useSWR<PortfolioResult>(
     query ? `/api/portfolio?chain_id=${query.chainId}&address=${encodeURIComponent(query.addr)}&_=${query.seq}` : null,
     fetcher
   );
+
+  // 初始加载历史记录（仅客户端）
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem("lp_monitor_portfolio_history");
+      if (raw) setHistory(JSON.parse(raw));
+    } catch { /* ignore */ }
+  }, []);
+
+  // 查询成功后自动记录（SWR data 变化且非 error 时）
+  useEffect(() => {
+    if (!data || !query) return;
+    const chainName = (chains ?? []).find((c: any) => c.id === query.chainId)?.name ?? `chain#${query.chainId}`;
+    setHistory((prev) => {
+      const next = [
+        { chainId: query.chainId, chainName, address: query.addr, ts: Date.now() },
+        ...prev.filter((h) => !(h.chainId === query.chainId && h.address.toLowerCase() === query.addr.toLowerCase())),
+      ].slice(0, 10);
+      try { localStorage.setItem("lp_monitor_portfolio_history", JSON.stringify(next)); } catch { /* ignore */ }
+      return next;
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [data]);
+
+  function removeHistory(ts: number) {
+    setHistory((prev) => {
+      const next = prev.filter((h) => h.ts !== ts);
+      try { localStorage.setItem("lp_monitor_portfolio_history", JSON.stringify(next)); } catch { /* ignore */ }
+      return next;
+    });
+  }
+
+  function clearHistory() {
+    setHistory([]);
+    try { localStorage.removeItem("lp_monitor_portfolio_history"); } catch { /* ignore */ }
+  }
 
   function doQuery() {
     if (!chainId || !/^0x[a-fA-F0-9]{40}$/.test(addr.trim())) return;
@@ -259,6 +301,26 @@ function PortfolioSection() {
           <button className="btn-primary w-full" onClick={doQuery} disabled={!chainId || !addr}>统计</button>
         </div>
       </div>
+
+      {/* 最近查询记录 */}
+      {history.length > 0 && (
+        <div className="mb-4 flex flex-wrap items-center gap-1.5">
+          <span className="text-xs text-ink-soft">最近查询：</span>
+          {history.map((h) => (
+            <span key={h.ts} className="inline-flex items-center gap-1 rounded border border-slate-200 bg-slate-50 px-2 py-1 text-xs">
+              <button
+                className="hover:text-ink"
+                title={`${h.chainName} · ${h.address}`}
+                onClick={() => { setChainId(h.chainId); setAddr(h.address); setQuery({ chainId: h.chainId, addr: h.address, seq: Date.now() }); }}
+              >
+                {h.chainName} · {short(h.address)}
+              </button>
+              <button className="text-ink-soft hover:text-warn" onClick={() => removeHistory(h.ts)}>×</button>
+            </span>
+          ))}
+          <button className="text-xs text-ink-soft hover:text-warn" onClick={clearHistory}>清空</button>
+        </div>
+      )}
 
       {isLoading && <p className="text-sm text-ink-soft">统计中…（需读取链上余额与池子状态）</p>}
       {error && <p className="text-sm text-warn">❌ {(error as any)?.message ?? error}</p>}

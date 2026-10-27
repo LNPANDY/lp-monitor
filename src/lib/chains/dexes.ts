@@ -8,6 +8,7 @@ export interface DexRow {
   factory: string;
   npm: string; // v3: NonfungiblePositionManager；v4: PositionManager
   stateview?: string; // v4: StateView lens 合约地址（读池状态用，跨链地址不同）
+  quoter?: string; // v3: QuoterV2 合约地址（兑换报价用）
   enabled: number;
 }
 

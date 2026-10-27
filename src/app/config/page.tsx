@@ -195,12 +195,12 @@ function DexesSection() {
   const { data: chains } = useSWR<any[]>("/api/chains", fetcher);
   const [chainId, setChainId] = useState<number | "">("");
   const { data: dexes } = useSWR<any[]>(chainId ? `/api/dexes?chain_id=${chainId}` : "/api/dexes", fetcher);
-  const [form, setForm] = useState({ name: "", factory: "", npm: "", type: "v3-fork", stateview: "" });
+  const [form, setForm] = useState({ name: "", factory: "", npm: "", type: "v3-fork", stateview: "", quoter: "" });
   const [err, setErr] = useState("");
 
   async function add() {
     setErr("");
-    try { await api("/api/dexes", "POST", { chain_id: Number(chainId), ...form }); setForm({ name: "", factory: "", npm: "", type: "v3-fork", stateview: "" }); mutate(chainId ? `/api/dexes?chain_id=${chainId}` : "/api/dexes"); }
+    try { await api("/api/dexes", "POST", { chain_id: Number(chainId), ...form }); setForm({ name: "", factory: "", npm: "", type: "v3-fork", stateview: "", quoter: "" }); mutate(chainId ? `/api/dexes?chain_id=${chainId}` : "/api/dexes"); }
     catch (e: any) { setErr(e.message); }
   }
 
@@ -214,6 +214,9 @@ function DexesSection() {
         <Field label={form.type === "v4" ? "PoolManager" : "Factory"}><input className="input" value={form.factory} onChange={(e) => setForm({ ...form, factory: e.target.value })} placeholder="0x…" /></Field>
         <Field label={form.type === "v4" ? "PositionManager" : "NPM"}><input className="input" value={form.npm} onChange={(e) => setForm({ ...form, npm: e.target.value })} placeholder="0x…" /></Field>
         <Field label="类型"><select className="input" value={form.type} onChange={(e) => setForm({ ...form, type: e.target.value })}><option value="v3-fork">v3-fork</option><option value="v4">v4</option></select></Field>
+      </div>
+      <div className="mb-3">
+        <Field label="QuoterV2 地址（可选，代币兑换报价用；从 DEX 文档或浏览器搜 QuoterV2）"><input className="input" value={form.quoter} onChange={(e) => setForm({ ...form, quoter: e.target.value })} placeholder="0x…" /></Field>
       </div>
       {form.type === "v4" && (
         <div className="mb-3">
@@ -229,6 +232,7 @@ function DexesSection() {
               { key: "name", label: "名称" },
               { key: "factory", label: d.type === "v4" ? "PoolManager 地址" : "Factory 地址" },
               { key: "npm", label: d.type === "v4" ? "PositionManager 地址" : "NPM 地址" },
+              { key: "quoter", label: "QuoterV2 地址（报价用）" },
               ...(d.type === "v4" ? [{ key: "stateview", label: "StateView 地址" }] : []),
             ]}
             values={d}

@@ -317,6 +317,8 @@ function migrate(db: DB) {
   safeAddColumn(db, "liquidity_favorites", "monitor_cex", "INTEGER NOT NULL DEFAULT 0");
   // dexes 表 Uniswap v4 支持：StateView lens 合约地址（v4 池状态读取，跨链地址不同需配置）
   safeAddColumn(db, "dexes", "stateview", "TEXT NOT NULL DEFAULT ''");
+  // dexes 表 QuoterV2 地址：代币兑换报价用（V3 fork 单跳报价）
+  safeAddColumn(db, "dexes", "quoter", "TEXT NOT NULL DEFAULT ''");
 
   // push_states 重建迁移：加 entity_type 区分仓位/收藏池实体
   migratePushStatesEntityType(db);

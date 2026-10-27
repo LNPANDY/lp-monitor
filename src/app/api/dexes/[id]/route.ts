@@ -4,7 +4,7 @@ import { ok, fail, getBody } from "@/lib/api";
 export const dynamic = "force-dynamic";
 
 export async function PATCH(req: Request, { params }: { params: { id: string } }) {
-  const b = await getBody<{ name?: string; factory?: string; npm?: string; stateview?: string; enabled?: number }>(req);
+  const b = await getBody<{ name?: string; factory?: string; npm?: string; stateview?: string; quoter?: string; enabled?: number }>(req);
   const db = getDb();
   const sets: string[] = [];
   const args: any[] = [];
@@ -12,6 +12,7 @@ export async function PATCH(req: Request, { params }: { params: { id: string } }
   if (b.factory !== undefined) { sets.push("factory=?"); args.push(b.factory.toLowerCase()); }
   if (b.npm !== undefined) { sets.push("npm=?"); args.push(b.npm.toLowerCase()); }
   if (b.stateview !== undefined) { sets.push("stateview=?"); args.push(b.stateview.trim().toLowerCase()); }
+  if (b.quoter !== undefined) { sets.push("quoter=?"); args.push(b.quoter.trim().toLowerCase()); }
   if (b.enabled !== undefined) { sets.push("enabled=?"); args.push(b.enabled ? 1 : 0); }
   if (sets.length === 0) return fail("无更新字段");
   args.push(params.id);
