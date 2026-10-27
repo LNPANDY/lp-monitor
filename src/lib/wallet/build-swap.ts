@@ -72,17 +72,50 @@ export interface SwapParams {
   deadline: bigint;
 }
 
+/** unwrapWETH9(uint256,recipient)：把 Router 持有的 WETH 提成 native 发给 recipient */
+const UNWRAP_WETH_ABI = [
+  {
+    name: "unwrapWETH9",
+    type: "function",
+    stateMutability: "payable",
+    inputs: [
+      { name: "amountMinimum", type: "uint256" },
+      { name: "recipient", type: "address" },
+    ],
+    outputs: [],
+  },
+] as const;
+
+/** multicall(bytes[])：Router02 的批量执行 */
+const MULTICALL_ABI = [
+  {
+    name: "multicall",
+    type: "function",
+    stateMutability: "payable",
+    inputs: [{ name: "data", type: "bytes[]" }],
+    outputs: [{ name: "results", type: "bytes[]" }],
+  },
+] as const;
+
 /**
- * 构造 swap 的 calldata + 可选的 value（native 输入时）。
+ * 构造「swap + 自动 unwrap」的 calldata。
  *
+ * 输出为 wrapped 原生币（如 W0G）且 router 是 Router02（支持 multicall）时：
+ *   calldata = multicall([exactInputSingle, unwrapWETH9(amountMin, recipient)])
+ *   swap 得到的 wrapped 立即在 Router 内 withdraw 成 native 发到钱包。
+ * 其他情况退化为单笔 exactInputSingle。
+ *
+ * @param routerAddr router 地址
  * @param routerKind 'router02'（struct）| 'swaprouter'（平铺）
  * @param isNativeIn 输入是否为原生币（true 时返回 value 字段）
+ * @param unwrap 输出是 wrapped native 时传 true（自动提现）
  */
 export function buildSwapCalldata(
   routerAddr: string,
   routerKind: "router02" | "swaprouter",
   p: SwapParams,
-  isNativeIn: boolean
+  isNativeIn: boolean,
+  unwrap: boolean = false
 ): { to: string; data: string; value?: string } {
   const deadline = p.deadline > 0n ? p.deadline : BigInt(Math.floor(Date.now() / 1000) + 1200);
   const abi = routerKind === "router02" ? ROUTER02_ABI : SWAPROUTER_V1_ABI;
@@ -96,16 +129,36 @@ export function buildSwapCalldata(
     amountOutMinimum: p.amountOutMinimum,
     sqrtPriceLimitX96: 0n,
   };
-  const data = encodeFunctionData({
+  const swapData = encodeFunctionData({
     abi,
     functionName: "exactInputSingle",
     args: routerKind === "router02"
       ? [args]
       : [args.tokenIn, args.tokenOut, args.fee, args.recipient, args.deadline, args.amountIn, args.amountOutMinimum, args.sqrtPriceLimitX96],
   });
+
+  // unwrap：swap 得到的 wrapped native 在同一交易里 withdraw 成 native（Router02 multicall）
+  if (unwrap && routerKind === "router02") {
+    const unwrapData = encodeFunctionData({
+      abi: UNWRAP_WETH_ABI,
+      functionName: "unwrapWETH9",
+      args: [p.amountOutMinimum, p.recipient as `0x${string}`],
+    });
+    const data = encodeFunctionData({
+      abi: MULTICALL_ABI,
+      functionName: "multicall",
+      args: [[swapData, unwrapData]],
+    });
+    return {
+      to: routerAddr,
+      data,
+      ...(isNativeIn ? { value: "0x" + p.amountIn.toString(16) } : {}),
+    };
+  }
+
   return {
     to: routerAddr,
-    data,
+    data: swapData,
     ...(isNativeIn ? { value: "0x" + p.amountIn.toString(16) } : {}),
   };
 }

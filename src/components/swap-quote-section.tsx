@@ -98,26 +98,23 @@ export function SwapQuoteSection() {
     }
     setQuoting(true);
     try {
-      // 反向输入（tokenOut 侧填数字）时，先用上次成交价反算 tokenIn 数量
-      let amountForQuote = amount;
-      if (dir === "out" && quote) {
-        // 用上次报价的成交价反算：amountIn ≈ amountOut / price
-        const price = Number(quote.amountOutHuman) / Number(quote.amountInHuman);
-        if (Number.isFinite(price) && price > 0) {
-          amountForQuote = (Number(amount) / price).toPrecision(10);
-        }
+      const body: any = {
+        chain_id: dex.chain_id_ref,
+        token_in_addr: tokenInMeta.token_addr,
+        token_out_addr: tokenOutMeta.token_addr,
+        slippage_pct: slippage,
+        ...(feeOverride ? { fee: feeOverride } : {}),
+      };
+      if (dir === "in") {
+        body.amount_in = amount;
+      } else {
+        // 反向输入：直接把目标输出数量传给后端迭代反算（精确，无近似）
+        body.target_out = amount;
       }
       const r = await fetch("/api/swap-quote", {
         method: "POST",
         headers: authHeaders({ "Content-Type": "application/json" }),
-        body: JSON.stringify({
-          chain_id: dex.chain_id_ref,
-          token_in_addr: tokenInMeta.token_addr,
-          token_out_addr: tokenOutMeta.token_addr,
-          amount_in: amountForQuote,
-          slippage_pct: slippage,
-          ...(feeOverride ? { fee: feeOverride } : {}),
-        }),
+        body: JSON.stringify(body),
       });
       const j = await r.json();
       if (!j.ok) throw new Error(j.error);
@@ -158,6 +155,10 @@ export function SwapQuoteSection() {
     setSwapping(true); setErr(""); setTxHash("");
     try {
       await switchChain(quote.chain.id);
+      // 输出是 wrapped native（isNative 且地址非原生——报价时已映射为 wrapped）时自动 unwrap
+      // 判定：tokenOut 的 symbol 与链原生 symbol 前缀匹配（W0G/0G、WETH/ETH）
+      const outIsWrappedNative = quote.tokenOut.symbol.toUpperCase().startsWith("W") &&
+        quote.tokenOut.symbol.length > 1;
       const swap = buildSwapCalldata(
         quote.router.addr,
         quote.router.kind,
@@ -170,7 +171,8 @@ export function SwapQuoteSection() {
           amountOutMinimum: BigInt(quote.amountOutMin),
           deadline: 0n, // buildSwapCalldata 内部默认 +20 分钟
         },
-        quote.tokenIn.isNative
+        quote.tokenIn.isNative,
+        outIsWrappedNative
       );
       const h = await sendTx({ to: swap.to, data: swap.data, value: swap.value ? BigInt(swap.value) : undefined });
       setTxHash(h);

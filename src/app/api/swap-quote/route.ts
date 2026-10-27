@@ -87,6 +87,8 @@ export async function POST(req: Request) {
     token_in_addr?: string;
     token_out_addr?: string;
     amount_in?: string;
+    /** 目标输出数量（反向输入模式）：想要得到多少 tokenOut，后端迭代反算 amountIn */
+    target_out?: string;
     slippage_pct?: number;
     fee?: number;
   }>(req);
@@ -170,8 +172,23 @@ export async function POST(req: Request) {
     const symIn = inMeta.isNative ? chain.symbol : (mIn?.symbol ?? "tokenIn");
     const symOut = outMeta.isNative ? chain.symbol : (mOut?.symbol ?? "tokenOut");
 
-    const amountIn = parseHumanAmount(b.amount_in, decIn);
-    if (amountIn <= 0n) return fail("amount_in 须为正数");
+    // 金额确定：
+    //   正向（amount_in）直接用；反向（target_out）用 spot 价估初始值，
+    //   报价后按实际 amountOut/目标 比例迭代修正一次（Quoter 是线性的近似，两次足够精确）
+    let targetOutRaw = 0n;
+    let amountIn = 0n;
+    if (b.target_out) {
+      targetOutRaw = parseHumanAmount(b.target_out, decOut);
+      if (targetOutRaw <= 0n) return fail("target_out 须为正数");
+      const slot00 = await client.readContract({ address: pool as `0x${string}`, abi: POOL_SLOT0_ABI, functionName: "slot0" }) as readonly [bigint, number, number, number];
+      const spot = Number(slot00[0]) ** 2 / Number(1n << 96n) ** 2 * Math.pow(10, decIn - decOut);
+      if (spot <= 0) return fail("读取池子价格失败");
+      // 初始估计：targetOut / spot
+      amountIn = parseHumanAmount((Number(targetOutRaw) / Number(10n ** BigInt(decOut)) / spot).toPrecision(15), decIn);
+    } else {
+      amountIn = parseHumanAmount(b.amount_in, decIn);
+    }
+    if (amountIn <= 0n) return fail("金额须为正数");
 
     // 5. QuoterV2 报价（revert 回退 V1）
     const quoter = dexRow.quoter as `0x${string}`;
@@ -215,6 +232,34 @@ export async function POST(req: Request) {
     }
     if (amountOut <= 0n) {
       return fail("报价结果为 0：池子流动性可能不足以完成这笔兑换", 422);
+    }
+
+    // 反向模式迭代：按实际产出与目标的比例修正 amountIn，重新报价一次
+    if (targetOutRaw > 0n && amountOut !== targetOutRaw) {
+      const ratio = Number(targetOutRaw) / Number(amountOut);
+      if (Number.isFinite(ratio) && ratio > 0 && ratio < 1e6) {
+        const adjusted = BigInt(BigInt(Math.floor(Number(amountIn) * ratio * 1.0001))); // 1.0001 防止差一点
+        if (adjusted > 0n && adjusted !== amountIn) {
+          amountIn = adjusted;
+          try {
+            const r2 = await client.readContract({
+              address: quoter,
+              abi: QUOTER_V2_ABI,
+              functionName: "quoteExactInputSingle",
+              args: [{
+                tokenIn: inMeta.addr as `0x${string}`,
+                tokenOut: outMeta.addr as `0x${string}`,
+                amountIn,
+                fee,
+                sqrtPriceLimitX96: 0n,
+              }],
+            }) as readonly [bigint, bigint, number, bigint];
+            amountOut = r2[0];
+            sqrtPriceAfter = r2[1];
+            gasEstimate = r2[3];
+          } catch { /* 修正失败就按第一次结果返回 */ }
+        }
+      }
     }
 
     // 6. 价格影响：spot 价 vs 成交价
