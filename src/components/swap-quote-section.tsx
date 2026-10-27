@@ -93,6 +93,26 @@ export function SwapQuoteSection() {
   const tokenInMeta = chainTokens.find((t) => t.token_symbol === inSym);
   const tokenOutMeta = chainTokens.find((t) => t.token_symbol === outSym);
 
+  /** 只查钱包余额（不走报价）：native 用链配置 symbol 匹配 __native__ 行判断 */
+  const fetchBalances = useCallback(async () => {
+    if (!dex || !address || !tokenInMeta || !tokenOutMeta) return;
+    try {
+      const r = await fetch("/api/token-balances", {
+        method: "POST",
+        headers: authHeaders({ "Content-Type": "application/json" }),
+        body: JSON.stringify({
+          chain_id: dex.chain_id_ref,
+          wallet: address,
+          tokens: [tokenInMeta.token_addr, tokenOutMeta.token_addr],
+        }),
+      });
+      const j = await r.json();
+      if (!j.ok) return;
+      const arr: string[] = j.data.balances;
+      setBalances({ in: arr[0] ?? "0", out: arr[1] ?? "0" });
+    } catch { /* ignore */ }
+  }, [dex, address, tokenInMeta, tokenOutMeta]);
+
   /** 报价：用输入侧的金额 */
   const doQuote = useCallback(async (amount: string, dir: "in" | "out") => {
     setErr("");
@@ -155,16 +175,16 @@ export function SwapQuoteSection() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [amountIn, amountOut, editingSide, inSym, outSym, slippage, feeOverride]);
 
-  // 选完 token 对后立即加载（用最小金额 1 触发一次报价，拿到余额 + 池子信息）
+  // 选完 token 对后只查钱包余额（不走报价）
   const initialLoadedRef = useRef("");
   useEffect(() => {
-    if (!dex || !tokenInMeta || !tokenOutMeta || inSym === outSym) return;
-    const key = `${dex.id}-${inSym}-${outSym}`;
+    if (!dex || !address || !tokenInMeta || !tokenOutMeta || inSym === outSym) return;
+    const key = `${dex.chain_id_ref}-${inSym}-${outSym}-${address}`;
     if (initialLoadedRef.current === key) return;
     initialLoadedRef.current = key;
-    doQuote("1", "in");
+    fetchBalances();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [dex?.id, inSym, outSym]);
+  }, [dex?.id, inSym, outSym, address]);
 
   /** 执行兑换 */
   async function executeSwap() {
@@ -242,7 +262,7 @@ export function SwapQuoteSection() {
 
       {/* 兑换输入区：宽屏四列横排，窄屏（<md）堆叠为两行 */}
       {dex && chainTokens.length >= 2 && (
-        <div className="mb-3 grid grid-cols-1 items-start gap-2 md:grid-cols-[auto_auto_auto_auto] md:items-start md:gap-2">
+        <div className="mb-3 grid grid-cols-1 items-start gap-2 md:grid-cols-[auto_auto_auto_auto] md:items-start md:gap-x-1">
           {/* 输入侧（含余额，固定宽度防跳动） */}
           <label className="text-xs">
             <div className="mb-1 text-ink-soft">卖出</div>
@@ -265,7 +285,7 @@ export function SwapQuoteSection() {
           {/* 交换按钮：与输入行垂直居中（label 标题 20px + 输入框 38px 的一半） */}
           <div className="pt-[26px] md:pt-[26px]">
             <button
-              className="rounded border border-slate-300 bg-white px-2 py-1.5 text-xs hover:bg-slate-100 md:px-2"
+              className="rounded border border-slate-300 bg-white px-1.5 py-1.5 text-xs hover:bg-slate-100"
               title="交换方向"
               onClick={swapSides}
             >⇄</button>
