@@ -321,15 +321,14 @@ export async function POST(req: Request) {
           if (otherMap) {
             // 用 buildQuotesByAddr 拿另一侧报价（含固定价/inverted 处理）
             const mappingsForQuote = [{
-              token_addr: otherAddr,
-              token_symbol: "",
-              cex_symbol: otherMap.cex_symbol,
-              fixed_price: otherMap.fixed_price,
+              chainIdRef: b.chain_id,
+              tokenAddr: otherAddr.toLowerCase(),
+              cexSymbol: (otherMap.cex_symbol || "").toUpperCase(),
+              fixedPrice: otherMap.fixed_price,
               quote: otherMap.quote,
-              inverted: otherMap.inverted,
-              enabled: true,
+              inverted: otherMap.inverted === 1,
             }];
-            const quotes = await buildQuotesByAddr(mappingsForQuote as any);
+            const quotes = await buildQuotesByAddr(mappingsForQuote);
             const otherQuote = quotes.get(otherAddr.toLowerCase());
             if (otherQuote && otherQuote.price > 0) {
               // CEX 口径：1 other = otherQuote.price stable
