@@ -286,7 +286,9 @@ export function SwapQuoteSection() {
               </select>
             </div>
             <div className="mt-0.5 h-[16px] text-[11px] text-ink-soft">
-              {balances && tokenInMeta && `余额：${fmtBalance(balances.in, quote?.tokenIn?.decimals ?? 18)}`}
+              {balances && tokenInMeta && (balances.in !== "0"
+                ? `余额：${fmtBalance(balances.in, quote?.tokenIn?.decimals ?? 18)}`
+                : "余额：…")}
             </div>
           </label>
 
@@ -314,7 +316,9 @@ export function SwapQuoteSection() {
               </select>
             </div>
             <div className="mt-0.5 h-[16px] text-[11px] text-ink-soft">
-              {balances && tokenOutMeta && `余额：${fmtBalance(balances.out, quote?.tokenOut?.decimals ?? 18)}`}
+              {balances && tokenOutMeta && (balances.out !== "0"
+                ? `余额：${fmtBalance(balances.out, quote?.tokenOut?.decimals ?? 18)}`
+                : "余额：…")}
             </div>
           </label>
 

@@ -30,23 +30,27 @@ export async function POST(req: Request) {
     const balances = await Promise.all(
       b.tokens.map(async (raw) => {
         const addr = (raw ?? "").trim().toLowerCase();
-        try {
-          if (addr === "__native__") {
-            // 原生币余额
-            const v = await client.getBalance({ address: wallet });
+        // 读一次，失败重试一次（公共 RPC 并发限流时偶发失败，重试通常成功）
+        for (let attempt = 0; attempt < 2; attempt++) {
+          try {
+            if (addr === "__native__") {
+              const v = await client.getBalance({ address: wallet });
+              return v.toString();
+            }
+            if (!/^0x[a-f0-9]{40}$/.test(addr)) return "0";
+            const v = await client.readContract({
+              address: addr as `0x${string}`,
+              abi: ERC20_BALANCE_ABI,
+              functionName: "balanceOf",
+              args: [wallet],
+            }) as bigint;
             return v.toString();
+          } catch (e) {
+            if (attempt === 1) return "0"; // 两次都失败才放弃
+            await new Promise((r) => setTimeout(r, 400));
           }
-          if (!/^0x[a-f0-9]{40}$/.test(addr)) return "0";
-          const v = await client.readContract({
-            address: addr as `0x${string}`,
-            abi: ERC20_BALANCE_ABI,
-            functionName: "balanceOf",
-            args: [wallet],
-          }) as bigint;
-          return v.toString();
-        } catch {
-          return "0";
         }
+        return "0";
       })
     );
     return ok({ balances });
