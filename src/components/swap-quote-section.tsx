@@ -96,7 +96,7 @@ export function SwapQuoteSection() {
   const [err, setErr] = useState("");
   const [txHash, setTxHash] = useState("");
   // 两个 token 的钱包余额（报价返回）
-  const [balances, setBalances] = useState<{ in: string; out: string } | null>(null);
+  const [balances, setBalances] = useState<{ in: string; out: string; decIn: number; decOut: number } | null>(null);
 
   const tokenInMeta = chainTokens.find((t) => t.token_symbol === inSym);
   const tokenOutMeta = chainTokens.find((t) => t.token_symbol === outSym);
@@ -117,7 +117,8 @@ export function SwapQuoteSection() {
       const j = await r.json();
       if (!j.ok) return;
       const arr: string[] = j.data.balances;
-      setBalances({ in: arr[0] ?? "0", out: arr[1] ?? "0" });
+      const decs: number[] = j.data.decimals ?? [18, 18];
+      setBalances({ in: arr[0] ?? "0", out: arr[1] ?? "0", decIn: decs[0] ?? 18, decOut: decs[1] ?? 18 });
     } catch { /* ignore */ }
   }, [dex, address, tokenInMeta, tokenOutMeta]);
 
@@ -152,7 +153,8 @@ export function SwapQuoteSection() {
       const j = await r.json();
       if (!j.ok) throw new Error(j.error);
       setQuote(j.data);
-      setBalances((j.data as QuoteResult).balances ?? null);
+      const qb = (j.data as QuoteResult).balances;
+      setBalances(qb ? { in: qb.in, out: qb.out, decIn: (j.data as QuoteResult).tokenIn.decimals, decOut: (j.data as QuoteResult).tokenOut.decimals } : null);
       // 把另一侧的数量填回输入框（用户没在编辑那侧时），并标记为自动回填
       autoFillTsRef.current = Date.now();
       if (dir === "in") {
@@ -287,7 +289,7 @@ export function SwapQuoteSection() {
             </div>
             <div className="mt-0.5 h-[16px] text-[11px] text-ink-soft">
               {balances && tokenInMeta && (balances.in !== "0"
-                ? `余额：${fmtBalance(balances.in, quote?.tokenIn?.decimals ?? 18)}`
+                ? `余额：${fmtBalance(balances.in, balances.decIn)}`
                 : "余额：…")}
             </div>
           </label>
@@ -317,7 +319,7 @@ export function SwapQuoteSection() {
             </div>
             <div className="mt-0.5 h-[16px] text-[11px] text-ink-soft">
               {balances && tokenOutMeta && (balances.out !== "0"
-                ? `余额：${fmtBalance(balances.out, quote?.tokenOut?.decimals ?? 18)}`
+                ? `余额：${fmtBalance(balances.out, balances.decOut)}`
                 : "余额：…")}
             </div>
           </label>

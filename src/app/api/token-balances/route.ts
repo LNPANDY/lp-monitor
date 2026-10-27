@@ -26,6 +26,11 @@ export async function POST(req: Request) {
   const { client } = getClient(b.chain_id);
   const wallet = b.wallet as `0x${string}`;
 
+  // 读每个代币的 decimals（格式化余额用；原生币 18）
+  const TOKEN_META_ABI = [
+    { name: "decimals", type: "function", stateMutability: "view", inputs: [], outputs: [{ name: "", type: "uint8" }] },
+  ] as const;
+
   try {
     const balances = await Promise.all(
       b.tokens.map(async (raw) => {
@@ -53,7 +58,22 @@ export async function POST(req: Request) {
         return "0";
       })
     );
-    return ok({ balances });
+    // 并发读 decimals（失败回退 18）
+    const decimals = await Promise.all(
+      b.tokens.map(async (raw) => {
+        const addr = (raw ?? "").trim().toLowerCase();
+        if (addr === "__native__") return 18;
+        try {
+          const d = await client.readContract({
+            address: addr as `0x${string}`,
+            abi: TOKEN_META_ABI,
+            functionName: "decimals",
+          }) as number;
+          return Number(d);
+        } catch { return 18; }
+      })
+    );
+    return ok({ balances, decimals });
   } catch (e: any) {
     return fail(`余额查询失败：${String(e?.message ?? e).slice(0, 150)}`, 502);
   }
