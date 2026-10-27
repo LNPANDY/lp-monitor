@@ -96,8 +96,12 @@ export async function POST(req: Request) {
     wallet?: string;
   }>(req);
 
-  if (!b.chain_id || !b.token_in_addr || !b.token_out_addr || !b.amount_in) {
-    return fail("chain_id/token_in_addr/token_out_addr/amount_in 必填");
+  if (!b.chain_id || !b.token_in_addr || !b.token_out_addr) {
+    return fail("chain_id/token_in_addr/token_out_addr 必填");
+  }
+  // 金额二选一：正向填 amount_in，反向填 target_out（想要得到的 tokenOut 数量）
+  if (!b.amount_in && !b.target_out) {
+    return fail("amount_in 与 target_out 须填其一");
   }
   if (b.token_in_addr.toLowerCase() === b.token_out_addr.toLowerCase()) {
     return fail("token_in 和 token_out 不能相同");
@@ -195,7 +199,7 @@ export async function POST(req: Request) {
       // 初始估计：targetOut / spot
       amountIn = parseHumanAmount((Number(targetOutRaw) / Number(10n ** BigInt(decOut)) / spot).toPrecision(15), decIn);
     } else {
-      amountIn = parseHumanAmount(b.amount_in, decIn);
+      amountIn = parseHumanAmount(b.amount_in ?? "0", decIn);
     }
     if (amountIn <= 0n) return fail("金额须为正数");
 
