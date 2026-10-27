@@ -234,33 +234,9 @@ export async function POST(req: Request) {
       return fail("报价结果为 0：池子流动性可能不足以完成这笔兑换", 422);
     }
 
-    // 反向模式迭代：按实际产出与目标的比例修正 amountIn，重新报价一次
-    if (targetOutRaw > 0n && amountOut !== targetOutRaw) {
-      const ratio = Number(targetOutRaw) / Number(amountOut);
-      if (Number.isFinite(ratio) && ratio > 0 && ratio < 1e6) {
-        const adjusted = BigInt(BigInt(Math.floor(Number(amountIn) * ratio * 1.0001))); // 1.0001 防止差一点
-        if (adjusted > 0n && adjusted !== amountIn) {
-          amountIn = adjusted;
-          try {
-            const r2 = await client.readContract({
-              address: quoter,
-              abi: QUOTER_V2_ABI,
-              functionName: "quoteExactInputSingle",
-              args: [{
-                tokenIn: inMeta.addr as `0x${string}`,
-                tokenOut: outMeta.addr as `0x${string}`,
-                amountIn,
-                fee,
-                sqrtPriceLimitX96: 0n,
-              }],
-            }) as readonly [bigint, bigint, number, bigint];
-            amountOut = r2[0];
-            sqrtPriceAfter = r2[1];
-            gasEstimate = r2[3];
-          } catch { /* 修正失败就按第一次结果返回 */ }
-        }
-      }
-    }
+    // 反向模式：spot 价粗算的 amountIn 一次报价即可，不做迭代修正。
+    // 精度由两道防线兜底：① 交易 amountOutMinimum 链上强制（达不到 revert）
+    // ② 钱包签名时用户复核实际输入/输出，不合适直接拒绝。
 
     // 6. 价格影响：spot 价 vs 成交价
     let priceImpactPct: number | null = null;
