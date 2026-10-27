@@ -616,9 +616,9 @@ function Toggle({ id, enabled, kind, disabled }: { id: number; enabled: boolean;
   }
   return (
     <button onClick={toggle} disabled={disabled}
-      className={`relative h-5 w-9 rounded-full transition ${enabled ? "bg-ok" : "bg-slate-300"} ${disabled ? "opacity-50" : ""}`}
+      className={`relative h-5 w-9 rounded-full transition ${enabled ? "bg-ok/80" : "bg-white/[0.12]"} ${disabled ? "opacity-50" : ""}`}
       title={disabled ? "内置项不可禁用" : ""}>
-      <span className={`absolute top-0.5 h-4 w-4 rounded-full bg-slate-200 transition-all ${enabled ? "left-4" : "left-0.5"}`} />
+      <span className={`absolute top-0.5 h-4 w-4 rounded-full bg-slate-300 shadow transition-all ${enabled ? "left-4" : "left-0.5"}`} />
     </button>
   );
 }
