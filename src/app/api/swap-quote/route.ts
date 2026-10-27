@@ -114,12 +114,18 @@ export async function POST(req: Request) {
           "SELECT token_symbol FROM token_symbols WHERE chain_id_ref=? AND token_addr='__native__' AND enabled=1"
         ).all(b.chain_id) as { token_symbol: string }[];
         const nativeSym = natives[0]?.token_symbol ?? chain.symbol;
-        const base = nativeSym.toLowerCase();
-        const wrapped = db.prepare(
-          "SELECT token_addr, token_symbol FROM token_symbols WHERE chain_id_ref=? AND enabled=1 AND token_addr!='__native__' AND LOWER(token_symbol) LIKE ?"
-        ).all(b.chain_id, `${base}%`) as { token_addr: string; token_symbol: string }[];
+        const base = nativeSym.toLowerCase(); // 如 '0g'
+        // wrapped 匹配：symbol 去 W 前缀后等于原生名（W0G→0G），或包含原生名
+        const candidates = db.prepare(
+          "SELECT token_addr, token_symbol FROM token_symbols WHERE chain_id_ref=? AND enabled=1 AND token_addr!='__native__'"
+        ).all(b.chain_id) as { token_addr: string; token_symbol: string }[];
+        const wrapped = candidates.filter((t) => {
+          const sym = t.token_symbol.toLowerCase();
+          const stripped = sym.startsWith("w") ? sym.slice(1) : sym;
+          return stripped === base || sym.includes(base);
+        });
         if (wrapped.length === 0) {
-          throw new Error(`原生币 ${nativeSym} 未找到对应的 wrapped 合约（请在 CEX 报价匹配里配置其包装代币）`);
+          throw new Error(`原生币 ${nativeSym} 未找到对应的 wrapped 合约（请在 CEX 报价匹配里配置 ${nativeSym} 的包装代币，如 W${nativeSym}）`);
         }
         return { addr: wrapped[0].token_addr.toLowerCase(), isNative: true };
       }

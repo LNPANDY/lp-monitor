@@ -240,9 +240,9 @@ export function SwapQuoteSection() {
         )}
       </div>
 
-      {/* 兑换输入区：三列 grid，中列交换按钮对齐输入行，右列滑点+兑换对齐 */}
+      {/* 兑换输入区：宽屏四列横排，窄屏（<md）堆叠为两行 */}
       {dex && chainTokens.length >= 2 && (
-        <div className="mb-3 grid grid-cols-[auto_auto_auto_1fr] items-start gap-2">
+        <div className="mb-3 grid grid-cols-1 items-start gap-2 md:grid-cols-[auto_auto_auto_auto] md:items-start md:gap-2">
           {/* 输入侧（含余额，固定宽度防跳动） */}
           <label className="text-xs">
             <div className="mb-1 text-ink-soft">卖出</div>
@@ -263,9 +263,9 @@ export function SwapQuoteSection() {
           </label>
 
           {/* 交换按钮：与输入行垂直居中（label 标题 20px + 输入框 38px 的一半） */}
-          <div className="pt-[26px]">
+          <div className="pt-[26px] md:pt-[26px]">
             <button
-              className="rounded border border-slate-300 bg-white px-2 py-1.5 text-xs hover:bg-slate-100"
+              className="rounded border border-slate-300 bg-white px-2 py-1.5 text-xs hover:bg-slate-100 md:px-2"
               title="交换方向"
               onClick={swapSides}
             >⇄</button>
@@ -290,8 +290,8 @@ export function SwapQuoteSection() {
             </div>
           </label>
 
-          {/* 滑点 + 兑换按钮 */}
-          <div className="flex items-end justify-end gap-2">
+          {/* 滑点 + 兑换按钮（紧跟输出侧，左侧留间距） */}
+          <div className="flex items-end gap-2 md:pl-2">
             <label className="text-xs">
               <div className="mb-1 text-ink-soft">滑点</div>
               <select className="input w-[92px]" value={slippage} onChange={(e) => setSlippage(Number(e.target.value))}>
