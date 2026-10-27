@@ -15,7 +15,8 @@
 }
 
 body {
-  @apply bg-ink-deep text-slate-100 antialiased;
+  color: #e2e8f0;
+  @apply bg-ink-deep antialiased;
   /* 微妙的径向渐变背景：顶部青色氛围光，避免纯黑的死板 */
   background-image:
     radial-gradient(1200px 500px at 50% -10%, rgba(34, 211, 238, 0.07), transparent 60%),
@@ -59,7 +60,7 @@ body {
 
 /* ============ 输入框 ============ */
 .input {
-  @apply w-full rounded-lg border border-white/10 bg-white/[0.04] px-3 py-2 text-sm text-slate-100 outline-none;
+  @apply w-full rounded-lg border border-white/10 bg-white/[0.04] px-3 py-2 text-sm text-[#e2e8f0] outline-none;
   @apply placeholder:text-slate-500 transition;
   @apply focus:border-brand-cyan/60 focus:ring-2 focus:ring-brand-cyan/20;
 }

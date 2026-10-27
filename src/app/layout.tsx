@@ -22,7 +22,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
               <span className="text-lg">💧</span>
               <span className="text-brand-gradient">LP Monitor</span>
             </Link>
-            <nav className="flex items-center gap-4 text-sm text-slate-300">
+            <nav className="flex items-center gap-4 text-sm text-slate-400">
               <Link href="/" className="hover:text-white transition-colors">仪表盘</Link>
               <Link href="/alerts" className="hover:text-white transition-colors">告警</Link>
               <Link href="/config" className="hover:text-white transition-colors">配置</Link>
