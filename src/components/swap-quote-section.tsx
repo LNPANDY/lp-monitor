@@ -40,6 +40,7 @@ interface QuoteResult {
   gasEstimate: string;
   router: { addr: string; kind: "router02" | "swaprouter" } | null;
   balances?: { in: string; out: string } | null;
+  executionPrice?: number;
 }
 
 /**
@@ -149,6 +150,17 @@ export function SwapQuoteSection() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [amountIn, amountOut, editingSide, inSym, outSym, slippage, feeOverride]);
 
+  // 选完 token 对后立即加载（用最小金额 1 触发一次报价，拿到余额 + 池子信息）
+  const initialLoadedRef = useRef("");
+  useEffect(() => {
+    if (!dex || !tokenInMeta || !tokenOutMeta || inSym === outSym) return;
+    const key = `${dex.id}-${inSym}-${outSym}`;
+    if (initialLoadedRef.current === key) return;
+    initialLoadedRef.current = key;
+    doQuote("1", "in");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dex?.id, inSym, outSym]);
+
   /** 执行兑换 */
   async function executeSwap() {
     if (!address) { await connect(); return; }
@@ -223,75 +235,75 @@ export function SwapQuoteSection() {
         )}
       </div>
 
-      {/* 兑换输入区 */}
+      {/* 兑换输入区：三列 grid，中列交换按钮对齐输入行，右列滑点+兑换对齐 */}
       {dex && chainTokens.length >= 2 && (
-        <div className="mb-3 flex flex-wrap items-end gap-2">
-          {/* 输入侧 */}
+        <div className="mb-3 grid grid-cols-[auto_auto_auto_1fr] items-start gap-2">
+          {/* 输入侧（含余额，固定宽度防跳动） */}
           <label className="text-xs">
             <div className="mb-1 text-ink-soft">卖出</div>
             <div className="flex items-center gap-1">
               <input
-                className="input max-w-[130px]"
+                className="input w-[130px]"
                 value={amountIn}
                 onChange={(e) => { setEditingSide("in"); setAmountIn(e.target.value); }}
                 placeholder="0.0"
               />
-              <select className="input max-w-[110px]" value={inSym} onChange={(e) => { setInSym(e.target.value); setQuote(null); setBalances(null); }}>
+              <select className="input w-[110px]" value={inSym} onChange={(e) => { setInSym(e.target.value); setQuote(null); setBalances(null); }}>
                 {chainTokens.map((t) => <option key={t.token_symbol} value={t.token_symbol}>{t.token_symbol}</option>)}
               </select>
             </div>
-            {balances && tokenInMeta && (
-              <div className="mt-0.5 text-[11px] text-ink-soft">
-                余额：{fmtBalance(balances.in, quote?.tokenIn?.decimals ?? 18)}
-              </div>
-            )}
+            <div className="mt-0.5 h-[16px] text-[11px] text-ink-soft">
+              {balances && tokenInMeta && `余额：${fmtBalance(balances.in, quote?.tokenIn?.decimals ?? 18)}`}
+            </div>
           </label>
 
-          {/* 交换按钮 */}
-          <button
-            className="mb-0.5 rounded border border-slate-300 bg-white px-2 py-1.5 text-xs hover:bg-slate-100"
-            title="交换方向"
-            onClick={swapSides}
-          >⇄</button>
+          {/* 交换按钮：与输入行垂直居中（label 标题 20px + 输入框 38px 的一半） */}
+          <div className="pt-[26px]">
+            <button
+              className="rounded border border-slate-300 bg-white px-2 py-1.5 text-xs hover:bg-slate-100"
+              title="交换方向"
+              onClick={swapSides}
+            >⇄</button>
+          </div>
 
           {/* 输出侧 */}
           <label className="text-xs">
             <div className="mb-1 text-ink-soft">得到（自动算）</div>
             <div className="flex items-center gap-1">
               <input
-                className="input max-w-[130px]"
+                className="input w-[130px]"
                 value={amountOut}
                 onChange={(e) => { setEditingSide("out"); setAmountOut(e.target.value); }}
                 placeholder="0.0"
               />
-              <select className="input max-w-[110px]" value={outSym} onChange={(e) => { setOutSym(e.target.value); setQuote(null); setBalances(null); }}>
+              <select className="input w-[110px]" value={outSym} onChange={(e) => { setOutSym(e.target.value); setQuote(null); setBalances(null); }}>
                 {chainTokens.map((t) => <option key={t.token_symbol} value={t.token_symbol}>{t.token_symbol}</option>)}
               </select>
             </div>
-            {balances && tokenOutMeta && (
-              <div className="mt-0.5 text-[11px] text-ink-soft">
-                余额：{fmtBalance(balances.out, quote?.tokenOut?.decimals ?? 18)}
-              </div>
-            )}
+            <div className="mt-0.5 h-[16px] text-[11px] text-ink-soft">
+              {balances && tokenOutMeta && `余额：${fmtBalance(balances.out, quote?.tokenOut?.decimals ?? 18)}`}
+            </div>
           </label>
 
           {/* 滑点 + 兑换按钮 */}
-          <label className="text-xs">
-            <div className="mb-1 text-ink-soft">滑点</div>
-            <select className="input max-w-[92px]" value={slippage} onChange={(e) => setSlippage(Number(e.target.value))}>
-              <option value={0.1}>0.1%</option>
-              <option value={0.5}>0.5%</option>
-              <option value={1}>1%</option>
-              <option value={3}>3%</option>
-            </select>
-          </label>
-          <button
-            className="btn-primary h-[38px] px-5"
-            disabled={swapping || quoting || !quote}
-            onClick={executeSwap}
-          >
-            {swapping ? "执行中…" : quoting ? "报价中…" : "兑换"}
-          </button>
+          <div className="flex items-end justify-end gap-2">
+            <label className="text-xs">
+              <div className="mb-1 text-ink-soft">滑点</div>
+              <select className="input w-[92px]" value={slippage} onChange={(e) => setSlippage(Number(e.target.value))}>
+                <option value={0.1}>0.1%</option>
+                <option value={0.5}>0.5%</option>
+                <option value={1}>1%</option>
+                <option value={3}>3%</option>
+              </select>
+            </label>
+            <button
+              className="btn-primary h-[38px] px-5"
+              disabled={swapping || quoting || !quote}
+              onClick={executeSwap}
+            >
+              {swapping ? "执行中…" : quoting ? "报价中…" : "兑换"}
+            </button>
+          </div>
         </div>
       )}
 
@@ -332,7 +344,7 @@ export function SwapQuoteSection() {
           </div>
           <div className="flex items-center justify-between border-t border-slate-200 py-1">
             <span className="text-ink-soft">成交价</span>
-            <span>1 {quote.tokenIn.symbol} ≈ {fmtNum(Number(quote.amountOut) / Number(quote.amountIn))} {quote.tokenOut.symbol}</span>
+            <span>1 {quote.tokenIn.symbol} ≈ {fmtNum(quote.executionPrice ?? 0)} {quote.tokenOut.symbol}</span>
           </div>
           {quote.priceImpactPct !== null && quote.priceImpactPct !== undefined && (
             <div className="flex items-center justify-between border-t border-slate-200 py-1">
@@ -383,8 +395,11 @@ function abbrev(v?: string): string {
 
 function fmtNum(n: number): string {
   if (!Number.isFinite(n)) return "—";
+  if (n === 0) return "0";
   if (n >= 1) return n.toLocaleString(undefined, { maximumFractionDigits: 6 });
-  return n.toPrecision(6).replace(/0+$/, "").replace(/\.$/, "");
+  // 极小值：展开小数（最多 12 位有效），避免 1.13e-11 这类显示
+  const s = n.toFixed(18).replace(/0+$/, "").replace(/\.$/, "");
+  return s;
 }
 
 /** raw 余额 → 可读（截断到 6 位有效小数） */

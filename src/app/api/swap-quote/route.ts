@@ -242,14 +242,16 @@ export async function POST(req: Request) {
 
     // 6. 价格影响：spot 价 vs 成交价
     let priceImpactPct: number | null = null;
+    // 成交价（human 口径）：1 tokenIn = ? tokenOut（整币）
+    // 注意不能用 amountOut/amountIn（raw 比），LINK(18)/USDC(6) 会差 10^12 倍
+    const executionPrice = Number(formatRaw(amountOut, decOut)) / Number(formatRaw(amountIn, decIn));
     try {
       const slot0 = await client.readContract({ address: pool as `0x${string}`, abi: POOL_SLOT0_ABI, functionName: "slot0" }) as readonly [bigint, number, number, number];
       const sqrtP = slot0[0];
-      // spot price（tokenOut raw / tokenIn raw，整币口径）
+      // spot price（human 口径）：1 tokenIn = ? tokenOut 整币
       const spotPrice = Number(sqrtP) ** 2 / Number(1n << 96n) ** 2 * Math.pow(10, decIn - decOut);
-      const execPrice = Number(amountOut) / Number(amountIn);
       if (spotPrice > 0) {
-        priceImpactPct = Math.abs(spotPrice - execPrice) / spotPrice * 100;
+        priceImpactPct = Math.abs(spotPrice - executionPrice) / spotPrice * 100;
       }
     } catch { /* ignore */ }
 
@@ -307,6 +309,7 @@ export async function POST(req: Request) {
       slippagePct,
       priceImpactPct,
       gasEstimate: gasEstimate.toString(),
+      executionPrice,
       router: routerAddr
         ? { addr: routerAddr, kind: dexRow.router02 ? "router02" : "swaprouter" }
         : null,
