@@ -44,6 +44,7 @@ export async function POST(req: Request) {
     fixed_price?: number | null;
     quote?: string;
     inverted?: number | boolean;
+    is_stable?: number | boolean;
   }>(req);
   if (!b.chain_id || !b.token_addr) return fail("chain_id/token_addr 必填");
   const rawAddr = b.token_addr.trim();
@@ -56,6 +57,7 @@ export async function POST(req: Request) {
   const quote = (b.quote || "").trim().toUpperCase();
   const cexSymbol = (b.cex_symbol || "").trim().toUpperCase();
   const inverted = b.inverted ? 1 : 0;
+  const isStable = b.is_stable ? 1 : 0;
 
   // 固定价模式：不需要 cex_symbol，但需要 quote
   if (fixedPrice !== null && !quote) return fail("固定价模式需同时填写计价币种（如 USDT）");

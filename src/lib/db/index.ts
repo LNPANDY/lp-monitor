@@ -319,6 +319,8 @@ function migrate(db: DB) {
   safeAddColumn(db, "dexes", "stateview", "TEXT NOT NULL DEFAULT ''");
   // dexes 表 QuoterV2 地址：代币兑换报价用（V3 fork 单跳报价）
   safeAddColumn(db, "dexes", "quoter", "TEXT NOT NULL DEFAULT ''");
+  // token_symbols 稳定币标记：兑换报价时用该代币的 CEX 报价做参考对比
+  safeAddColumn(db, "token_symbols", "is_stable", "INTEGER NOT NULL DEFAULT 0");
   // dexes 表 SwapRouter 地址：代币兑换执行用（router02=struct 签名 / swaprouter=平铺签名，二者填其一）
   safeAddColumn(db, "dexes", "router02", "TEXT NOT NULL DEFAULT ''");
   safeAddColumn(db, "dexes", "swaprouter", "TEXT NOT NULL DEFAULT ''");

@@ -41,6 +41,14 @@ interface QuoteResult {
   router: { addr: string; kind: "router02" | "swaprouter" } | null;
   balances?: { in: string; out: string } | null;
   executionPrice?: number;
+  cexCompare?: {
+    stableSymbol: string;
+    otherSymbol: string;
+    cexPrice: number;
+    executionPriceInStable: number;
+    diffPct: number;
+    cexSymbolLabel: string;
+  } | null;
 }
 
 /**
@@ -376,6 +384,19 @@ export function SwapQuoteSection() {
               <span className="text-ink-soft">价格影响</span>
               <span className={quote.priceImpactPct > 3 ? "text-warn font-semibold" : ""}>
                 {quote.priceImpactPct.toFixed(2)}%{quote.priceImpactPct > 3 && "（过高）"}
+              </span>
+            </div>
+          )}
+          {quote.cexCompare && (
+            <div className="flex items-center justify-between border-t border-slate-200 py-1">
+              <span className="text-ink-soft" title="稳定币走 CEX 报价口径对比：DEX 成交价 vs CEX 价">
+                CEX 对比（{quote.cexCompare.otherSymbol}→{quote.cexCompare.stableSymbol}）
+              </span>
+              <span className={Math.abs(quote.cexCompare.diffPct) > 1 ? "text-warn font-semibold" : ""}>
+                CEX {quote.cexCompare.cexPrice.toPrecision(6)} · DEX {quote.cexCompare.executionPriceInStable.toPrecision(6)}{" "}
+                <span className={quote.cexCompare.diffPct >= 0 ? "text-emerald-600" : "text-red-600"}>
+                  {quote.cexCompare.diffPct >= 0 ? "+" : ""}{quote.cexCompare.diffPct.toFixed(2)}%
+                </span>
               </span>
             </div>
           )}

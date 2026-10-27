@@ -18,6 +18,7 @@ import { resolveTokens } from "@/lib/chains/tokens";
 import { ok, fail, getBody } from "@/lib/api";
 import { FEE_TIERS } from "@/lib/v3/math";
 import { getPoolAddress } from "@/lib/adapters/v3-fork";
+import { buildQuotesByAddr } from "@/lib/cex/binance";
 
 export const dynamic = "force-dynamic";
 
@@ -247,6 +248,25 @@ export async function POST(req: Request) {
     // ② 钱包签名时用户复核实际输入/输出，不合适直接拒绝。
 
     // 6. 价格影响：spot 价 vs 成交价
+    // 读池子实际排序（token0/token1 是地址序，与用户的 in/out 方向无关）
+    let poolToken0 = "";
+    let dec0 = decIn;
+    let dec1 = decOut;
+    try {
+      poolToken0 = await client.readContract({
+        address: pool as `0x${string}`,
+        abi: [{ name: "token0", type: "function", stateMutability: "view", inputs: [], outputs: [{ name: "", type: "address" }] }] as const,
+        functionName: "token0",
+      }) as string;
+      poolToken0 = poolToken0.toLowerCase();
+      // 池子另一侧的 decimals
+      const poolToken1 = poolToken0 === inMeta.addr.toLowerCase() ? outMeta.addr : inMeta.addr;
+      const m0 = tokenMap.get(poolToken0);
+      const m1 = tokenMap.get(poolToken1.toLowerCase());
+      dec0 = m0?.decimals ?? 18;
+      dec1 = m1?.decimals ?? 18;
+    } catch { /* 读取失败用 decIn/decOut 兜底（方向可能不准） */ }
+
     let priceImpactPct: number | null = null;
     // 成交价（human 口径）：1 tokenIn = ? tokenOut（整币）
     // 注意不能用 amountOut/amountIn（raw 比），LINK(18)/USDC(6) 会差 10^12 倍
@@ -254,12 +274,95 @@ export async function POST(req: Request) {
     try {
       const slot0 = await client.readContract({ address: pool as `0x${string}`, abi: POOL_SLOT0_ABI, functionName: "slot0" }) as readonly [bigint, number, number, number];
       const sqrtP = slot0[0];
-      // spot price（human 口径）：1 tokenIn = ? tokenOut 整币
-      const spotPrice = Number(sqrtP) ** 2 / Number(1n << 96n) ** 2 * Math.pow(10, decIn - decOut);
-      if (spotPrice > 0) {
+      // 池子排序价：1 token0 = ? token1（整币）
+      // rawPriceX = sqrtP²/2^192 是 token0 raw / token1 raw，乘 10^(dec0-dec1) 换整币
+      const poolSortedPrice = Number(sqrtP) ** 2 / Number(1n << 96n) ** 2 * Math.pow(10, dec0 - dec1);
+      // 用户方向：
+      //   tokenIn=token0, tokenOut=token1 → spot = poolSortedPrice
+      //   tokenIn=token1, tokenOut=token0 → spot = 1 / poolSortedPrice
+      const inIsToken0 = poolToken0 ? inMeta.addr.toLowerCase() === poolToken0 : true;
+      const spotPrice = inIsToken0 ? poolSortedPrice : 1 / poolSortedPrice;
+      if (spotPrice > 0 && Number.isFinite(spotPrice)) {
         priceImpactPct = Math.abs(spotPrice - executionPrice) / spotPrice * 100;
       }
     } catch { /* ignore */ }
+
+    // 6.5 稳定币 CEX 对比：
+    //   tokenIn/tokenOut 任一是标记为 is_stable 的代币时，
+    //   用另一方的 CEX 报价（is_stable 或任意有 CEX 映射的）换算出
+    //   「CEX 口径的 tokenIn→tokenOut 价格」，与 executionPrice 求偏差。
+    //   典型场景：LINK→USDC.e，USDC.e 是稳定币（固定价 1 USDC），
+    //   LINK 有 CEX 映射（LINKUSDC），可算出 CEX 认为的 LINK→USDC.e 价格。
+    let cexCompare: {
+      stableSymbol: string;
+      otherSymbol: string;
+      cexPrice: number;   // CEX 口径：1 other = ? stable
+      executionPriceInStable: number; // DEX 成交价换算到同一口径
+      diffPct: number;    // (exec - cex) / cex × 100
+      cexSymbolLabel: string;
+    } | null = null;
+    try {
+      const stableMappings = db.prepare(
+        `SELECT ts.token_addr, ts.token_symbol, ts.cex_symbol, ts.fixed_price, ts.quote, ts.inverted
+         FROM token_symbols ts WHERE ts.chain_id_ref=? AND ts.enabled=1 AND ts.is_stable=1`
+      ).all(b.chain_id) as { token_addr: string; token_symbol: string; cex_symbol: string; fixed_price: number | null; quote: string; inverted: number }[];
+      if (stableMappings.length > 0) {
+        // 找出 in/out 中哪一侧是稳定币
+        const inIsStable = stableMappings.find((m) => m.token_addr.toLowerCase() === inMeta.addr.toLowerCase());
+        const outIsStable = stableMappings.find((m) => m.token_addr.toLowerCase() === outMeta.addr.toLowerCase());
+        const stableSide = inIsStable ? "in" : outIsStable ? "out" : null;
+        if (stableSide) {
+          const stableMap = (inIsStable ?? outIsStable)!;
+          const otherAddr = stableSide === "in" ? outMeta.addr : inMeta.addr;
+          // 另一侧的 CEX 报价（任意映射，不限 is_stable）
+          const otherMap = db.prepare(
+            "SELECT token_addr, cex_symbol, fixed_price, quote, inverted FROM token_symbols WHERE chain_id_ref=? AND enabled=1 AND LOWER(token_addr)=LOWER(?)"
+          ).get(b.chain_id, otherAddr) as { cex_symbol: string; fixed_price: number | null; quote: string; inverted: number } | undefined;
+          if (otherMap) {
+            // 用 buildQuotesByAddr 拿另一侧报价（含固定价/inverted 处理）
+            const mappingsForQuote = [{
+              token_addr: otherAddr,
+              token_symbol: "",
+              cex_symbol: otherMap.cex_symbol,
+              fixed_price: otherMap.fixed_price,
+              quote: otherMap.quote,
+              inverted: otherMap.inverted,
+              enabled: true,
+            }];
+            const quotes = await buildQuotesByAddr(mappingsForQuote as any);
+            const otherQuote = quotes.get(otherAddr.toLowerCase());
+            if (otherQuote && otherQuote.price > 0) {
+              // CEX 口径：1 other = otherQuote.price stable
+              // 执行价换算：executionPrice 是 1 tokenIn = ? tokenOut（整币）
+              //   若 stable 是 out：execInStable = executionPrice（1 in = X stable）；
+              //     cexPrice = otherQuote.price（1 other = X stable）→ 同口径
+              //   若 stable 是 in：execInStable = 1 / executionPrice（1 out = ? in）；
+              //     cexPrice = 1 / otherQuote.price（1 stable = ? other → 取倒数同口径）
+              const stableSymbol = stableMap.token_symbol || "stable";
+              const otherSymbol = stableSide === "in" ? symOut : symIn;
+              let cexPrice: number;
+              let execInStable: number;
+              if (stableSide === "out") {
+                cexPrice = otherQuote.price;
+                execInStable = executionPrice;
+              } else {
+                cexPrice = 1 / otherQuote.price;
+                execInStable = 1 / executionPrice;
+              }
+              const diffPct = (execInStable - cexPrice) / cexPrice * 100;
+              cexCompare = {
+                stableSymbol,
+                otherSymbol,
+                cexPrice,
+                executionPriceInStable: execInStable,
+                diffPct,
+                cexSymbolLabel: otherQuote.symbol,
+              };
+            }
+          }
+        }
+      }
+    } catch { /* CEX 对比失败不影响主报价 */ }
 
     // 7. 滑点后最小获得
     const slippagePct = Number(b.slippage_pct ?? 0.1);
@@ -320,6 +423,7 @@ export async function POST(req: Request) {
         ? { addr: routerAddr, kind: dexRow.router02 ? "router02" : "swaprouter" }
         : null,
       balances,
+      cexCompare,
     });
   } catch (e: any) {
     const msg = String(e?.message ?? e);

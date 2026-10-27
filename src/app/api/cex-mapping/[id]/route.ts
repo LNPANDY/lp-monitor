@@ -12,6 +12,7 @@ export async function PATCH(req: Request, { params }: { params: { id: string } }
     fixed_price?: number | null;
     quote?: string;
     inverted?: number | boolean;
+    is_stable?: number | boolean;
   }>(req);
   const db = getDb();
   const sets: string[] = [];
@@ -40,6 +41,10 @@ export async function PATCH(req: Request, { params }: { params: { id: string } }
   if (b.inverted !== undefined) {
     sets.push("inverted=?");
     args.push(b.inverted ? 1 : 0);
+  }
+  if (b.is_stable !== undefined) {
+    sets.push("is_stable=?");
+    args.push(b.is_stable ? 1 : 0);
   }
   if (sets.length === 0) return fail("无更新字段");
   args.push(params.id);

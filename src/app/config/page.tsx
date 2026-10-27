@@ -345,7 +345,9 @@ function CexMappingSection() {
   const [chainId, setChainId] = useState<number | "">("");
   const key = chainId ? `/api/cex-mapping?chain_id=${chainId}` : "/api/cex-mapping";
   const { data: mappings } = useSWR<any[]>(key, fetcher);
-  const [form, setForm] = useState({ token_addr: "", token_symbol: "", cex_symbol: "", fixed_price: "", quote: "", inverted: false });
+  const [form, setForm] = useState({ token_addr: "", token_symbol: "", cex_symbol: "", fixed_price: "", quote: "", inverted: false, is_stable: false });
+  // 编辑中的映射 id（null=新增模式；编辑时保存先删旧再建新，因 UNIQUE(chain_id, token_addr) 且可能改地址）
+  const [editingMappingId, setEditingMappingId] = useState<number | null>(null);
   const [err, setErr] = useState("");
   // 测试报价的行内结果：id → { status:'loading'|'ok'|'error', text }
   const [tests, setTests] = useState<Record<number, { status: string; text: string }>>({});
@@ -361,11 +363,25 @@ function CexMappingSection() {
         cex_symbol: form.cex_symbol,
         quote: form.quote,
         inverted: form.inverted ? 1 : 0,
+        is_stable: form.is_stable ? 1 : 0,
       };
       // 有固定价时带上
       if (fp && Number(fp) > 0) body.fixed_price = Number(fp);
-      await api("/api/cex-mapping", "POST", body);
-      setForm({ token_addr: "", token_symbol: "", cex_symbol: "", fixed_price: "", quote: "", inverted: false });
+
+      if (editingMappingId != null) {
+        // 编辑模式：地址没改就 PATCH 原行；地址改了则删旧建新（UNIQUE 按 token_addr）
+        const editing = (mappings ?? []).find((m: any) => m.id === editingMappingId);
+        if (editing && editing.token_addr.toLowerCase() === form.token_addr.trim().toLowerCase()) {
+          await api(`/api/cex-mapping/${editingMappingId}`, "PATCH", body);
+        } else {
+          await api(`/api/cex-mapping/${editingMappingId}`, "DELETE");
+          await api("/api/cex-mapping", "POST", body);
+        }
+        setEditingMappingId(null);
+      } else {
+        await api("/api/cex-mapping", "POST", body);
+      }
+      setForm({ token_addr: "", token_symbol: "", cex_symbol: "", fixed_price: "", quote: "", inverted: false, is_stable: false });
       mutate(key);
     } catch (e: any) { setErr(e.message); }
   }
@@ -453,6 +469,10 @@ function CexMappingSection() {
         <Field label="计价币种（如 USDC）">
           <input className="input" value={form.quote} onChange={(e) => setForm({ ...form, quote: e.target.value })} placeholder="USDC" />
         </Field>
+        <label className="flex items-center gap-1 text-xs text-ink-soft" title="兑换报价时用该 token 的 CEX 报价做参考对比；与固定价模式无关（固定价是喂价口径）">
+          <input type="checkbox" checked={!!form.is_stable} onChange={(e) => setForm({ ...form, is_stable: e.target.checked })} />
+          稳定币（兑换报价显示 CEX 对比）
+        </label>
         <label className="flex items-center gap-1 text-xs text-ink-soft">
           <input type="checkbox" checked={!!isFixed} onChange={(e) => setForm({ ...form, fixed_price: e.target.checked ? "1" : "" })} />
           固定价模式（稳定币专用，如 USDC.e = 1 USDT）
@@ -465,7 +485,14 @@ function CexMappingSection() {
         )}
       </div>
       <div className="mb-3 flex gap-2">
-        <button className="btn-primary" onClick={add} disabled={!chainId || !form.token_addr || (!isFixed && !form.cex_symbol)}>添加匹配</button>
+        <button className="btn-primary" onClick={add} disabled={!chainId || !form.token_addr || (!isFixed && !form.cex_symbol)}>
+          {editingMappingId != null ? "保存修改" : "添加匹配"}
+        </button>
+        {editingMappingId != null && (
+          <button className="btn-ghost" onClick={() => { setEditingMappingId(null); setForm({ token_addr: "", token_symbol: "", cex_symbol: "", fixed_price: "", quote: "", inverted: false, is_stable: false }); }}>
+            取消编辑
+          </button>
+        )}
         {err && <span className="self-center text-sm text-warn">{err}</span>}
       </div>
       <div className="space-y-2">
@@ -492,6 +519,27 @@ function CexMappingSection() {
                   <span className="font-mono text-xs text-ink-soft">{m.token_addr === "__native__" ? <span className="tag-info text-xs">GAS 代币</span> : short(m.token_addr)}</span>
                 </div>
                 <div className="flex items-center gap-2">
+                  <button
+                    className="btn-ghost text-xs"
+                    onClick={() => {
+                      // 编辑：把该行值填回上方表单，滚动到表单；删除旧行由保存时 upsert 处理（同 token_addr UNIQUE）
+                      setChainId(m.chain_id_ref);
+                      setForm({
+                        token_addr: m.token_addr,
+                        token_symbol: m.token_symbol ?? "",
+                        cex_symbol: m.cex_symbol ?? "",
+                        fixed_price: m.fixed_price != null ? String(m.fixed_price) : "",
+                        quote: m.quote ?? "",
+                        inverted: m.inverted === 1,
+                        is_stable: m.is_stable === 1,
+                      });
+                      setEditingMappingId(m.id);
+                      window.scrollTo({ top: 0, behavior: "smooth" });
+                    }}
+                  >
+                    编辑
+                  </button>
+                  {m.is_stable === 1 && <span className="tag-info text-xs">稳定币</span>}
                   <button
                     className="btn-ghost text-xs"
                     disabled={t?.status === "loading"}
