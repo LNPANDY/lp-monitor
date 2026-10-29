@@ -119,11 +119,15 @@ export function buildSwapCalldata(
 ): { to: string; data: string; value?: string } {
   const deadline = p.deadline > 0n ? p.deadline : BigInt(Math.floor(Date.now() / 1000) + 1200);
   const abi = routerKind === "router02" ? ROUTER02_ABI : SWAPROUTER_V1_ABI;
+  // unwrap 路径：swap 的 recipient 必须是 Router 自己（address(this)），
+  // 让换得的 WETH 留在 Router 里，随后 unwrapWETH9 才有 WETH 可提现给用户。
+  // （否则 WETH 直发用户，Router 余额为 0 → unwrap 时 revert "Insufficient WETH9"）
+  const swapRecipient = unwrap ? routerAddr : p.recipient;
   const args = {
     tokenIn: p.tokenIn as `0x${string}`,
     tokenOut: p.tokenOut as `0x${string}`,
     fee: p.fee,
-    recipient: p.recipient as `0x${string}`,
+    recipient: swapRecipient as `0x${string}`,
     deadline,
     amountIn: p.amountIn,
     amountOutMinimum: p.amountOutMinimum,
