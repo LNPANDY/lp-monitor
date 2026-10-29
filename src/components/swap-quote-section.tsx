@@ -208,10 +208,9 @@ export function SwapQuoteSection() {
     setSwapping(true); setErr(""); setTxHash("");
     try {
       await switchChain(quote.chain.chain_id);
-      // 输出是 wrapped native（isNative 且地址非原生——报价时已映射为 wrapped）时自动 unwrap
-      // 判定：tokenOut 的 symbol 与链原生 symbol 前缀匹配（W0G/0G、WETH/ETH）
-      const outIsWrappedNative = quote.tokenOut.symbol.toUpperCase().startsWith("W") &&
-        quote.tokenOut.symbol.length > 1;
+      // 输出 WETH 直接发到钱包，不做自动 unwrap：
+      // 0G 链没有 native ETH 需求，且自建 Router 内置 WETH9 与链上 WETH 代币
+      // 可能不是同一合约（unwrapWETH9 提不到 swap 输出，revert Insufficient WETH9）
       const swap = buildSwapCalldata(
         quote.router.addr,
         quote.router.kind,
@@ -224,8 +223,7 @@ export function SwapQuoteSection() {
           amountOutMinimum: BigInt(quote.amountOutMin),
           deadline: 0n, // buildSwapCalldata 内部默认 +20 分钟
         },
-        quote.tokenIn.isNative,
-        outIsWrappedNative
+        quote.tokenIn.isNative
       );
       const h = await sendTx({ to: swap.to, data: swap.data, value: swap.value ? BigInt(swap.value) : undefined });
       setTxHash(h);
