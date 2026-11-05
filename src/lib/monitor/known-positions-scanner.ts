@@ -4,7 +4,7 @@
  * 性能目标：100个仓位 < 10秒
  * 与全量扫描(scanner.ts)共享推送去重(dedup.ts)和告警文案构建函数
  */
-import { getDb } from "../db";
+import { getDb, isPairFlipped } from "../db";
 import { listChains, getClient } from "../chains";
 import type { PublicClient } from "viem";
 import { resolveTokens } from "../chains/tokens";
@@ -143,9 +143,9 @@ async function processChainPositions(chain: any, positions: any[], chainIdRef: n
     // 解析代币信息
     const tokenMap = await resolveTokens(client, chainIdRef, positions.flatMap(p => [p.token0, p.token1]));
     
-    // 加载CEX映射
-    const cexMappings = Array.from((await loadAllMappings()).values()).flat();
-    const quotesByAddr = await buildQuotesByAddr(cexMappings, chain.key);
+    // 加载本链 CEX 映射（按链隔离，防止跨链 __native__ 覆盖，且不误传 chain.key 给 skipCache）
+    const chainMappings = loadAllMappings().get(chainIdRef) ?? [];
+    const quotesByAddr = chainMappings.length > 0 ? await buildQuotesByAddr(chainMappings, false) : new Map<string, CexQuote>();
     
     // 批量处理仓位
     for (const position of positions) {
@@ -178,6 +178,7 @@ async function processSinglePosition(
 ) {
   const db = getDb();
   const now = new Date().toISOString();
+  const effectiveFlip = position.pair_flip === 1 || isPairFlipped(position.chain_id_ref, position.token0, position.token1) ? 1 : 0;
 
   // 1. 获取仓位当前状态（包含 CEX 价差、margin）
   const status = await getPositionStatus(position, chain, dexes, tokenMap, quotesByAddr, client);
@@ -194,7 +195,9 @@ async function processSinglePosition(
     `).run(now, position.id);
 
     summary.closed++;
-    const pairLabel = `${position.token0_symbol}/${position.token1_symbol}`;
+    const pairLabel = effectiveFlip
+      ? `${position.token1_symbol}/${position.token0_symbol}`
+      : `${position.token0_symbol}/${position.token1_symbol}`;
     console.log(`[scanner-known] 仓位已关闭: #${position.token_id} ${pairLabel} (${chain.name})`);
 
     // 关闭告警（统一去重）
@@ -225,7 +228,7 @@ async function processSinglePosition(
     }
   }
 
-  // 4. 更新仓位状态（含 margin、CEX 数据、检查时间）
+  // 4. 更新仓位状态（含 margin、CEX 数据、检查时间、pair_flip）
   const cexJson = status.cexPriceInfo ? JSON.stringify(status.cexPriceInfo.payload) : "";
   db.prepare(`
     UPDATE positions
@@ -237,7 +240,8 @@ async function processSinglePosition(
         last_margin_lower = ?,
         last_margin_upper = ?,
         last_cex_price = ?,
-        notify_state = ?
+        notify_state = ?,
+        pair_flip = ?
     WHERE id = ?
   `).run(
     status.currentTick,
@@ -249,6 +253,7 @@ async function processSinglePosition(
     status.marginUpper,
     cexJson,
     status.inRange ? "in_range" : "out_of_range",
+    effectiveFlip,
     position.id
   );
 
@@ -265,7 +270,7 @@ async function processSinglePosition(
     if (shouldPush(position.id, alertType, alertType)) {
       const dp = makeDp(position);
       const w = makeWalletRow(position);
-      const n = buildNotification(w, chain.name, dexes.find(d => d.id === position.dex_id)?.name ?? "", dp, makeReadResult(position, status), position.token0_symbol, position.token1_symbol, position.pair_flip, status.price0Human);
+      const n = buildNotification(w, chain.name, dexes.find(d => d.id === position.dex_id)?.name ?? "", dp, makeReadResult(position, status), position.token0_symbol, position.token1_symbol, effectiveFlip, status.price0Human);
       await sendAndRecord(position, chain, dexes, alertType, n, summary, status.currentTick, alertType);
     }
   }
@@ -275,7 +280,7 @@ async function processSinglePosition(
     if (shouldPush(position.id, "tick_move", "moved")) {
       const dp = makeDp(position);
       const w = makeWalletRow(position);
-      const n = buildTickMoveNotification(w, chain.name, dexes.find(d => d.id === position.dex_id)?.name ?? "", dp, makeReadResult(position, status), position.token0_symbol, position.token1_symbol, position.last_margin_lower, status.marginLower, tickMoveDelta, tickMoveDirection, position.pair_flip, status.price0Human);
+      const n = buildTickMoveNotification(w, chain.name, dexes.find(d => d.id === position.dex_id)?.name ?? "", dp, makeReadResult(position, status), position.token0_symbol, position.token1_symbol, position.last_margin_lower, status.marginLower, tickMoveDelta, tickMoveDirection, effectiveFlip, status.price0Human);
       await sendAndRecord(position, chain, dexes, "tick_move", n, summary, status.currentTick, "moved");
     }
   }
@@ -294,7 +299,7 @@ async function processSinglePosition(
     if (shouldPush(position.id, "cex_price", "exceeds_threshold")) {
       const dp = makeDp(position);
       const w = makeWalletRow(position);
-      const n = buildCexPriceNotification(w, chain.name, dexes.find(d => d.id === position.dex_id)?.name ?? "", dp, makeReadResult(position, status), position.token0_symbol, position.token1_symbol, status.cexPriceInfo.payload, position.pair_flip);
+      const n = buildCexPriceNotification(w, chain.name, dexes.find(d => d.id === position.dex_id)?.name ?? "", dp, makeReadResult(position, status), position.token0_symbol, position.token1_symbol, status.cexPriceInfo.payload, effectiveFlip);
       await sendAndRecord(position, chain, dexes, "cex_price", n, summary, status.currentTick, "exceeds_threshold");
     }
   }
@@ -330,18 +335,20 @@ function makeReadResult(position: any, status: any): any {
 }
 
 /** 发送通知 + 写 alerts 表 + 记录推送去重（统一入口） */
-async function sendAndRecord(position: any, chain: any, _dexes: any[], alertType: string, n: { title: string; body: string }, summary: KnownPositionsSummary, currentTick: number, currentState: string) {
+async function sendAndRecord(position: any, _chain: any, _dexes: any[], alertType: string, n: { title: string; body: string }, summary: KnownPositionsSummary, currentTick: number, currentState: string) {
   summary.alertsSent++;
+  let sentChannels: string[] = [];
   try {
-    await notifyAll(n);
+    const sendRes = await notifyAll(n);
+    sentChannels = sendRes.sent ?? [];
   } catch (error) {
     console.error(`[scanner-known] 发送通知失败:`, error);
   }
-  // 写入 alerts 表（与全量扫描一致）
+  // 写入 alerts 表（与全量扫描一致，记录真实成功推送的渠道列表）
   const db = getDb();
   db.prepare(
     `INSERT INTO alerts (position_id, type, tick_at, message, channels) VALUES (?, ?, ?, ?, ?)`
-  ).run(position.id, alertType, currentTick, n.body, "[]");
+  ).run(position.id, alertType, currentTick, n.body, JSON.stringify(sentChannels));
   // 记录推送去重（用调用点传入的状态，确保与 shouldPush 一致）
   recordPush(position.id, alertType, currentState);
 }

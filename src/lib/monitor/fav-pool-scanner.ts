@@ -11,7 +11,7 @@
  *   - 交易对翻转（pair_flip）与静音（cex_alert_mutes）检查与仓位推送保持一致
  *   - 由 enhanced-scheduler 在 fast discover 之后、known 扫描之前作为 Step 1.5 调用
  */
-import { getDb } from "../db";
+import { getDb, isPairFlipped } from "../db";
 import { getClient } from "../chains";
 import { resolveTokens } from "../chains/tokens";
 import { isCexPriceEnabled } from "../db/settings";
@@ -200,22 +200,17 @@ export async function scanFavoritePools(): Promise<FavPoolScanSummary> {
             dec1
           );
 
-          // 5. pair_flip（与探针 API 同款宽匹配）
-          //    dexName 通过 npm_addr 反查；npm_addr 为空时 dexName=''，
-          //    此时需匹配该 token 对的全部翻转记录（不限 dex），否则永远匹配不上
-          let flipped = false;
-          const dexRow = fav.npm_addr
-            ? db.prepare("SELECT name FROM dexes WHERE chain_id_ref=? AND LOWER(npm)=LOWER(?)").get(chainIdRef, fav.npm_addr) as { name: string } | undefined
-            : undefined;
-          const dexName = dexRow?.name ?? "";
-          const flipRow = dexName
-            ? db.prepare(
-                "SELECT id FROM pair_flips WHERE chain_id_ref=? AND (dex_name=? OR dex_name='') AND token0=? AND token1=?"
-              ).get(chainIdRef, dexName, token0.toLowerCase(), token1.toLowerCase())
-            : db.prepare(
-                "SELECT id FROM pair_flips WHERE chain_id_ref=? AND token0=? AND token1=?"
-              ).get(chainIdRef, token0.toLowerCase(), token1.toLowerCase());
-          if (flipRow) flipped = true;
+          // 5. pair_flip（全局统一匹配）+ 顺便写回收藏表的 token0/token1/symbol
+          const flipped = isPairFlipped(chainIdRef, token0, token1);
+          if (sym0 && sym1) {
+            try {
+              db.prepare(
+                `UPDATE liquidity_favorites
+                 SET token0 = ?, token1 = ?, token0_symbol = ?, token1_symbol = ?
+                 WHERE id = ?`
+              ).run(token0.toLowerCase(), token1.toLowerCase(), sym0, sym1, fav.id);
+            } catch { /* ignore */ }
+          }
 
           // 6. 不做静音检查：收藏池是用户手动逐个开启监控的白名单，
           //    cex_alert_mutes 静音表是给仓位自动推送降噪用的；想停某收藏池

@@ -1,4 +1,4 @@
-import { getDb } from "@/lib/db";
+import { getDb, isPairFlipped } from "@/lib/db";
 import { ok, fail, getBody } from "@/lib/api";
 import { getClient } from "@/lib/chains";
 import { resolveTokens } from "@/lib/chains/tokens";
@@ -34,9 +34,12 @@ interface FavoriteRow {
   npm_addr: string;
   sort_order: number;
   created_at: string;
+  token0?: string;
+  token1?: string;
   token0_symbol: string;
   token1_symbol: string;
   fee: number | null;
+  pair_flip?: number;
 }
 
 interface ChainInfo {
@@ -45,7 +48,7 @@ interface ChainInfo {
 }
 
 /** 列出所有收藏（带链名，按 sort_order 降序、created_at 降序）。
- *  额外关联最近一次快照的 token0/token1 symbol 与 fee，用于前端展示。 */
+ *  额外关联最近一次快照的 token0/token1 symbol、fee 以及全局 pair_flip 翻转状态，用于前端展示。 */
 export async function GET(req: Request) {
   const url = new URL(req.url);
   const chainId = url.searchParams.get("chain_id");
@@ -71,31 +74,62 @@ export async function GET(req: Request) {
   if (chainId) { sql += " AND f.chain_id_ref=?"; args.push(Number(chainId)); }
   sql += " ORDER BY f.sort_order DESC, f.created_at DESC";
   const rows = db.prepare(sql).all(...args) as (FavoriteRow & ChainInfo)[];
-  
-  // 直接使用 liquidity_favorites 表中的 token symbol
+
   const enhancedRows = rows.map(row => {
-    // 如果 symbol 为空字符串，尝试从快照获取 fee 信息
-    if (!row.token0_symbol && !row.token1_symbol) {
+    let t0 = row.token0 || "";
+    let t1 = row.token1 || "";
+    let sym0 = row.token0_symbol || "";
+    let sym1 = row.token1_symbol || "";
+
+    // 如果缺少 token0/token1 或 symbol，尝试从 positions 表同池子记录补全
+    if (!t0 || !t1 || !sym0 || !sym1) {
       const pos = db.prepare(`
-        SELECT token0_symbol, token1_symbol 
-        FROM positions 
-        WHERE chain_id_ref = ? AND pool = ? AND COALESCE(staker_contract, '') = COALESCE(?, '')
-        ORDER BY last_checked_at DESC 
+        SELECT token0, token1, token0_symbol, token1_symbol, pair_flip
+        FROM positions
+        WHERE chain_id_ref = ? AND LOWER(pool) = LOWER(?)
+        ORDER BY last_checked_at DESC
         LIMIT 1
-      `).get(row.chain_id_ref, row.pool_addr, row.staker_addr) as { token0_symbol: string; token1_symbol: string } | undefined;
-      
-      if (pos && pos.token0_symbol && pos.token1_symbol) {
-        return {
-          ...row,
-          token0_symbol: pos.token0_symbol,
-          token1_symbol: pos.token1_symbol
-        };
+      `).get(row.chain_id_ref, row.pool_addr) as { token0: string; token1: string; token0_symbol: string; token1_symbol: string; pair_flip: number } | undefined;
+
+      if (pos) {
+        if (!t0) t0 = pos.token0 || "";
+        if (!t1) t1 = pos.token1 || "";
+        if (!sym0) sym0 = pos.token0_symbol || "";
+        if (!sym1) sym1 = pos.token1_symbol || "";
       }
     }
-    
-    return row;
+
+    // 如果有 symbol 但还没有 token 地址，尝试从 tokens 缓存表反查地址以匹配 pair_flips
+    if ((!t0 || !t1) && sym0 && sym1) {
+      const tok0 = db.prepare("SELECT address FROM tokens WHERE chain_id_ref=? AND LOWER(symbol)=LOWER(?) LIMIT 1").get(row.chain_id_ref, sym0) as { address: string } | undefined;
+      const tok1 = db.prepare("SELECT address FROM tokens WHERE chain_id_ref=? AND LOWER(symbol)=LOWER(?) LIMIT 1").get(row.chain_id_ref, sym1) as { address: string } | undefined;
+      if (!t0 && tok0?.address) t0 = tok0.address;
+      if (!t1 && tok1?.address) t1 = tok1.address;
+    }
+
+    let pair_flip = 0;
+    if (t0 && t1) {
+      pair_flip = isPairFlipped(row.chain_id_ref, t0, t1) ? 1 : 0;
+    } else if (sym0 && sym1) {
+      // 按 symbol 兜底查 positions 表中的 pair_flip
+      const posFlip = db.prepare(`
+        SELECT pair_flip FROM positions
+        WHERE chain_id_ref=? AND LOWER(token0_symbol)=LOWER(?) AND LOWER(token1_symbol)=LOWER(?) AND pair_flip=1
+        LIMIT 1
+      `).get(row.chain_id_ref, sym0, sym1);
+      if (posFlip) pair_flip = 1;
+    }
+
+    return {
+      ...row,
+      token0: t0,
+      token1: t1,
+      token0_symbol: sym0,
+      token1_symbol: sym1,
+      pair_flip,
+    };
   });
-  
+
   return ok(enhancedRows);
 }
 

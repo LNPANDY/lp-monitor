@@ -3,9 +3,6 @@ import { useWallet } from "@/lib/wallet/use-wallet";
 
 /**
  * 顶栏「连接钱包」按钮。
- *
- * 未连接：显示「连接钱包」，点击触发 EIP-1193 授权（OKX 优先）。
- * 已连接：显示截断地址，点击断开。
  */
 export function WalletConnect() {
   const { address, status, error, connect, disconnect, walletName } = useWallet();
@@ -14,16 +11,14 @@ export function WalletConnect() {
 
   if (status === "connected" && address) {
     return (
-      <div className="flex items-center gap-2">
-        {walletName && (
-          <span className="hidden text-[11px] text-ink-soft sm:inline">{walletName}</span>
-        )}
+      <div className="flex items-center gap-1.5">
         <button
-          className="rounded border border-white/10 bg-white/[0.04] px-2.5 py-1 text-xs hover:bg-white/[0.08]"
-          title={`${address} · 点击断开`}
+          className="inline-flex items-center gap-2 rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-2.5 py-1.5 font-mono text-xs font-medium text-emerald-200 transition hover:border-emerald-400/50 hover:bg-emerald-500/15"
+          title={`${walletName ? walletName + " · " : ""}${address}（点击断开）`}
           onClick={disconnect}
         >
-          {short(address)}
+          <span className="h-2 w-2 rounded-full bg-emerald-400 shadow-[0_0_8px_#10b981]" />
+          <span>{short(address)}</span>
         </button>
       </div>
     );
@@ -32,14 +27,17 @@ export function WalletConnect() {
   return (
     <div className="flex items-center gap-2">
       <button
-        className="btn-primary rounded px-3 py-1 text-xs"
+        className="btn-primary px-3 py-1.5 text-xs"
         disabled={status === "connecting"}
         onClick={connect}
       >
+        <svg className="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2">
+          <path strokeLinecap="round" strokeLinejoin="round" d="M21 12V7a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2h14a2 2 0 002-2v-5zm-6 0h6" />
+        </svg>
         {status === "connecting" ? "连接中…" : "连接钱包"}
       </button>
       {error && (
-        <span className="max-w-[200px] truncate text-[11px] text-warn" title={error}>
+        <span className="max-w-[180px] truncate text-[11px] text-rose-400" title={error}>
           {error}
         </span>
       )}

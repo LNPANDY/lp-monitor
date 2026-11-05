@@ -1,4 +1,4 @@
-import { getDb } from "@/lib/db";
+import { getDb, isPairFlipped } from "@/lib/db";
 import { ok, fail, getBody } from "@/lib/api";
 import { getClient } from "@/lib/chains";
 import { listDexes } from "@/lib/chains/dexes";
@@ -129,25 +129,18 @@ export async function POST(req: Request) {
     }
   }
 
-  // 6. 翻转状态：从 pair_flips 表读取（按 chain + token 对匹配）
-  let pairFlip = 0;
-  const dexName = npm
-    ? (listDexes(b.chainId, false).find(d => d.npm.toLowerCase() === npm.toLowerCase())?.name ?? "")
-    : "";
-  const flipRow = db
-    .prepare("SELECT id FROM pair_flips WHERE chain_id_ref=? AND (dex_name=? OR dex_name='') AND token0=? AND token1=?")
-    .get(b.chainId, dexName, token0.toLowerCase(), token1.toLowerCase());
-  if (flipRow) pairFlip = 1;
+  // 6. 翻转状态：使用全局统一的 isPairFlipped（按 chain + token 对匹配）
+  const pairFlip = isPairFlipped(b.chainId, token0, token1) ? 1 : 0;
 
-  // 7. 探针成功后，把 symbol 写回匹配的收藏（按 UNIQUE 键 chain_id_ref+pool_addr+staker_addr）
-  // 这样收藏列表能显示真实 token symbol（如 W0G/USDC.e），而非空值回退
+  // 7. 探针成功后，把 token0/token1 及 symbol 写回匹配的收藏（按 chain_id_ref+pool_addr）
+  // 这样收藏列表能显示真实 token symbol 与翻转后的交易对名称
   if (sym0 && sym1) {
     try {
       db.prepare(
         `UPDATE liquidity_favorites
-         SET token0_symbol = ?, token1_symbol = ?
-         WHERE chain_id_ref = ? AND pool_addr = ? AND COALESCE(staker_addr, '') = ?`
-      ).run(sym0, sym1, b.chainId, b.pool.toLowerCase(), staker);
+         SET token0 = ?, token1 = ?, token0_symbol = ?, token1_symbol = ?
+         WHERE chain_id_ref = ? AND LOWER(pool_addr) = LOWER(?)`
+      ).run(token0.toLowerCase(), token1.toLowerCase(), sym0, sym1, b.chainId, b.pool.toLowerCase());
     } catch {
       // 写回失败不影响探针主流程
     }

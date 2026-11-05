@@ -233,13 +233,18 @@ function migrate(db: DB) {
       staker_addr   TEXT    NOT NULL DEFAULT '',  -- 可选 vault/质押地址（小写）
       npm_addr      TEXT    NOT NULL DEFAULT '',  -- 可选 NPM 地址（留空则按链取第一个 v3-fork）
       sort_order    INTEGER NOT NULL DEFAULT 0,   -- 排序权重，越大越靠前
+      token0        TEXT    NOT NULL DEFAULT '',  -- 池子 token0 地址（小写）
+      token1        TEXT    NOT NULL DEFAULT '',  -- 池子 token1 地址（小写）
+      token0_symbol TEXT    NOT NULL DEFAULT '',  -- token0 的 symbol，用于显示
+      token1_symbol TEXT    NOT NULL DEFAULT '',  -- token1 的 symbol，用于显示
+      monitor_cex   INTEGER NOT NULL DEFAULT 0,   -- 快速扫描监控开关
       created_at    TEXT    NOT NULL DEFAULT (datetime('now')),
       UNIQUE(chain_id_ref, pool_addr, staker_addr)
     );
     CREATE INDEX IF NOT EXISTS idx_liq_fav_chain ON liquidity_favorites(chain_id_ref);
 
     -- 交易对翻转偏好（独立于 positions 表，钱包/链删除重建后仍可恢复）
-    -- 唯一键: chain_id_ref + dex_name + token0 + token1（忽略 token_id，同一交易对共享翻转）
+    -- 唯一键: chain_id_ref + dex_name + token0 + token1（查询时按 chain_id_ref + token0 + token1 全局共享翻转）
     CREATE TABLE IF NOT EXISTS pair_flips (
       id            INTEGER PRIMARY KEY AUTOINCREMENT,
       chain_id_ref  INTEGER NOT NULL REFERENCES chains(id) ON DELETE CASCADE,
@@ -258,21 +263,6 @@ function migrate(db: DB) {
       token1        TEXT    NOT NULL,
       created_at    TEXT    NOT NULL DEFAULT (datetime('now')),
       UNIQUE(chain_id_ref, token0, token1)
-    );
-
--- 流动性收藏：保存探针收藏信息，包含token symbol
-    CREATE TABLE IF NOT EXISTS liquidity_favorites (
-      id            INTEGER PRIMARY KEY AUTOINCREMENT,
-      chain_id_ref  INTEGER NOT NULL REFERENCES chains(id) ON DELETE CASCADE,
-      label         TEXT    NOT NULL DEFAULT '',   -- 自定义备注，如 '0G/WETH 0.3% 主池'
-      pool_addr     TEXT    NOT NULL,             -- V3 池子地址（小写）
-      staker_addr   TEXT    NOT NULL DEFAULT '',  -- 可选 vault/质押地址（小写）
-      npm_addr      TEXT    NOT NULL DEFAULT '',  -- 可选 NPM 地址（留空则按链取第一个 v3-fork）
-      sort_order    INTEGER NOT NULL DEFAULT 0,   -- 排序权重，越大越靠前
-      token0_symbol  TEXT    NOT NULL DEFAULT '', -- token0的symbol，用于显示
-      token1_symbol  TEXT    NOT NULL DEFAULT '', -- token1的symbol，用于显示
-      created_at    TEXT    NOT NULL DEFAULT (datetime('now')),
-      UNIQUE(chain_id_ref, pool_addr, staker_addr)
     );
 
     -- 推送状态记录：用于控制相同告警的推送频次，避免重复推送
@@ -296,7 +286,9 @@ function migrate(db: DB) {
   safeAddColumn(db, "positions", "token0_symbol", "TEXT NOT NULL DEFAULT ''");
   safeAddColumn(db, "positions", "token1_symbol", "TEXT NOT NULL DEFAULT ''");
   safeAddColumn(db, "push_states", "last_alert_state", "TEXT NOT NULL DEFAULT ''");
-  // liquidity_favorites 表新增 token symbol 字段
+  // liquidity_favorites 表新增 token 地址与 symbol 字段
+  safeAddColumn(db, "liquidity_favorites", "token0", "TEXT NOT NULL DEFAULT ''");
+  safeAddColumn(db, "liquidity_favorites", "token1", "TEXT NOT NULL DEFAULT ''");
   safeAddColumn(db, "liquidity_favorites", "token0_symbol", "TEXT NOT NULL DEFAULT ''");
   safeAddColumn(db, "liquidity_favorites", "token1_symbol", "TEXT NOT NULL DEFAULT ''");
   // pair_flip: 0=原始token0/token1, 1=用户翻转为token1/token0
@@ -329,6 +321,57 @@ function migrate(db: DB) {
   migratePushStatesEntityType(db);
 
   seedDefaults(db);
+}
+
+/**
+ * 统一查询交易对是否已翻转（按 chain_id_ref + token0 + token1 跨模块全局一致）。
+ * 同时检查 pair_flips 表与 positions 表，确保旧数据也能无缝兼容。
+ */
+export function isPairFlipped(chainIdRef: number, token0: string, token1: string): boolean {
+  if (!chainIdRef || !token0 || !token1) return false;
+  const db = getDb();
+  const t0 = token0.trim().toLowerCase();
+  const t1 = token1.trim().toLowerCase();
+  const row = db
+    .prepare("SELECT 1 FROM pair_flips WHERE chain_id_ref=? AND LOWER(token0)=? AND LOWER(token1)=? LIMIT 1")
+    .get(chainIdRef, t0, t1);
+  if (row) return true;
+  const posRow = db
+    .prepare("SELECT 1 FROM positions WHERE chain_id_ref=? AND LOWER(token0)=? AND LOWER(token1)=? AND pair_flip=1 LIMIT 1")
+    .get(chainIdRef, t0, t1);
+  return !!posRow;
+}
+
+/**
+ * 统一设置交易对翻转状态（按 chain_id_ref + token0 + token1 跨仓位、探针、建仓面板同步更新）。
+ */
+export function setPairFlip(
+  chainIdRef: number,
+  token0: string,
+  token1: string,
+  flip: boolean,
+  dexName = ""
+): void {
+  if (!chainIdRef || !token0 || !token1) return;
+  const db = getDb();
+  const t0 = token0.trim().toLowerCase();
+  const t1 = token1.trim().toLowerCase();
+  const flipVal = flip ? 1 : 0;
+  const tx = db.transaction(() => {
+    if (flip) {
+      db.prepare(
+        "INSERT OR IGNORE INTO pair_flips (chain_id_ref, dex_name, token0, token1) VALUES (?,?,?,?)"
+      ).run(chainIdRef, dexName || "", t0, t1);
+    } else {
+      db.prepare(
+        "DELETE FROM pair_flips WHERE chain_id_ref=? AND LOWER(token0)=? AND LOWER(token1)=?"
+      ).run(chainIdRef, t0, t1);
+    }
+    db.prepare(
+      "UPDATE positions SET pair_flip=? WHERE chain_id_ref=? AND LOWER(token0)=? AND LOWER(token1)=?"
+    ).run(flipVal, chainIdRef, t0, t1);
+  });
+  tx();
 }
 
 /** 初始化默认设置 */

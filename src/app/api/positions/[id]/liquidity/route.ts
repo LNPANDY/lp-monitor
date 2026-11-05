@@ -1,4 +1,4 @@
-import { getDb } from "@/lib/db";
+import { getDb, isPairFlipped } from "@/lib/db";
 import { ok, fail } from "@/lib/api";
 import { getClient } from "@/lib/chains";
 import { resolveTokens } from "@/lib/chains/tokens";
@@ -25,21 +25,11 @@ interface PositionRow {
   source: string;
   staker_contract: string;
   last_liquidity: string;
+  pair_flip?: number;
 }
 
 /**
  * 对单个仓位做流动性分析（场景A 直持 / 场景B 质押）。
- *
- * 入参：
- *   - 路径参数 id：positions 主键
- *   - body.force=1：忽略缓存强制刷新
- *
- * 流程：
- *   1. 命中未过期快照 → 直接返回（payload 已是完整结果）
- *   2. 读 position 行，取 chain/dex/staking，构造 PublicClient
- *   3. resolveTokens 拿 decimals（缺失兜底 18）
- *   4. source=direct → analyzeDirect；source=staking → analyzeStaked
- *   5. 写入 liquidity_snapshots（payload 存完整 JSON），返回结果
  */
 export async function POST(req: Request, { params }: { params: { id: string } }) {
   const url = new URL(req.url);
@@ -48,6 +38,7 @@ export async function POST(req: Request, { params }: { params: { id: string } })
 
   const pos = db.prepare("SELECT * FROM positions WHERE id=?").get(params.id) as PositionRow | undefined;
   if (!pos) return fail("仓位不存在", 404);
+  const pairFlip = pos.pair_flip === 1 || isPairFlipped(pos.chain_id_ref, pos.token0, pos.token1) ? 1 : 0;
 
   // 1. 命中缓存
   if (!force) {
@@ -60,7 +51,7 @@ export async function POST(req: Request, { params }: { params: { id: string } })
       .get(params.id) as { payload: string } | undefined;
     if (cached?.payload) {
       try {
-        return ok({ ...JSON.parse(cached.payload), cached: true });
+        return ok({ ...JSON.parse(cached.payload), pairFlip, cached: true });
       } catch {
         // payload 损坏，走重算
       }
@@ -151,5 +142,5 @@ export async function POST(req: Request, { params }: { params: { id: string } })
     expires.toISOString()
   );
 
-  return ok({ ...result, cached: false });
+  return ok({ ...result, pairFlip, cached: false });
 }

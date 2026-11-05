@@ -16,7 +16,7 @@
  * 故直接放开 source 过滤即可一并统计（含 direct + staking）。
  */
 import type { PublicClient } from "viem";
-import { getDb } from "../db";
+import { getDb, isPairFlipped } from "../db";
 import { getClient, getChain } from "../chains";
 import { resolveTokens } from "../chains/tokens";
 import { loadAllMappings, buildQuotesByAddr, type CexQuote } from "../cex/binance";
@@ -236,16 +236,24 @@ export async function computePortfolio(chainDbId: number, address: string): Prom
         }
         // else：两端都有量但至少一端缺报价 → 无法估值
 
+        const flipped = p.pair_flip === 1 || isPairFlipped(chainDbId, p.token0, p.token1);
+        const pairDisplay = flipped ? `${sym1}/${sym0}` : `${sym0}/${sym1}`;
+        const subItems = flipped
+          ? [
+              { symbol: sym1, amount: fmtAmount(amt1), valueUsd: v1 },
+              { symbol: sym0, amount: fmtAmount(amt0), valueUsd: v0 },
+            ]
+          : [
+              { symbol: sym0, amount: fmtAmount(amt0), valueUsd: v0 },
+              { symbol: sym1, amount: fmtAmount(amt1), valueUsd: v1 },
+            ];
         const sourceTag = p.source === "staking" ? "·质押" : "";
         items.push({
           kind: "lp",
-          symbol: `LP·#${p.token_id}(${sym0}/${sym1})${sourceTag}`,
+          symbol: `LP·#${p.token_id}(${pairDisplay})${sourceTag}`,
           amount: fmtAmount(0), // LP 总量无单一数量概念，置空
           valueUsd: positionValue,
-          subItems: [
-            { symbol: sym0, amount: fmtAmount(amt0), valueUsd: v0 },
-            { symbol: sym1, amount: fmtAmount(amt1), valueUsd: v1 },
-          ],
+          subItems,
         });
       } catch (e: any) {
         warnings.push(`仓位 #${p.token_id} 计算失败：${e?.message ?? e}`);

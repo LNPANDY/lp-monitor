@@ -1,12 +1,12 @@
 import { ok, fail, getBody } from "@/lib/api";
-import { getDb } from "@/lib/db";
+import { setPairFlip } from "@/lib/db";
 import { listDexes } from "@/lib/chains/dexes";
 
 export const dynamic = "force-dynamic";
 
 /**
- * PUT: 翻转探针池子的交易对展示顺序。
- * 复用 pair_flips 表（与仓位翻转共享偏好）。
+ * PUT: 翻转探针或建仓面板池子的交易对展示顺序。
+ * 复用 setPairFlip（与仓位翻转、收藏列表、建仓面板共享偏好）。
  *
  * body: { chain_id, token0, token1, flip: boolean, npm? }
  */
@@ -23,7 +23,6 @@ export async function PUT(req: Request) {
     return fail("缺少 chain_id / token0 / token1 / flip");
   }
 
-  const db = getDb();
   const t0 = b.token0.trim().toLowerCase();
   const t1 = b.token1.trim().toLowerCase();
 
@@ -36,23 +35,15 @@ export async function PUT(req: Request) {
     dexName = matched?.name ?? "";
   }
 
-  const flipVal = b.flip ? 1 : 0;
-  if (flipVal === 1) {
-    db.prepare(
-      `INSERT OR IGNORE INTO pair_flips (chain_id_ref, dex_name, token0, token1) VALUES (?,?,?,?)`
-    ).run(b.chain_id, dexName, t0, t1);
-  } else {
-    db.prepare(
-      `DELETE FROM pair_flips WHERE chain_id_ref=? AND (dex_name=? OR dex_name='') AND token0=? AND token1=?`
-    ).run(b.chain_id, dexName, t0, t1);
-  }
+  const flipBool = !!b.flip;
+  setPairFlip(b.chain_id, t0, t1, flipBool, dexName);
 
   return ok({
     chain_id: b.chain_id,
     token0: t0,
     token1: t1,
-    pair_flip: flipVal,
+    pair_flip: flipBool ? 1 : 0,
     dex_name: dexName,
-    message: b.flip ? "交易对已翻转为 token1/token0" : "交易对已重置为 token0/token1",
+    message: flipBool ? "交易对已翻转为 token1/token0" : "交易对已重置为 token0/token1",
   });
 }

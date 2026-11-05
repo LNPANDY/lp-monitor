@@ -1,27 +1,24 @@
 "use client";
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect } from "react";
 import useSWR from "swr";
-import { fetcher, authHeaders, short } from "./util";
-import { useWallet } from "@/lib/wallet/use-wallet";
+import { fetcher, authHeaders, short, fmtFull } from "./util";
+import { useWallet, waitForTxReceipt } from "@/lib/wallet/use-wallet";
 import { buildSwapCalldata } from "@/lib/wallet/build-swap";
+import { buildApproveCalldata, MAX_UINT256 } from "@/lib/wallet/build-mint";
+import { getInjectedProvider } from "@/lib/wallet/provider";
+import { toast } from "./toast";
 
-interface CexToken {
-  token_symbol: string;
-  token_addr: string; // '__native__' 表示原生币
-  chain_id_ref: number;
-}
-
-interface DexWithQuoter {
+interface CexMappingRow {
   id: number;
-  name: string;
   chain_id_ref: number;
   chain_name: string;
-  quoter: string;
-  router02: string;
-  swaprouter: string;
+  token_addr: string;
+  token_symbol: string;
+  cex_symbol: string;
+  enabled: number;
 }
 
-interface QuoteResult {
+interface QuoteData {
   chain: { id: number; name: string; chain_id: number };
   dexName: string;
   pool: string;
@@ -38,10 +35,10 @@ interface QuoteResult {
   slippagePct: number;
   priceImpactPct: number | null;
   gasEstimate: string;
+  executionPrice: number;
   router: { addr: string; kind: "router02" | "swaprouter" } | null;
-  balances?: { in: string; out: string } | null;
-  executionPrice?: number;
-  cexCompare?: {
+  balances: { in: string; out: string } | null;
+  cexCompare: {
     stableSymbol: string;
     otherSymbol: string;
     cexPrice: number;
@@ -52,419 +49,580 @@ interface QuoteResult {
   } | null;
 }
 
-/**
- * 代币兑换（QuoterV2 报价 + SwapRouter 执行）。
- *
- * - DEX 自动读取已配置 quoter 的 v3 DEX（显示为 链-DEX 名）
- * - token 下拉读取 CEX 报价匹配的代币（含 __native__ 原生币）
- * - 任一侧输入数量 → 防抖自动算另一侧（正向 exact-in 报价，反向用成交价反算）
- * - 「兑换」按钮 = 调钱包执行 swap（exactInputSingle，带滑点保护）
- */
 export function SwapQuoteSection() {
   const { data: chains } = useSWR<any[]>("/api/chains", fetcher);
-  const { data: allDexes } = useSWR<DexWithQuoter[]>("/api/dexes", fetcher);
-  const { data: allMappings } = useSWR<CexToken[]>("/api/cex-mapping", fetcher);
-  const { address, sendTx, switchChain, connect } = useWallet();
+  const { data: mappings } = useSWR<CexMappingRow[]>("/api/cex-mapping", fetcher);
+  const wallet = useWallet();
 
-  // 可用 DEX：配了 quoter 的（显示 链-DEX）
-  const dexOptions = (allDexes ?? []).filter((d) => d.quoter);
-  const [dexId, setDexId] = useState<number | "">("");
-  // 选中的 DEX 对象
-  const dex = dexOptions.find((d) => d.id === dexId) ?? dexOptions[0] ?? null;
+  const [chainId, setChainId] = useState<number | "">("");
+  const [tokenIn, setTokenIn] = useState("");
+  const [tokenOut, setTokenOut] = useState("");
+  const [amountIn, setAmountIn] = useState("1");
+  const [targetOut, setTargetOut] = useState("");
+  const [inputMode, setInputMode] = useState<"in" | "out">("in");
+  const [slippagePct, setSlippagePct] = useState("0.5");
+  const [feeOverride, setFeeOverride] = useState<number | null>(null);
 
-  // 该链的 CEX 代币列表
-  const chainTokens = (allMappings ?? []).filter((m) => dex && m.chain_id_ref === dex.chain_id_ref);
-  const [inSym, setInSym] = useState("");
-  const [outSym, setOutSym] = useState("");
-  // 初始化：进 DEX 后默认选第 1、2 个代币
-  useEffect(() => {
-    if (dex && chainTokens.length >= 2 && !inSym && !outSym) {
-      setInSym(chainTokens[0].token_symbol);
-      setOutSym(chainTokens[1].token_symbol);
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [dex?.id]);
-
-  const [amountIn, setAmountIn] = useState("");
-  const [amountOut, setAmountOut] = useState("");
-  // 哪一侧是用户输入的（另一侧自动算）
-  const [editingSide, setEditingSide] = useState<"in" | "out">("in");
-  const [slippage, setSlippage] = useState<number>(0.1);
-  const [feeOverride, setFeeOverride] = useState<number | undefined>(undefined);
-  const [quote, setQuote] = useState<QuoteResult | null>(null);
-  const [quoting, setQuoting] = useState(false);
-  const [swapping, setSwapping] = useState(false);
+  const [loading, setLoading] = useState(false);
   const [err, setErr] = useState("");
+  const [quote, setQuote] = useState<QuoteData | null>(null);
+
+  const [swapping, setSwapping] = useState(false);
+  const [swapStep, setSwapStep] = useState("");
   const [txHash, setTxHash] = useState("");
-  // 两个 token 的钱包余额（报价返回）
-  const [balances, setBalances] = useState<{ in: string; out: string; decIn: number; decOut: number } | null>(null);
 
-  const tokenInMeta = chainTokens.find((t) => t.token_symbol === inSym);
-  const tokenOutMeta = chainTokens.find((t) => t.token_symbol === outSym);
+  const enabledChains = (chains ?? []).filter((c) => c.enabled);
 
-  /** 只查钱包余额（不走报价）：native 用链配置 symbol 匹配 __native__ 行判断 */
-  const fetchBalances = useCallback(async () => {
-    if (!dex || !address || !tokenInMeta || !tokenOutMeta) return;
-    try {
-      const r = await fetch("/api/token-balances", {
-        method: "POST",
-        headers: authHeaders({ "Content-Type": "application/json" }),
-        body: JSON.stringify({
-          chain_id: dex.chain_id_ref,
-          wallet: address,
-          tokens: [tokenInMeta.token_addr, tokenOutMeta.token_addr],
-        }),
-      });
-      const j = await r.json();
-      if (!j.ok) return;
-      const arr: string[] = j.data.balances;
-      const decs: number[] = j.data.decimals ?? [18, 18];
-      setBalances({ in: arr[0] ?? "0", out: arr[1] ?? "0", decIn: decs[0] ?? 18, decOut: decs[1] ?? 18 });
-    } catch { /* ignore */ }
-  }, [dex, address, tokenInMeta, tokenOutMeta]);
+  // 默认选中第一个有代币映射的链
+  useEffect(() => {
+    if (!chainId && enabledChains.length > 0 && mappings) {
+      const chainWithTokens = enabledChains.find((c) =>
+        mappings.some((m) => m.enabled && m.chain_id_ref === c.id)
+      );
+      setChainId((chainWithTokens ?? enabledChains[0]).id);
+    }
+  }, [chainId, enabledChains, mappings]);
 
-  /** 报价：用输入侧的金额 */
-  const doQuote = useCallback(async (amount: string, dir: "in" | "out") => {
+  const chainTokens = (mappings ?? []).filter(
+    (m) => m.enabled && (!chainId || m.chain_id_ref === Number(chainId))
+  );
+
+  // 当链变化且尚未选币时，默认填入前两个常用币
+  useEffect(() => {
+    if (chainTokens.length >= 2 && !tokenIn && !tokenOut) {
+      setTokenIn(chainTokens[0].token_addr);
+      setTokenOut(chainTokens[1].token_addr);
+    }
+  }, [chainTokens, tokenIn, tokenOut]);
+
+  function flipDirection() {
+    const prevIn = tokenIn;
+    const prevOut = tokenOut;
+    setTokenIn(prevOut);
+    setTokenOut(prevIn);
+    setFeeOverride(null);
+    setQuote(null);
     setErr("");
-    if (!dex || !tokenInMeta || !tokenOutMeta || !amount || Number(amount) <= 0) {
-      setQuote(null);
+    setTxHash("");
+  }
+
+  async function doQuote(opts?: {
+    overrideFee?: number | null;
+    overrideAmountIn?: string;
+  }) {
+    if (!chainId || !tokenIn || !tokenOut) {
+      toast.warn("请选择链以及卖出和买入代币");
       return;
     }
-    setQuoting(true);
+    const useAmtIn = opts?.overrideAmountIn ?? amountIn;
+    if (inputMode === "in" && !useAmtIn) return;
+    if (inputMode === "out" && !targetOut) return;
+
+    setLoading(true);
+    setErr("");
+    setTxHash("");
     try {
-      const body: any = {
-        chain_id: dex.chain_id_ref,
-        token_in_addr: tokenInMeta.token_addr,
-        token_out_addr: tokenOutMeta.token_addr,
-        slippage_pct: slippage,
-        ...(feeOverride ? { fee: feeOverride } : {}),
-        ...(address ? { wallet: address } : {}),
+      const useFee =
+        opts && "overrideFee" in opts ? opts.overrideFee : feeOverride;
+      const body: Record<string, any> = {
+        chain_id: Number(chainId),
+        token_in_addr: tokenIn,
+        token_out_addr: tokenOut,
+        slippage_pct: Number(slippagePct) || 0.5,
       };
-      if (dir === "in") {
-        body.amount_in = amount;
+      if (inputMode === "out") {
+        body.target_out = targetOut;
       } else {
-        // 反向输入：直接把目标输出数量传给后端迭代反算（精确，无近似）
-        body.target_out = amount;
+        body.amount_in = useAmtIn;
       }
+      if (useFee) body.fee = useFee;
+      if (wallet.address) body.wallet = wallet.address;
+
       const r = await fetch("/api/swap-quote", {
         method: "POST",
         headers: authHeaders({ "Content-Type": "application/json" }),
         body: JSON.stringify(body),
       });
       const j = await r.json();
-      if (!j.ok) throw new Error(j.error);
+      if (!j.ok) throw new Error(j.error || "报价失败");
       setQuote(j.data);
-      const qb = (j.data as QuoteResult).balances;
-      setBalances(qb ? { in: qb.in, out: qb.out, decIn: (j.data as QuoteResult).tokenIn.decimals, decOut: (j.data as QuoteResult).tokenOut.decimals } : null);
-      // 把另一侧的数量填回输入框（用户没在编辑那侧时），并标记为自动回填
-      autoFillTsRef.current = Date.now();
-      if (dir === "in") {
-        setAmountOut(trimNum(j.data.amountOutHuman));
-      } else {
-        setAmountIn(trimNum(j.data.amountInHuman));
+      if (inputMode === "out" && j.data?.amountInHuman) {
+        setAmountIn(j.data.amountInHuman);
       }
     } catch (e: any) {
       setErr(e.message);
       setQuote(null);
-    } finally { setQuoting(false); }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [dex, tokenInMeta, tokenOutMeta, slippage, feeOverride]);
+    } finally {
+      setLoading(false);
+    }
+  }
 
-  // 防抖自动报价
-  const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  // doQuote 成功后自动回填另一侧数量时置位，防抖 effect 检测到则跳过（避免二次报价）
-  const autoFillTsRef = useRef(0);
-  useEffect(() => {
-    if (debounceRef.current) clearTimeout(debounceRef.current);
-    debounceRef.current = setTimeout(() => {
-      // 自动回填后的 1 秒内不触发报价（那是回填引发的 effect，不是用户输入）
-      if (Date.now() - autoFillTsRef.current < 1000) return;
-      const amount = editingSide === "in" ? amountIn : amountOut;
-      if (amount && Number(amount) > 0) doQuote(amount, editingSide);
-    }, 700);
-    return () => { if (debounceRef.current) clearTimeout(debounceRef.current); };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [amountIn, amountOut, editingSide, inSym, outSym, slippage, feeOverride]);
-
-  // 选完 token 对后只查钱包余额（不走报价）
-  const initialLoadedRef = useRef("");
-  useEffect(() => {
-    if (!dex || !address || !tokenInMeta || !tokenOutMeta || inSym === outSym) return;
-    const key = `${dex.chain_id_ref}-${inSym}-${outSym}-${address}`;
-    if (initialLoadedRef.current === key) return;
-    initialLoadedRef.current = key;
-    fetchBalances();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [dex?.id, inSym, outSym, address]);
-
-  /** 执行兑换 */
   async function executeSwap() {
-    if (!address) { await connect(); return; }
-    if (!quote) { setErr("请先输入数量获取报价"); return; }
-    if (!quote.router) { setErr("该 DEX 未配置 SwapRouter 地址（请在配置页 DEX 设置里填写）"); return; }
-    if (!tokenInMeta) return;
-
-    // 授权检查提示（不做静默 approve，用户自行确认额度）
-    setSwapping(true); setErr(""); setTxHash("");
+    if (!quote || !quote.router) return;
+    setSwapping(true);
+    setErr("");
+    setTxHash("");
     try {
-      await switchChain(quote.chain.chain_id);
-      // 输出 WETH 直接发到钱包，不做自动 unwrap：
-      // 0G 链没有 native ETH 需求，且自建 Router 内置 WETH9 与链上 WETH 代币
-      // 可能不是同一合约（unwrapWETH9 提不到 swap 输出，revert Insufficient WETH9）
-      const swap = buildSwapCalldata(
-        quote.router.addr,
+      let addr = wallet.address;
+      if (!addr) {
+        setSwapStep("连接钱包…");
+        addr = await wallet.connect();
+        if (!addr) throw new Error("未连接钱包");
+      }
+
+      const chainRow = enabledChains.find((c) => c.id === quote.chain.id);
+      if (wallet.chainId !== quote.chain.chain_id) {
+        setSwapStep(`切换到 ${quote.chain.name}…`);
+        await wallet.switchChain(quote.chain.chain_id, {
+          chainName: quote.chain.name,
+          nativeCurrency: {
+            name: chainRow?.symbol || "ETH",
+            symbol: chainRow?.symbol || "ETH",
+            decimals: 18,
+          },
+          rpcUrls: chainRow?.rpc_urls ?? [],
+          blockExplorerUrls: chainRow?.explorer_url
+            ? [chainRow.explorer_url]
+            : undefined,
+        });
+      }
+
+      const routerAddr = quote.router.addr;
+      const amountInBig = BigInt(quote.amountIn);
+      const amountOutMinBig = BigInt(quote.amountOutMin);
+
+      // 非原生币时检查 allowance，不足则先 approve 并使用 350ms 极速回执轮询
+      if (!quote.tokenIn.isNative) {
+        setSwapStep(`检查 ${quote.tokenIn.symbol} 授权…`);
+        const p = getInjectedProvider();
+        let needApprove = true;
+        if (p) {
+          try {
+            const ownerPad = addr
+              .toLowerCase()
+              .replace(/^0x/, "")
+              .padStart(64, "0");
+            const spenderPad = routerAddr
+              .toLowerCase()
+              .replace(/^0x/, "")
+              .padStart(64, "0");
+            const raw = (await p.request({
+              method: "eth_call",
+              params: [
+                {
+                  to: quote.tokenIn.addr,
+                  data: "0xdd62ed3e" + ownerPad + spenderPad,
+                },
+                "latest",
+              ],
+            })) as string;
+            if (raw && raw !== "0x" && BigInt(raw) >= amountInBig) {
+              needApprove = false;
+            }
+          } catch {}
+        }
+
+        if (needApprove) {
+          setSwapStep(`1/2 · 授权 ${quote.tokenIn.symbol}…`);
+          const appTx = buildApproveCalldata(
+            quote.tokenIn.addr,
+            routerAddr,
+            MAX_UINT256
+          );
+          const appHash = await wallet.sendTx({ ...appTx, gas: 80000n });
+          setSwapStep(`等待 ${quote.tokenIn.symbol} 授权确认…`);
+          await waitForTxReceipt(appHash, 45_000);
+        }
+      }
+
+      setSwapStep("2/2 · 发送兑换交易…");
+      const deadline = BigInt(Math.floor(Date.now() / 1000) + 1200);
+      const swapTx = buildSwapCalldata(
+        routerAddr,
         quote.router.kind,
         {
           tokenIn: quote.tokenIn.addr,
           tokenOut: quote.tokenOut.addr,
           fee: quote.fee,
-          recipient: address,
-          amountIn: BigInt(quote.amountIn),
-          amountOutMinimum: BigInt(quote.amountOutMin),
-          deadline: 0n, // buildSwapCalldata 内部默认 +20 分钟
+          recipient: addr,
+          amountIn: amountInBig,
+          amountOutMinimum: amountOutMinBig,
+          deadline,
         },
         quote.tokenIn.isNative
       );
-      const h = await sendTx({ to: swap.to, data: swap.data, value: swap.value ? BigInt(swap.value) : undefined });
+      const h = await wallet.sendTx({
+        to: swapTx.to,
+        data: swapTx.data,
+        value: swapTx.value ? BigInt(swapTx.value) : undefined,
+        gas: 320000n,
+      });
       setTxHash(h);
+      setSwapStep("等待兑换上链确认…");
+      await waitForTxReceipt(h, 45_000);
+      setSwapStep("");
+      toast.success(
+        `兑换成功！${quote.amountInHuman} ${quote.tokenIn.symbol} → ${quote.amountOutHuman} ${quote.tokenOut.symbol}`
+      );
+      doQuote();
     } catch (e: any) {
-      setErr(`兑换失败：${e?.message ?? e}`);
-    } finally { setSwapping(false); }
+      setErr(e?.message || String(e));
+      toast.error(e?.message || "兑换中断");
+      setSwapStep("");
+    } finally {
+      setSwapping(false);
+    }
   }
 
-  /** 交换两侧 */
-  function swapSides() {
-    setInSym(outSym);
-    setOutSym(inSym);
-    setAmountIn(amountOut);
-    setAmountOut(amountIn);
-    setEditingSide(editingSide === "in" ? "out" : "in");
-    setQuote(null);
+  function fmtBal(rawStr: string, decimals: number): number {
+    const n = Number(rawStr) / Math.pow(10, decimals);
+    return Number.isFinite(n) ? n : 0;
   }
+
+  const inBalanceNum =
+    quote?.balances && quote.tokenIn
+      ? fmtBal(quote.balances.in, quote.tokenIn.decimals)
+      : null;
+  const outBalanceNum =
+    quote?.balances && quote.tokenOut
+      ? fmtBal(quote.balances.out, quote.tokenOut.decimals)
+      : null;
 
   return (
-    <section className="card p-5">
-      <h2 className="mb-1 text-base font-semibold">💱 代币兑换</h2>
-      <p className="mb-3 text-xs text-ink-soft">
-        QuoterV2 精确报价 + SwapRouter 链上执行。需在配置页给 DEX 填写 QuoterV2 和 SwapRouter 地址。
-      </p>
+    <div className="card p-3.5 space-y-3">
+      <div className="flex flex-wrap items-center justify-between gap-2 border-b border-white/[0.07] pb-2.5">
+        <div className="flex items-center gap-2">
+          <span className="text-sm font-semibold text-ink">
+            💱 极速询价 & 代币兑换
+          </span>
+          <span className="text-[11px] text-ink-muted">
+            自动优选最大深度池并对比币安汇率
+          </span>
+        </div>
+      </div>
 
-      {/* DEX 选择 */}
-      <div className="mb-3">
-        <span className="label">DEX</span>
-        {dexOptions.length === 0 ? (
-          <p className="text-xs text-warn">暂无可用 DEX（请先在配置页给 DEX 填写 QuoterV2 地址）</p>
-        ) : (
+      {/* 链 + 卖出币 + 互换 + 买入币 */}
+      <div className="grid grid-cols-1 gap-2 sm:grid-cols-12 items-end">
+        <div className="sm:col-span-3">
+          <span className="label">链</span>
           <select
-            className="input max-w-[240px]"
-            value={dex?.id ?? ""}
-            onChange={(e) => { setDexId(e.target.value ? Number(e.target.value) : ""); setInSym(""); setOutSym(""); setQuote(null); }}
+            className="input"
+            value={chainId}
+            onChange={(e) => {
+              setChainId(e.target.value ? Number(e.target.value) : "");
+              setTokenIn("");
+              setTokenOut("");
+              setQuote(null);
+            }}
           >
-            {dexOptions.map((d) => (
-              <option key={d.id} value={d.id}>
-                {(chains ?? []).find((c: any) => c.id === d.chain_id_ref)?.name ?? d.chain_id_ref}-{d.name}
+            <option value="">选择链</option>
+            {enabledChains.map((c) => (
+              <option key={c.id} value={c.id}>
+                {c.name}
               </option>
             ))}
           </select>
-        )}
+        </div>
+
+        <div className="sm:col-span-4">
+          <span className="label">卖出 (Token In)</span>
+          <select
+            className="input font-medium"
+            value={tokenIn}
+            onChange={(e) => {
+              setTokenIn(e.target.value);
+              setFeeOverride(null);
+              setQuote(null);
+            }}
+          >
+            <option value="">选择代币</option>
+            {chainTokens.map((m) => (
+              <option key={m.id} value={m.token_addr}>
+                {m.token_symbol || short(m.token_addr)}
+                {m.token_addr === "__native__" ? " (原生)" : ""}
+              </option>
+            ))}
+          </select>
+        </div>
+
+        <div className="sm:col-span-1 flex justify-center">
+          <button
+            type="button"
+            className="btn-ghost px-2 py-1.5 text-xs"
+            onClick={flipDirection}
+            title="互换卖出与买入币种"
+          >
+            ⇄
+          </button>
+        </div>
+
+        <div className="sm:col-span-4">
+          <span className="label">买入 (Token Out)</span>
+          <select
+            className="input font-medium"
+            value={tokenOut}
+            onChange={(e) => {
+              setTokenOut(e.target.value);
+              setFeeOverride(null);
+              setQuote(null);
+            }}
+          >
+            <option value="">选择代币</option>
+            {chainTokens.map((m) => (
+              <option key={m.id} value={m.token_addr}>
+                {m.token_symbol || short(m.token_addr)}
+                {m.token_addr === "__native__" ? " (原生)" : ""}
+              </option>
+            ))}
+          </select>
+        </div>
       </div>
 
-      {/* 兑换输入区：宽屏四列横排，窄屏（<md）堆叠为两行 */}
-      {dex && chainTokens.length >= 2 && (
-        <div className="mb-3 grid grid-cols-1 items-start gap-2 md:grid-cols-[auto_auto_auto_auto] md:items-start md:gap-x-1">
-          {/* 输入侧（含余额，固定宽度防跳动） */}
-          <label className="text-xs">
-            <div className="mb-1 text-ink-soft">卖出</div>
-            <div className="flex items-center gap-1">
-              <input
-                className="input w-[130px]"
-                value={amountIn}
-                onChange={(e) => { setEditingSide("in"); setAmountIn(e.target.value); }}
-                placeholder="0.0"
-              />
-              <select className="input w-[110px]" value={inSym} onChange={(e) => { setInSym(e.target.value); setQuote(null); setBalances(null); }}>
-                {chainTokens.map((t) => <option key={t.token_symbol} value={t.token_symbol}>{t.token_symbol}</option>)}
-              </select>
-            </div>
-            <div className="mt-0.5 h-[16px] text-[11px] text-ink-soft">
-              {balances && tokenInMeta && (balances.in !== "0"
-                ? `余额：${fmtBalance(balances.in, balances.decIn)}`
-                : "余额：…")}
-            </div>
-          </label>
-
-          {/* 交换按钮：与输入行垂直居中（label 标题 20px + 输入框 38px 的一半） */}
-          <div className="pt-[26px] md:pt-[26px]">
-            <button
-              className="rounded border border-white/10 bg-white/[0.04] px-1.5 py-1.5 text-xs hover:bg-white/[0.08]"
-              title="交换方向"
-              onClick={swapSides}
-            >⇄</button>
-          </div>
-
-          {/* 输出侧 */}
-          <label className="text-xs">
-            <div className="mb-1 text-ink-soft">得到（自动算）</div>
-            <div className="flex items-center gap-1">
-              <input
-                className="input w-[130px]"
-                value={amountOut}
-                onChange={(e) => { setEditingSide("out"); setAmountOut(e.target.value); }}
-                placeholder="0.0"
-              />
-              <select className="input w-[110px]" value={outSym} onChange={(e) => { setOutSym(e.target.value); setQuote(null); setBalances(null); }}>
-                {chainTokens.map((t) => <option key={t.token_symbol} value={t.token_symbol}>{t.token_symbol}</option>)}
-              </select>
-            </div>
-            <div className="mt-0.5 h-[16px] text-[11px] text-ink-soft">
-              {balances && tokenOutMeta && (balances.out !== "0"
-                ? `余额：${fmtBalance(balances.out, balances.decOut)}`
-                : "余额：…")}
-            </div>
-          </label>
-
-          {/* 滑点 + 兑换按钮（紧跟输出侧，左侧留间距） */}
-          <div className="flex items-end gap-2 md:pl-2">
-            <label className="text-xs">
-              <div className="mb-1 text-ink-soft">滑点</div>
-              <select className="input w-[92px]" value={slippage} onChange={(e) => setSlippage(Number(e.target.value))}>
-                <option value={0.1}>0.1%</option>
-                <option value={0.5}>0.5%</option>
-                <option value={1}>1%</option>
-                <option value={3}>3%</option>
-              </select>
-            </label>
-            <button
-              className="btn-primary h-[38px] px-5"
-              disabled={swapping || quoting || !quote}
-              onClick={executeSwap}
-            >
-              {swapping ? "执行中…" : quoting ? "报价中…" : "兑换"}
-            </button>
-          </div>
+      {/* 正向卖出数量 / 反向目标买入数量 + 滑点 + 询价按钮 */}
+      <div className="grid grid-cols-1 gap-2 sm:grid-cols-12 items-end">
+        <div className="sm:col-span-5">
+          <span className="label flex items-center justify-between">
+            <span>
+              卖出数量{" "}
+              {inputMode === "out" && (
+                <span className="text-brand-light">(反算)</span>
+              )}
+            </span>
+            {inBalanceNum !== null && (
+              <span className="font-mono text-[10px] text-ink-soft">
+                余额: {inBalanceNum.toFixed(4)}
+              </span>
+            )}
+          </span>
+          <input
+            className={`input font-mono ${
+              inputMode === "in" ? "border-brand/50" : "opacity-80"
+            }`}
+            value={amountIn}
+            onFocus={() => setInputMode("in")}
+            onChange={(e) => {
+              setInputMode("in");
+              setAmountIn(e.target.value);
+              setTargetOut("");
+            }}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") doQuote();
+            }}
+            placeholder="输入卖出数量"
+          />
         </div>
-      )}
 
-      {/* fee 档位切换 */}
-      {quote && quote.availableFees.length > 1 && (
-        <div className="mb-3 flex flex-wrap items-center gap-1.5 text-xs">
-          <span className="text-ink-soft">费率档：</span>
-          {quote.availableFees.map((f) => (
+        <div className="sm:col-span-4">
+          <span className="label flex items-center justify-between">
+            <span>
+              目标买入{" "}
+              {inputMode === "out" && (
+                <span className="text-brand-light">(优先)</span>
+              )}
+            </span>
+            {outBalanceNum !== null && (
+              <span className="font-mono text-[10px] text-ink-soft">
+                余额: {outBalanceNum.toFixed(4)}
+              </span>
+            )}
+          </span>
+          <input
+            className={`input font-mono ${
+              inputMode === "out" ? "border-brand/50" : "opacity-80"
+            }`}
+            value={targetOut}
+            onFocus={() => setInputMode("out")}
+            onChange={(e) => {
+              setInputMode("out");
+              setTargetOut(e.target.value);
+            }}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") doQuote();
+            }}
+            placeholder="可选：想得多少"
+          />
+        </div>
+
+        <div className="sm:col-span-3 flex gap-1.5">
+          <div className="w-16 shrink-0">
+            <span className="label">滑点%</span>
+            <input
+              className="input font-mono px-2 text-center"
+              value={slippagePct}
+              onChange={(e) => setSlippagePct(e.target.value)}
+            />
+          </div>
+          <button
+            type="button"
+            className="btn-primary flex-1 h-[34px] self-end text-xs"
+            disabled={loading || !chainId || !tokenIn || !tokenOut}
+            onClick={() => doQuote()}
+          >
+            {loading ? "询价…" : "报价"}
+          </button>
+        </div>
+      </div>
+
+      {/* 快捷余额百分比按钮 */}
+      {inBalanceNum !== null && inBalanceNum > 0 && (
+        <div className="flex items-center gap-1.5 text-[11px]">
+          <span className="text-ink-muted">快捷卖出:</span>
+          {[25, 50, 75, 100].map((pct) => (
             <button
-              key={f.fee}
-              className={`rounded px-1.5 py-0.5 ${f.fee === quote.fee ? "bg-brand-cyan/20 text-brand-cyan border border-brand-cyan/40" : "border border-white/10 bg-white/[0.04] text-slate-300 hover:bg-white/[0.08]"}`}
-              onClick={() => { setFeeOverride(f.fee); }}
+              key={pct}
+              type="button"
+              onClick={() => {
+                const v =
+                  pct === 100
+                    ? inBalanceNum * (quote?.tokenIn.isNative ? 0.98 : 0.9999)
+                    : (inBalanceNum * pct) / 100;
+                const str = Number(v.toFixed(6)).toString();
+                setInputMode("in");
+                setAmountIn(str);
+                setTargetOut("");
+                doQuote({ overrideAmountIn: str });
+              }}
+              className="rounded border border-white/[0.08] bg-white/[0.03] px-1.5 py-0.5 font-mono text-[10px] text-ink-soft hover:border-brand/40 hover:text-brand-light"
             >
-              {f.fee / 10000}%（流动性 {abbrev(f.liquidity)}）
+              {pct === 100 ? "MAX" : `${pct}%`}
             </button>
           ))}
         </div>
       )}
 
-      {quoting && <p className="text-sm text-ink-soft">报价中…（自动找池子 + Quoter 调用）</p>}
-      {err && <p className="text-sm text-warn">{err}</p>}
-      {txHash && (
-        <p className="text-sm text-ok">
-          ✅ 兑换交易已提交：<span className="font-mono">{short(txHash)}</span>
-        </p>
+      {err && (
+        <div className="rounded-lg border border-danger/30 bg-danger/10 px-3 py-2 text-xs text-danger">
+          ❌ {err}
+        </div>
       )}
 
-      {/* 报价结果 */}
-      {quote && !quoting && (
-        <div className="rounded border border-slate-200 bg-slate-50 p-3 text-sm">
-          <div className="flex items-center justify-between py-1">
-            <span className="text-ink-soft">预计获得</span>
-            <span className="font-semibold">{quote.amountOutHuman} {quote.tokenOut.symbol}</span>
-          </div>
-          <div className="flex items-center justify-between border-t border-slate-200 py-1">
-            <span className="text-ink-soft">滑点 {quote.slippagePct}% 后最少</span>
-            <span>{quote.amountOutMinHuman} {quote.tokenOut.symbol}</span>
-          </div>
-          <div className="flex items-center justify-between border-t border-slate-200 py-1">
-            <span className="text-ink-soft">成交价</span>
-            {quote.cexCompare ? (
-              <span>1 {quote.cexCompare.otherSymbol} ≈ {fmtNum(quote.cexCompare.displayPrice)} {quote.cexCompare.stableSymbol}</span>
-            ) : (
-              <span>1 {quote.tokenIn.symbol} ≈ {fmtNum(quote.executionPrice ?? 0)} {quote.tokenOut.symbol}</span>
-            )}
-          </div>
-          {quote.priceImpactPct !== null && quote.priceImpactPct !== undefined && (
-            <div className="flex items-center justify-between border-t border-slate-200 py-1">
-              <span className="text-ink-soft">价格影响</span>
-              <span className={quote.priceImpactPct > 3 ? "text-warn font-semibold" : ""}>
-                {quote.priceImpactPct.toFixed(2)}%{quote.priceImpactPct > 3 && "（过高）"}
-              </span>
+      {/* 报价详情卡片 */}
+      {quote && (
+        <div className="rounded-xl border border-white/[0.08] bg-surface-raised/70 p-3 space-y-2.5 text-xs">
+          {/* 费率档位切换 */}
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex flex-wrap items-center gap-1">
+              <span className="text-ink-muted">{quote.dexName}:</span>
+              {quote.availableFees.map((f) => {
+                const active = f.fee === quote.fee;
+                return (
+                  <button
+                    key={f.fee}
+                    type="button"
+                    onClick={() => {
+                      setFeeOverride(f.fee);
+                      doQuote({ overrideFee: f.fee });
+                    }}
+                    className={`rounded px-1.5 py-0.5 font-mono text-[10px] transition ${
+                      active
+                        ? "bg-brand/20 text-brand-light border border-brand/40 font-semibold"
+                        : "bg-white/[0.04] text-ink-soft hover:text-ink"
+                    }`}
+                  >
+                    {(f.fee / 10000).toFixed(2)}%
+                  </button>
+                );
+              })}
             </div>
-          )}
-          {quote.cexCompare && (
-            <div className="flex items-center justify-between border-t border-slate-200 py-1">
-              <span className="text-ink-soft" title="稳定币走 CEX 报价口径对比：DEX 成交价 vs CEX 价">
-                CEX 对比（{quote.cexCompare.otherSymbol}→{quote.cexCompare.stableSymbol}）
-              </span>
-              <span className={Math.abs(quote.cexCompare.diffPct) > 1 ? "text-warn font-semibold" : ""}>
-                CEX {quote.cexCompare.cexPrice.toPrecision(6)} · DEX {quote.cexCompare.executionPriceInStable.toPrecision(6)}{" "}
-                <span className={quote.cexCompare.diffPct >= 0 ? "text-ok" : "text-warn"}>
-                  {quote.cexCompare.diffPct >= 0 ? "+" : ""}{quote.cexCompare.diffPct.toFixed(2)}%
-                </span>
-              </span>
-            </div>
-          )}
-          <div className="flex items-center justify-between border-t border-slate-200 py-1">
-            <span className="text-ink-soft">池子</span>
-            <span className="font-mono text-xs">
-              {short(quote.pool)} · fee {quote.fee / 10000}% · {quote.dexName}
-              {quote.tokenIn.isNative && ` · ${quote.tokenIn.symbol}(native→wrapped)`}
+            <span className="font-mono text-[11px] text-ink-muted">
+              池 {short(quote.pool)}
             </span>
           </div>
-          {!quote.router && (
-            <p className="mt-1 text-xs text-warn">⚠️ 该 DEX 未配置 SwapRouter 地址，只能报价不能执行兑换</p>
+
+          {/* 兑换主数字 */}
+          <div className="rounded-lg border border-ok/30 bg-ok/[0.07] px-3 py-2 space-y-1">
+            <div className="font-mono text-sm font-bold text-ink">
+              {fmtFull(Number(quote.amountInHuman))} {quote.tokenIn.symbol} →{" "}
+              <span className="text-ok">
+                {fmtFull(Number(quote.amountOutHuman))} {quote.tokenOut.symbol}
+              </span>
+            </div>
+            <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] text-ink-soft font-mono">
+              <span>
+                最低可得: {fmtFull(Number(quote.amountOutMinHuman))}{" "}
+                {quote.tokenOut.symbol}
+              </span>
+              {quote.priceImpactPct !== null && (
+                <span
+                  className={
+                    quote.priceImpactPct > 1
+                      ? "text-danger font-semibold"
+                      : "text-ink-soft"
+                  }
+                >
+                  价格冲击: {quote.priceImpactPct.toFixed(3)}%
+                </span>
+              )}
+            </div>
+          </div>
+
+          {/* 成交价 & CEX 对比 */}
+          <div className="space-y-1 text-[11px]">
+            <div className="font-mono text-ink-soft">
+              成交汇率:{" "}
+              {quote.cexCompare ? (
+                <strong className="text-ink">
+                  1 {quote.cexCompare.otherSymbol} ={" "}
+                  {fmtFull(quote.cexCompare.displayPrice)}{" "}
+                  {quote.cexCompare.stableSymbol}
+                </strong>
+              ) : (
+                <strong className="text-ink">
+                  1 {quote.tokenIn.symbol} = {fmtFull(quote.executionPrice)}{" "}
+                  {quote.tokenOut.symbol}
+                </strong>
+              )}
+            </div>
+
+            {quote.cexCompare && (
+              <div
+                className={`rounded-lg border px-2.5 py-1.5 flex flex-wrap items-center justify-between gap-1 ${
+                  Math.abs(quote.cexCompare.diffPct) > 1
+                    ? "border-warn/40 bg-warn/10 text-warn"
+                    : "border-brand/30 bg-brand/10 text-brand-light"
+                }`}
+              >
+                <span>
+                  📊 币安 ({quote.cexCompare.cexSymbolLabel}):{" "}
+                  <strong className="font-mono">
+                    1 {quote.cexCompare.otherSymbol} ={" "}
+                    {fmtFull(quote.cexCompare.cexPrice)}{" "}
+                    {quote.cexCompare.stableSymbol}
+                  </strong>
+                </span>
+                <span className="font-mono font-semibold">
+                  偏差 {quote.cexCompare.diffPct >= 0 ? "+" : ""}
+                  {quote.cexCompare.diffPct.toFixed(2)}%
+                </span>
+              </div>
+            )}
+          </div>
+
+          {/* 立即兑换按钮 */}
+          {quote.router ? (
+            <button
+              type="button"
+              className="btn-primary w-full py-2 text-xs font-semibold"
+              onClick={executeSwap}
+              disabled={swapping}
+            >
+              {swapping
+                ? swapStep || "处理中…"
+                : `🚀 立即兑换 (${quote.tokenIn.symbol} → ${quote.tokenOut.symbol})`}
+            </button>
+          ) : (
+            <div className="text-[11px] text-warn">
+              ⚠️ 请先在「系统配置 → DEX」填写 SwapRouter02 或 SwapRouter 地址以启用直接兑换。
+            </div>
+          )}
+
+          {txHash && (
+            <div className="text-[11px] font-mono text-ok">
+              ✅ 交易已上链: {short(txHash)}
+            </div>
           )}
         </div>
       )}
-    </section>
+    </div>
   );
-}
-
-function trimNum(s: string): string {
-  if (s.includes(".")) return s.replace(/0+$/, "").replace(/\.$/, "");
-  return s;
-}
-
-function abbrev(v?: string): string {
-  if (!v) return "0";
-  try {
-    const n = BigInt(v);
-    if (n === 0n) return "0";
-    const s = n.toString();
-    const units: [number, string][] = [[18, "P"], [15, "P"], [12, "T"], [9, "B"], [6, "M"], [3, "K"]];
-    for (const [exp, suffix] of units) {
-      if (s.length > exp) {
-        const intPart = s.slice(0, s.length - exp);
-        const frac = s.slice(s.length - exp, s.length - exp + 1).replace(/0+$/, "");
-        return `${intPart}${frac ? "." + frac : ""}${suffix}`;
-      }
-    }
-    return s;
-  } catch { return v; }
-}
-
-function fmtNum(n: number): string {
-  if (!Number.isFinite(n)) return "—";
-  if (n === 0) return "0";
-  if (n >= 1) return n.toLocaleString(undefined, { maximumFractionDigits: 6 });
-  // 极小值：展开小数（最多 12 位有效），避免 1.13e-11 这类显示
-  const s = n.toFixed(18).replace(/0+$/, "").replace(/\.$/, "");
-  return s;
-}
-
-/** raw 余额 → 可读（截断到 6 位有效小数） */
-function fmtBalance(raw: string, decimals?: number): string {
-  try {
-    const n = BigInt(raw);
-    const d = BigInt(decimals ?? 18);
-    const base = 10n ** d;
-    const intPart = n / base;
-    const frac = (n % base).toString().padStart(Number(d), "0").slice(0, 6).replace(/0+$/, "");
-    return frac ? `${intPart}.${frac}` : `${intPart}`;
-  } catch { return "0"; }
 }

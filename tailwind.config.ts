@@ -7,27 +7,28 @@ const config: Config = {
   theme: {
     extend: {
       colors: {
-        // 涨跌/状态色（暗色下提高亮度保证可读）
-        ok: { DEFAULT: "#4ade80", soft: "rgba(74, 222, 128, 0.12)" },
-        warn: { DEFAULT: "#f87171", soft: "rgba(248, 113, 113, 0.12)" },
+        // 状态与行情语义色（高对比度金融终端标准）
+        ok: { DEFAULT: "#10b981", soft: "rgba(16, 185, 129, 0.14)" },
+        warn: { DEFAULT: "#f43f5e", soft: "rgba(244, 63, 94, 0.14)" },
+        amber: { DEFAULT: "#f59e0b", soft: "rgba(245, 158, 11, 0.14)" },
         ink: { DEFAULT: "#f1f5f9", soft: "#94a3b8" },
-        // 深底（body/卡片基色）
-        "ink-deep": "#020617",
-        // 品牌强调色（青→紫渐变的两端，也可单独使用）
+        "ink-deep": "#060911",
+        "surface-1": "#0c121e",
+        "surface-2": "#111927",
+        "surface-3": "#172234",
+        // 品牌与交互主色（剔除陈旧紫色，改用清脆青蓝与翡翠绿）
+        primary: { DEFAULT: "#06b6d4", soft: "rgba(6, 182, 212, 0.14)" },
         "brand-cyan": "#22d3ee",
-        "brand-violet": "#a78bfa",
+        "brand-violet": "#38bdf8",
 
-        // ===== 亮色时代遗留色的暗色映射 =====
-        // 业务代码里大量 bg-white / bg-slate-50 / border-slate-200 等
-        // 硬编码，暗色主题下通过重定义这些色值原地变暗，业务零改动。
-        // 注意：slate 全系重定义只影响本项目（未用 slate 的预设其他档位照常）。
+        // 兼容旧类名的深色映射
         slate: {
-          50: "rgba(255, 255, 255, 0.04)",    // 曾是浅底 → 变半透明行底
-          100: "rgba(255, 255, 255, 0.06)",   // 曾是浅灰底 → 半透明
-          200: "rgba(255, 255, 255, 0.10)",   // 曾是边框 → 暗描边
-          300: "rgba(255, 255, 255, 0.16)",   // 曾是深边框/按钮底 → 亮一点的描边
+          50: "rgba(255, 255, 255, 0.03)",
+          100: "rgba(255, 255, 255, 0.05)",
+          200: "rgba(255, 255, 255, 0.09)",
+          300: "rgba(255, 255, 255, 0.15)",
           400: "#94a3b8",
-          500: "#94a3b8",
+          500: "#64748b",
           600: "#cbd5e1",
           700: "#e2e8f0",
           800: "#f1f5f9",
@@ -35,9 +36,8 @@ const config: Config = {
           950: "#ffffff",
         },
       },
-      // 数字等宽字体栈（余额/价格读数用）
       fontFamily: {
-        num: ["ui-monospace", "SFMono-Regular", "Menlo", "monospace"],
+        num: ["ui-monospace", "SFMono-Regular", "JetBrains Mono", "Menlo", "monospace"],
       },
     },
   },

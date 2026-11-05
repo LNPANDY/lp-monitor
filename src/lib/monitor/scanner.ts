@@ -6,7 +6,7 @@
  *  4. 与上次状态对比 → 状态翻转才告警；同状态用 cooldown 去重
  *  5. 写回 positions / alerts
  */
-import { getDb } from "../db";
+import { getDb, isPairFlipped } from "../db";
 import { getClient, listChains } from "../chains";
 import type { PublicClient } from "viem";
 import { resolveTokens } from "../chains/tokens";
@@ -247,14 +247,8 @@ async function processPosition(ctx: ScanCtx, dp: DiscoveredPosition): Promise<Sc
       r.fee, sym0, sym1, dec0, dec1
     );
 
-    // upsert 仓位最新状态（pair_flip 从 prev 保留；prev 为 null 时从 pair_flips 表恢复历史翻转）
-    let prevPairFlip = prev?.pair_flip ?? 0;
-    if (prevPairFlip === 0) {
-      const savedFlip = db.prepare(
-        "SELECT id FROM pair_flips WHERE chain_id_ref=? AND dex_name=? AND token0=? AND token1=?"
-      ).get(w.chain_id_ref, dex.name, r.token0.toLowerCase(), r.token1.toLowerCase());
-      if (savedFlip) prevPairFlip = 1;
-    }
+    // upsert 仓位最新状态（pair_flip 从 prev 或全局 pair_flips 恢复）
+    const prevPairFlip = (prev?.pair_flip === 1 || isPairFlipped(w.chain_id_ref, r.token0, r.token1)) ? 1 : 0;
     db.prepare(
       `INSERT INTO positions
         (wallet_id, chain_id_ref, dex_id, dex_name, token_id, token0, token1, token0_symbol, token1_symbol, fee, pool,

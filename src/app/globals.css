@@ -2,13 +2,7 @@
 @tailwind components;
 @tailwind utilities;
 
-/* ============ 暗色 DeFi 设计系统 ============
- * 风格参考：Uniswap / Aave 等专业 DeFi 界面
- * - 深蓝黑底 + 半透明卡片 + 细描边
- * - 青/紫渐变强调色（品牌感）
- * - 数字等宽（tabular-nums）便于对齐读数
- * - 涨跌色统一（ok=涨绿 / warn=跌红）
- * ========================================== */
+/* ============ Pro DeFi Terminal Design System ============ */
 
 :root {
   color-scheme: dark;
@@ -16,107 +10,149 @@
 
 body {
   color: #e2e8f0;
-  @apply bg-ink-deep antialiased;
-  /* 微妙的径向渐变背景：顶部青色氛围光，避免纯黑的死板 */
+  background-color: #060911;
+  @apply antialiased selection:bg-cyan-500/30 selection:text-cyan-100;
   background-image:
-    radial-gradient(1200px 500px at 50% -10%, rgba(34, 211, 238, 0.07), transparent 60%),
-    radial-gradient(900px 400px at 90% 0%, rgba(168, 85, 247, 0.05), transparent 55%);
+    radial-gradient(1100px 420px at 20% -5%, rgba(6, 182, 212, 0.07), transparent 65%),
+    radial-gradient(900px 380px at 85% -5%, rgba(16, 185, 129, 0.05), transparent 60%);
   background-attachment: fixed;
 }
 
-/* ============ 卡片 ============ */
+/* ============ 卡片系统 ============ */
 .card {
-  @apply rounded-2xl border border-white/[0.06] bg-white/[0.03] shadow-[0_1px_0_0_rgba(255,255,255,0.04)_inset,0_8px_24px_-12px_rgba(0,0,0,0.5)];
-  backdrop-filter: blur(8px);
-  transition: border-color 0.2s ease, background-color 0.2s ease, transform 0.15s ease;
+  @apply rounded-xl border border-white/[0.07] bg-[#0c121e]/90 shadow-[0_1px_0_0_rgba(255,255,255,0.04)_inset,0_10px_30px_-12px_rgba(0,0,0,0.65)];
+  backdrop-filter: blur(10px);
+  transition: border-color 0.18s ease, background-color 0.18s ease, box-shadow 0.18s ease;
 }
-/* 可交互卡片：hover 微升起 + 描边提亮（用 .card-hover 显式开启，避免纯展示卡也动） */
+
 .card-hover:hover {
-  @apply border-white/[0.12] bg-white/[0.05];
-  transform: translateY(-1px);
+  @apply border-cyan-500/25 bg-[#101827]/95;
+  box-shadow: 0 1px 0 0 rgba(255, 255, 255, 0.06) inset, 0 12px 32px -12px rgba(6, 182, 212, 0.12);
 }
 
-/* ============ 按钮 ============ */
+.panel-inset {
+  @apply rounded-lg border border-white/[0.06] bg-[#080d16]/90;
+}
+
+/* ============ 按钮系统 ============ */
 .btn {
-  @apply inline-flex items-center justify-center gap-1 rounded-lg px-3 py-1.5 text-sm font-medium transition select-none;
-  @apply focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-cyan/50 disabled:opacity-50 disabled:pointer-events-none;
-}
-/* 主按钮：品牌渐变（青→紫），替代原纯黑 */
-.btn-primary {
-  @apply btn text-ink-deep font-semibold;
-  background-image: linear-gradient(135deg, #22d3ee 0%, #a78bfa 100%);
-  box-shadow: 0 2px 12px -2px rgba(34, 211, 238, 0.35);
-}
-.btn-primary:hover { filter: brightness(1.1); }
-.btn-primary:active { filter: brightness(0.95); }
-.btn-ghost {
-  @apply btn border border-white/10 bg-white/[0.04];
-  @apply hover:border-white/20 hover:bg-white/[0.08];
-  color: #cbd5e1;
-}
-.btn-ghost:hover { color: #e2e8f0; }
-.btn-danger {
-  @apply btn bg-warn/90 text-white hover:bg-warn;
-  box-shadow: 0 2px 12px -2px rgba(220, 38, 38, 0.35);
+  @apply inline-flex items-center justify-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-medium transition-all select-none;
+  @apply focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400/50 disabled:opacity-45 disabled:pointer-events-none;
 }
 
-/* ============ 输入框 ============ */
-.input {
-  @apply w-full rounded-lg border border-white/10 bg-white/[0.04] px-3 py-2 text-sm text-[#e2e8f0] outline-none;
-  @apply placeholder:text-slate-500 transition;
-  @apply focus:border-brand-cyan/60 focus:ring-2 focus:ring-brand-cyan/20;
+.btn-primary {
+  @apply btn font-semibold text-[#041016];
+  background: linear-gradient(135deg, #22d3ee 0%, #10b981 100%);
+  box-shadow: 0 2px 14px -3px rgba(34, 211, 238, 0.4);
 }
-/* select 的下拉箭头在暗色下用亮色 */
+.btn-primary:hover {
+  filter: brightness(1.08);
+  box-shadow: 0 4px 18px -2px rgba(34, 211, 238, 0.55);
+}
+.btn-primary:active {
+  transform: translateY(0.5px);
+}
+
+.btn-secondary {
+  @apply btn border border-cyan-500/30 bg-cyan-500/10 text-cyan-300 hover:border-cyan-400/50 hover:bg-cyan-500/20 hover:text-cyan-200;
+}
+
+.btn-ghost {
+  @apply btn border border-white/[0.08] bg-white/[0.03] text-slate-300;
+  @apply hover:border-white/[0.18] hover:bg-white/[0.07] hover:text-white;
+}
+
+.btn-danger {
+  @apply btn border border-rose-500/35 bg-rose-500/15 text-rose-300 hover:border-rose-500/60 hover:bg-rose-500/25 hover:text-rose-200;
+}
+
+.btn-xs {
+  @apply px-2 py-1 text-[11px] rounded-md;
+}
+
+/* ============ 输入框系统 ============ */
+.input {
+  @apply w-full rounded-lg border border-white/[0.09] bg-[#070b13]/90 px-2.5 py-1.5 text-xs text-slate-100 outline-none;
+  @apply placeholder:text-slate-500 transition-colors;
+  @apply focus:border-cyan-400/60 focus:bg-[#090f1a] focus:ring-2 focus:ring-cyan-400/15;
+}
+
 select.input {
   background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='%2394a3b8'%3E%3Cpath d='M4.5 6.5L8 10l3.5-3.5' stroke='%2394a3b8' stroke-width='1.5' fill='none' stroke-linecap='round'/%3E%3C/svg%3E");
   background-repeat: no-repeat;
   background-position: right 8px center;
   appearance: none;
-  padding-right: 28px;
+  padding-right: 26px;
 }
-.label { @apply mb-1 block text-xs font-medium text-slate-400; }
 
-/* ============ 标签 ============ */
+.label {
+  @apply mb-1 block text-[11px] font-medium uppercase tracking-wider text-slate-400;
+}
+
+/* ============ 标签与徽章 ============ */
 .tag {
-  @apply inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium;
+  @apply inline-flex items-center gap-1 rounded-md px-2 py-0.5 text-[11px] font-medium leading-tight;
 }
-.tag-ok { @apply tag bg-ok/15 text-ok; }
-.tag-warn { @apply tag bg-warn/15 text-warn; }
-.tag-muted { @apply tag bg-white/[0.06] text-slate-400; }
-.tag-info { @apply tag bg-brand-cyan/15 text-brand-cyan; }
+.tag-ok {
+  @apply tag border border-emerald-500/25 bg-emerald-500/10 text-emerald-300;
+}
+.tag-warn {
+  @apply tag border border-amber-500/30 bg-amber-500/15 text-amber-300;
+}
+.tag-danger {
+  @apply tag border border-rose-500/35 bg-rose-500/15 text-rose-300;
+}
+.tag-amber {
+  @apply tag border border-amber-500/30 bg-amber-500/15 text-amber-300;
+}
+.tag-muted {
+  @apply tag border border-white/[0.06] bg-white/[0.04] text-slate-400;
+}
+.tag-info {
+  @apply tag border border-cyan-500/25 bg-cyan-500/10 text-cyan-300;
+}
 
-/* ============ 数字与表格 ============ */
-/* 金额/价格/地址等读数：等宽数字，避免跳动 */
-.tabular { font-variant-numeric: tabular-nums; }
+/* ============ 等宽数字与排版 ============ */
+.tabular {
+  font-variant-numeric: tabular-nums;
+}
 .num {
-  @apply tabular font-medium;
-  letter-spacing: -0.01em;
+  @apply tabular font-mono font-medium;
+  letter-spacing: -0.015em;
 }
 
-/* ============ 分隔线 / 弱文字 ============ */
-.hr { @apply border-white/[0.06]; }
-.text-ink-soft { @apply text-slate-400; }
+.hr {
+  @apply border-white/[0.06];
+}
+.text-ink-soft {
+  @apply text-slate-400;
+}
 
 /* ============ 顶栏毛玻璃吸附 ============ */
 .glass-header {
-  @apply border-b border-white/[0.06];
-  background: rgba(2, 6, 23, 0.75);
-  backdrop-filter: blur(12px);
+  @apply border-b border-white/[0.07];
+  background: rgba(6, 9, 17, 0.82);
+  backdrop-filter: blur(14px);
 }
 
-/* ============ 滚动条（暗色细条） ============ */
-::-webkit-scrollbar { width: 8px; height: 8px; }
-::-webkit-scrollbar-track { background: transparent; }
+/* ============ 细滚动条 ============ */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
 ::-webkit-scrollbar-thumb {
   @apply rounded-full bg-white/10;
-  border: 2px solid transparent;
-  background-clip: padding-box;
 }
-::-webkit-scrollbar-thumb:hover { @apply bg-white/20; }
+::-webkit-scrollbar-thumb:hover {
+  @apply bg-white/25;
+}
 
-/* ============ 品牌渐变文字（标题点缀用） ============ */
+/* ============ 标题强调色 ============ */
 .text-brand-gradient {
-  background-image: linear-gradient(135deg, #22d3ee 0%, #a78bfa 100%);
+  background-image: linear-gradient(135deg, #22d3ee 0%, #34d399 100%);
   -webkit-background-clip: text;
   background-clip: text;
   color: transparent;

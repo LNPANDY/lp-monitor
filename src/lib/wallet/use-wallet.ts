@@ -98,8 +98,8 @@ if (typeof window !== "undefined") {
   }
 }
 
-/** 触发连接（会弹钱包授权窗）。 */
-async function connect() {
+/** 触发连接（会弹钱包授权窗）。返回连接成功的钱包地址。 */
+async function connect(): Promise<string | null> {
   const p = getInjectedProvider();
   if (!p) {
     const name = detectWalletName();
@@ -108,7 +108,7 @@ async function connect() {
         ? `检测到 ${name} 但无法连接，请检查钱包扩展`
         : "未检测到钱包扩展，请先安装 OKX 钱包或 MetaMask",
     });
-    return;
+    return null;
   }
   provider = p;
   bindProviderEvents(p);
@@ -116,14 +116,17 @@ async function connect() {
   try {
     const accounts = (await p.request({ method: "eth_requestAccounts" })) as string[];
     const chainIdHex = (await p.request({ method: "eth_chainId" })) as string;
+    const addr = accounts?.[0] ?? null;
     setState({
-      address: accounts?.[0] ?? null,
+      address: addr,
       chainId: hexToChainId(chainIdHex),
-      status: accounts?.[0] ? "connected" : "disconnected",
+      status: addr ? "connected" : "disconnected",
       error: "",
     });
+    return addr;
   } catch (e: any) {
     setState({ status: "disconnected", error: e?.message || "连接被拒绝" });
+    return null;
   }
 }
 
@@ -141,7 +144,7 @@ async function switchChain(
   targetChainId: number,
   chainParams?: {
     chainName: string;
-    nativeCurrency: { name: string; symbol: string; decimals: number };
+    nativeCurrency?: { name: string; symbol: string; decimals: number };
     rpcUrls: string[];
     blockExplorerUrls?: string[];
   }
@@ -163,7 +166,11 @@ async function switchChain(
           {
             chainId: chainIdHex,
             chainName: chainParams.chainName,
-            nativeCurrency: chainParams.nativeCurrency,
+            nativeCurrency: chainParams.nativeCurrency ?? {
+              name: "ETH",
+              symbol: "ETH",
+              decimals: 18,
+            },
             rpcUrls: chainParams.rpcUrls,
             blockExplorerUrls: chainParams.blockExplorerUrls ?? [],
           },
@@ -177,54 +184,157 @@ async function switchChain(
 }
 
 /**
-   * 发送交易（用户在钱包确认）。返回 txHash。
-   * @param to   目标合约地址
-   * @param data 已编码的 calldata（0x...）
-   * @param value 原生代币金额（wei，可选）
-   */
-  async function sendTx(opts: {
-    to: string;
-    data: string;
-    value?: bigint;
-  }): Promise<string> {
-    if (!provider || !state.address) throw new Error("钱包未连接");
-    
-    // 获取当前链ID并检查是否匹配目标链
-    const currentChainIdHex = (await provider.request({ method: "eth_chainId" })) as string;
-    const currentChainId = parseInt(currentChainIdHex, 16);
-    
-    console.log("Sending transaction:", {
-      to: opts.to,
-      from: state.address,
-      currentChainId,
-      value: opts.value
-    });
-    
-    const from = state.address;
-    const params: any = {
-      from,
-      to: opts.to,
-      data: opts.data,
-    };
-    if (opts.value && opts.value > 0n) {
-      params.value = "0x" + opts.value.toString(16);
+ * 发送交易（用户在钱包确认）。返回 txHash。
+ * @param to   目标合约地址
+ * @param data 已编码的 calldata（0x...）
+ * @param value 原生代币金额（wei，可选）
+ * @param gas   可选预设 gas limit，加速非 multicall 连续交易的钱包弹窗响应
+ */
+async function sendTx(opts: {
+  to: string;
+  data: string;
+  value?: bigint;
+  gas?: bigint;
+}): Promise<string> {
+  if (!provider || !state.address) throw new Error("钱包未连接");
+
+  const from = state.address;
+  const params: any = {
+    from,
+    to: opts.to,
+    data: opts.data,
+  };
+  if (opts.value && opts.value > 0n) {
+    params.value = "0x" + opts.value.toString(16);
+  }
+  if (opts.gas && opts.gas > 0n) {
+    params.gas = "0x" + opts.gas.toString(16);
+  }
+
+  try {
+    const txHash = (await provider.request({
+      method: "eth_sendTransaction",
+      params: [params],
+    })) as string;
+    return txHash;
+  } catch (error: any) {
+    if (error.code === 4001) {
+      throw new Error("用户拒绝了交易");
     }
-    
+    throw error;
+  }
+}
+
+/**
+ * 极速轮询交易回执（350ms 间隔），一旦上链确认立即返回 receipt，避免死等固定延迟。
+ */
+export async function waitForTxReceipt(txHash: string, timeoutMs = 45000): Promise<any | null> {
+  const p = provider || getInjectedProvider();
+  if (!p || !txHash) return null;
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
     try {
-      const txHash = (await provider.request({
-        method: "eth_sendTransaction",
-        params: [params],
-      })) as string;
-      console.log("Transaction sent:", txHash);
-      return txHash;
-    } catch (error: any) {
-      console.error("Transaction failed:", error);
-      if (error.code === 4001) {
-        throw new Error("用户拒绝了交易");
+      const receipt = await p.request({
+        method: "eth_getTransactionReceipt",
+        params: [txHash],
+      });
+      if (receipt) {
+        if ((receipt as any).status === "0x0") {
+          throw new Error(`交易执行失败 (reverted): ${txHash.slice(0, 12)}…`);
+        }
+        return receipt;
       }
-      throw error;
+    } catch (e: any) {
+      if (e?.message?.includes("reverted")) throw e;
+    }
+    await new Promise((r) => setTimeout(r, 350));
+  }
+  return null;
+}
+
+const TRANSFER_TOPIC =
+  "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+
+/**
+ * 等待 Mint 交易回执并从 ERC721 Transfer(0x0, recipient, tokenId) 日志中提取新鑄造的 NFT tokenId。
+ */
+export async function extractMintedTokenIdFromReceipt(
+  txHash: string,
+  recipientAddr: string,
+  npmAddr: string,
+  timeoutMs = 45000
+): Promise<bigint | null> {
+  const receipt = await waitForTxReceipt(txHash, timeoutMs);
+  if (!receipt || !Array.isArray(receipt.logs)) return null;
+  const npmLower = npmAddr.toLowerCase();
+  const recLower = recipientAddr.toLowerCase().replace(/^0x/, "");
+  for (const log of receipt.logs) {
+    if ((log.address || "").toLowerCase() !== npmLower) continue;
+    const topics: string[] = log.topics || [];
+    if (
+      topics.length >= 4 &&
+      topics[0]?.toLowerCase() === TRANSFER_TOPIC &&
+      topics[2]?.toLowerCase().endsWith(recLower)
+    ) {
+      try {
+        return BigInt(topics[3]);
+      } catch {}
     }
   }
+  return null;
+}
+
+/**
+ * 质押前强校验 NFT 的 (token0, token1, fee) 是否与当前目标池子严格一致，
+ * 彻底杜绝将 A/B 交易对的 NFT 误存入 C/D 质押合约的风险。
+ */
+export async function verifyNftPoolMatch(
+  npm: string,
+  tokenId: bigint,
+  expectedToken0: string,
+  expectedToken1: string,
+  expectedFee: number
+): Promise<{ valid: boolean; reason?: string }> {
+  const p = provider || getInjectedProvider();
+  if (!p) return { valid: true };
+  try {
+    // positions(uint256) selector: 0x99fbab88
+    const data = "0x99fbab88" + tokenId.toString(16).padStart(64, "0");
+    const raw = (await p.request({
+      method: "eth_call",
+      params: [{ to: npm, data }, "latest"],
+    })) as string;
+    if (!raw || raw.length < 2 + 64 * 5) {
+      return { valid: true };
+    }
+    const clean = raw.replace(/^0x/, "");
+    // word 0: nonce, word 1: operator, word 2: token0, word 3: token1, word 4: fee
+    const word2 = clean.slice(64 * 2, 64 * 3);
+    const word3 = clean.slice(64 * 3, 64 * 4);
+    const word4 = clean.slice(64 * 4, 64 * 5);
+    const actualToken0 = ("0x" + word2.slice(24)).toLowerCase();
+    const actualToken1 = ("0x" + word3.slice(24)).toLowerCase();
+    const actualFee = parseInt(word4, 16);
+
+    const exp0 = expectedToken0.toLowerCase();
+    const exp1 = expectedToken1.toLowerCase();
+    if (actualToken0 !== exp0 || actualToken1 !== exp1) {
+      return {
+        valid: false,
+        reason: `安全拦截：NFT #${tokenId} 的代币对 (${actualToken0.slice(0, 6)}…/${actualToken1.slice(0, 6)}…) 与目标质押池不匹配！`,
+      };
+    }
+    if (expectedFee > 0 && actualFee !== expectedFee) {
+      return {
+        valid: false,
+        reason: `安全拦截：NFT #${tokenId} 的费率档位 (${actualFee}) 与目标质押池 (${expectedFee}) 不匹配！`,
+      };
+    }
+    return { valid: true };
+  } catch {
+    return { valid: true };
+  }
+}
 
 /** 导出 Hook：组件用此订阅钱包状态。 */
 export function useWallet() {

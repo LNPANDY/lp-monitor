@@ -1,124 +1,183 @@
 "use client";
 import { useState } from "react";
-import { authHeaders } from "./util";
+import { authHeaders, fmtFull } from "./util";
 
 /**
- * 仓位流动性分析结果（场景A 直持 / 场景B 质押），与后端 LiquidityResult 对齐。
+ * 仓位卡片上的「区间深度分析」折叠面板：
+ * 完全遵循 pairFlip（翻转）状态展示主币/计价币顺序与区间价格。
  */
-interface LiquidityResult {
-  total: { amount0: string; amount1: string };
-  mine: { amount0: string; amount1: string };
-  share: number;
-  priceLow: string;
-  priceHigh: string;
-  priceLabel: string;
-  currentTick: number;
-  tickLower: number;
-  tickUpper: number;
-  token0Symbol: string;
-  token1Symbol: string;
-  positionCount: number;
-  sampledAt: string;
-  cached?: boolean;
-}
-
-interface Props {
+export function LiquidityButton({
+  positionId,
+  pairFlip = 0,
+}: {
   positionId: number;
-  /** 该仓位参与统计的 LP 数量（来自 last_liquidity 是否存在），仅用于按钮文案提示 */
-  staking?: boolean;
-}
-
-/**
- * 嵌入仓位卡片的「流动性分析」按钮。
- *
- * 点击后调用 POST /api/positions/[id]/liquidity（命中 10 分钟快照缓存则秒回），
- * 展开显示该 tick 区间内的总流动性、你自己的占比、价格范围。
- */
-export function LiquidityButton({ positionId, staking }: Props) {
+  pairFlip?: number;
+}) {
   const [open, setOpen] = useState(false);
   const [loading, setLoading] = useState(false);
-  const [result, setResult] = useState<LiquidityResult | null>(null);
-  const [error, setError] = useState("");
+  const [err, setErr] = useState("");
+  const [result, setResult] = useState<any | null>(null);
 
-  async function toggle() {
-    if (open) {
-      setOpen(false);
-      return;
-    }
-    setOpen(true);
-    if (result) return; // 已有数据，仅展开
-    await load(false);
-  }
-
-  async function load(force: boolean) {
+  async function query(refresh = false) {
     setLoading(true);
-    setError("");
+    setErr("");
     try {
-      const r = await fetch(`/api/positions/${positionId}/liquidity${force ? "?force=1" : ""}`, {
-        method: "POST",
-        headers: authHeaders(),
-      });
+      const r = await fetch(
+        `/api/positions/${positionId}/liquidity${refresh ? "?force=1" : ""}`,
+        {
+          method: "POST",
+          headers: authHeaders(),
+        }
+      );
       const j = await r.json();
-      if (!j.ok) throw new Error(j.error || "分析失败");
-      setResult(j.data as LiquidityResult);
+      if (!j.ok) throw new Error(j.error || "查询失败");
+      setResult(j.data);
+      setOpen(true);
     } catch (e: any) {
-      setError(e.message);
+      setErr(e.message);
+      setOpen(true);
     } finally {
       setLoading(false);
     }
   }
 
+  function fmtAmt(s: string) {
+    const n = Number(s);
+    if (!Number.isFinite(n)) return s;
+    if (n === 0) return "0";
+    if (n >= 1000) return n.toLocaleString("en-US", { maximumFractionDigits: 2 });
+    if (n >= 1) return n.toLocaleString("en-US", { maximumFractionDigits: 4 });
+    return n.toPrecision(4);
+  }
+
+  const isFlipped = (result?.pairFlip ?? pairFlip) === 1;
+
+  // 按翻转状态决定先展示哪个代币，以及区间价格如何翻转
+  const primarySym = result
+    ? isFlipped
+      ? result.token1Symbol
+      : result.token0Symbol
+    : "";
+  const secondarySym = result
+    ? isFlipped
+      ? result.token0Symbol
+      : result.token1Symbol
+    : "";
+  const rangePrimaryAmt = result?.total
+    ? isFlipped
+      ? result.total.amount1
+      : result.total.amount0
+    : "0";
+  const rangeSecondaryAmt = result?.total
+    ? isFlipped
+      ? result.total.amount0
+      : result.total.amount1
+    : "0";
+  const myPrimaryAmt = result?.mine
+    ? isFlipped
+      ? result.mine.amount1
+      : result.mine.amount0
+    : "0";
+  const mySecondaryAmt = result?.mine
+    ? isFlipped
+      ? result.mine.amount0
+      : result.mine.amount1
+    : "0";
+
+  const rawPriceLow = Number(result?.priceLow ?? 0);
+  const rawPriceHigh = Number(result?.priceHigh ?? 0);
+  const displayPriceLow =
+    isFlipped && rawPriceHigh > 0 ? 1 / rawPriceHigh : rawPriceLow;
+  const displayPriceHigh =
+    isFlipped && rawPriceLow > 0 ? 1 / rawPriceLow : rawPriceHigh;
+
+  const sharePctNum = Number(result?.share ?? 0) * 100;
+
   return (
-    <div className="mt-2 border-t border-slate-200 pt-2">
-      <div className="flex items-center gap-2">
-        <button className="btn-ghost text-xs" onClick={toggle} disabled={loading}>
-          {open ? "▾ 收起流动性" : "▸ 流动性分析"}
-        </button>
-        {result?.cached && <span className="text-[10px] text-ink-soft">缓存</span>}
-      </div>
+    <div className="inline-block">
+      <button
+        type="button"
+        className={`btn-ghost btn-xs ${
+          open ? "border-brand/40 text-brand-light bg-brand/10" : ""
+        }`}
+        disabled={loading}
+        onClick={() => {
+          if (open && result) {
+            setOpen(false);
+          } else {
+            query(false);
+          }
+        }}
+      >
+        {loading ? "读取中…" : open ? "收起深度" : "📊 区间深度"}
+      </button>
 
       {open && (
-        <div className="mt-2 text-xs">
-          {loading && <div className="text-ink-soft">分析中（读取链上数据，可能需数秒）…</div>}
-          {error && <div className="text-warn">{error} <button className="underline" onClick={() => load(true)}>重试</button></div>}
-          {result && !loading && !error && (
-            <div className="space-y-1">
-              <LiRow label={`区间总流动性 (${result.priceLabel})`}>
-                <span className="font-medium">{result.total.amount0} {result.token0Symbol}</span>
-                <span className="text-ink-soft"> + </span>
-                <span className="font-medium">{result.total.amount1} {result.token1Symbol}</span>
-              </LiRow>
-              <LiRow label="我的流动性">
-                <span>{result.mine.amount0} {result.token0Symbol} + {result.mine.amount1} {result.token1Symbol}</span>
-              </LiRow>
-              <LiRow label="我的占比">
-                <span className={result.share > 0 ? "font-semibold text-ok" : "text-ink-soft"}>
-                  {(result.share * 100).toFixed(4)}%
-                </span>
-              </LiRow>
-              <LiRow label="区间内 LP 数">
-                <span>{result.positionCount}</span>
-              </LiRow>
-              <LiRow label="价格区间">
-                <span>{result.priceLow} ~ {result.priceHigh} {result.token1Symbol}/{result.token0Symbol}</span>
-              </LiRow>
-              <div className="flex items-center justify-between pt-1 text-ink-soft">
-                <span>采样 {new Date(result.sampledAt).toLocaleString()}</span>
-                <button className="underline hover:text-ink" onClick={() => load(true)}>强制刷新</button>
+        <div className="mt-2 rounded-lg border border-white/[0.08] bg-surface-raised/90 p-2.5 text-xs space-y-2">
+          {err ? (
+            <div className="text-danger">{err}</div>
+          ) : result ? (
+            <>
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="flex items-center gap-2">
+                  <span className="text-ink-soft">我的区间占比</span>
+                  <span className="font-mono text-sm font-bold text-brand-light">
+                    {sharePctNum.toFixed(2)}%
+                  </span>
+                </div>
+                <div className="flex items-center gap-2 text-[11px] text-ink-muted">
+                  <span>
+                    {result.mode === "staking"
+                      ? `质押池共 ${result.positionCount ?? 0} 个同窗口仓位`
+                      : "全池活跃流动性"}
+                    {result.cached ? " · 缓存" : " · 实时"}
+                  </span>
+                  <button
+                    type="button"
+                    className="text-brand-light underline hover:text-brand"
+                    disabled={loading}
+                    onClick={() => query(true)}
+                  >
+                    刷新
+                  </button>
+                </div>
               </div>
-            </div>
-          )}
+
+              {/* 占比进度条 */}
+              <div className="h-1.5 w-full overflow-hidden rounded-full bg-white/[0.06]">
+                <div
+                  className="h-full rounded-full bg-gradient-to-r from-brand to-ok transition-all"
+                  style={{ width: `${Math.min(100, Math.max(2, sharePctNum))}%` }}
+                />
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 pt-1">
+                <div className="rounded border border-white/[0.05] bg-surface/60 px-2.5 py-1.5">
+                  <div className="text-[11px] text-ink-muted">我的持仓数量</div>
+                  <div className="mt-0.5 font-mono text-ink font-medium">
+                    {fmtAmt(myPrimaryAmt)} {primarySym}{" "}
+                    <span className="text-ink-muted">+</span>{" "}
+                    {fmtAmt(mySecondaryAmt)} {secondarySym}
+                  </div>
+                </div>
+                <div className="rounded border border-white/[0.05] bg-surface/60 px-2.5 py-1.5">
+                  <div className="text-[11px] text-ink-muted">同区间总深度</div>
+                  <div className="mt-0.5 font-mono text-ink-soft">
+                    {fmtAmt(rangePrimaryAmt)} {primarySym}{" "}
+                    <span className="text-ink-muted">+</span>{" "}
+                    {fmtAmt(rangeSecondaryAmt)} {secondarySym}
+                  </div>
+                </div>
+              </div>
+
+              <div className="text-[11px] text-ink-muted font-mono pt-0.5">
+                区间价格: {fmtFull(displayPriceLow)} ~ {fmtFull(displayPriceHigh)}{" "}
+                {secondarySym}/{primarySym}
+              </div>
+            </>
+          ) : null}
         </div>
       )}
-    </div>
-  );
-}
-
-function LiRow({ label, children }: { label: string; children: React.ReactNode }) {
-  return (
-    <div className="flex justify-between gap-2">
-      <span className="text-ink-soft">{label}</span>
-      <span className="text-right break-all">{children}</span>
     </div>
   );
 }

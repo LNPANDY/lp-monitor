@@ -8,7 +8,7 @@
  *
  * 前端拿到后构造 mint / approve / deposit 的 calldata 发交易。
  */
-import { getDb } from "@/lib/db";
+import { getDb, isPairFlipped } from "@/lib/db";
 import { getClient } from "@/lib/chains";
 import { resolveTokens } from "@/lib/chains/tokens";
 import { ok, fail, getBody } from "@/lib/api";
@@ -17,6 +17,7 @@ import {
   tickToSqrtPriceX96,
   computeLiquidityFromAmount,
 } from "@/lib/wallet/build-mint";
+import { sqrtPriceX96ToHumanPrice, tickToPriceDisplay } from "@/lib/v3/math";
 
 export const dynamic = "force-dynamic";
 
@@ -241,47 +242,81 @@ export async function POST(req: Request) {
       }
     }
 
-    // 7. 授权状态（需要钱包地址才查）
+    // 7. 授权状态 + 钱包余额 + NFT 全局授权状态（需要钱包地址才查）
+    const dec0 = m0?.decimals ?? 18;
+    const dec1 = m1?.decimals ?? 18;
+    const pairFlip = isPairFlipped(b.chain_id, token0, token1) ? 1 : 0;
+    const priceCurrent = sqrtPriceX96ToHumanPrice(sqrtPriceX96, dec0, dec1);
+    const priceLow = tickToPriceDisplay(tickLower, dec0, dec1);
+    const priceHigh = tickToPriceDisplay(tickUpper, dec0, dec1);
+
     let approvals: {
       token0: { allowance: string; sufficient: boolean; decimals: number };
       token1: { allowance: string; sufficient: boolean; decimals: number };
+      nftApprovedForAll?: boolean;
     } | null = null;
-    if (b.wallet && /^0x[a-fA-F0-9]{40}$/.test(b.wallet) && matchedDex) {
-      const dec0 = m0?.decimals ?? 18;
-      const dec1 = m1?.decimals ?? 18;
-      const need0 = compute ? BigInt(compute.amount0) : 0n;
-      const need1 = compute ? BigInt(compute.amount1) : 0n;
-      const [a0, a1] = await Promise.all([
-        readAllowance(client, token0, b.wallet, matchedDex.npm),
-        readAllowance(client, token1, b.wallet, matchedDex.npm),
+    let balances: {
+      token0: string;
+      token1: string;
+      token0Human: string;
+      token1Human: string;
+    } | null = null;
+
+    if (b.wallet && /^0x[a-fA-F0-9]{40}$/.test(b.wallet)) {
+      const [bal0, bal1] = await Promise.all([
+        readBalance(client, token0, b.wallet),
+        readBalance(client, token1, b.wallet),
       ]);
-      approvals = {
-        token0: { allowance: a0.toString(), sufficient: a0 >= need0, decimals: dec0 },
-        token1: { allowance: a1.toString(), sufficient: a1 >= need1, decimals: dec1 },
+      balances = {
+        token0: bal0.toString(),
+        token1: bal1.toString(),
+        token0Human: formatRaw(bal0, dec0),
+        token1Human: formatRaw(bal1, dec1),
       };
+
+      if (matchedDex) {
+        const need0 = compute ? BigInt(compute.amount0) : 0n;
+        const need1 = compute ? BigInt(compute.amount1) : 0n;
+        const stakerContract = matchedStaking[0]?.contract;
+        const [a0, a1, nftAll] = await Promise.all([
+          readAllowance(client, token0, b.wallet, matchedDex.npm),
+          readAllowance(client, token1, b.wallet, matchedDex.npm),
+          stakerContract ? readIsApprovedForAll(client, matchedDex.npm, b.wallet, stakerContract) : Promise.resolve(false),
+        ]);
+        approvals = {
+          token0: { allowance: a0.toString(), sufficient: a0 >= need0, decimals: dec0 },
+          token1: { allowance: a1.toString(), sufficient: a1 >= need1, decimals: dec1 },
+          nftApprovedForAll: nftAll,
+        };
+      }
     }
 
     return ok({
       chain: { id: chain.id, name: chain.name, chain_id: chain.chain_id },
+      pairFlip,
       pool: {
         address: b.pool.toLowerCase(),
         token0: token0.toLowerCase(),
         token1: token1.toLowerCase(),
         token0Symbol: m0?.symbol ?? "",
         token1Symbol: m1?.symbol ?? "",
-        token0Decimals: m0?.decimals ?? 18,
-        token1Decimals: m1?.decimals ?? 18,
+        token0Decimals: dec0,
+        token1Decimals: dec1,
         fee: Number(fee),
         tickSpacing: spacing,
         currentTick,
         sqrtPriceX96: sqrtPriceX96.toString(),
+        priceCurrent,
       },
       range: {
         tickLower,
         tickUpper,
+        priceLow,
+        priceHigh,
         isMinimal: tickLower === floorTick(currentTick, spacing) && tickUpper === tickLower + spacing,
       },
       compute,
+      balances,
       /** 自动匹配的质押合约（可能为空 = 该 token 对无质押平台） */
       matchedStaking: matchedStaking.map((s) => ({
         id: s.id,
@@ -319,6 +354,62 @@ function formatRaw(v: bigint, decimals: number): string {
   const intPart = s.slice(0, s.length - decimals);
   const fracPart = s.slice(s.length - decimals).replace(/0+$/, "");
   return fracPart ? `${intPart}.${fracPart}` : intPart;
+}
+
+/** 查询 ERC20 余额 */
+async function readBalance(client: any, token: string, owner: string): Promise<bigint> {
+  try {
+    const abi = [
+      {
+        name: "balanceOf",
+        type: "function",
+        stateMutability: "view",
+        inputs: [{ name: "owner", type: "address" }],
+        outputs: [{ name: "", type: "uint256" }],
+      },
+    ] as const;
+    const v = await client.readContract({
+      address: token as `0x${string}`,
+      abi,
+      functionName: "balanceOf",
+      args: [owner as `0x${string}`],
+    });
+    return v as bigint;
+  } catch {
+    return 0n;
+  }
+}
+
+/** 查询 ERC721 isApprovedForAll */
+async function readIsApprovedForAll(
+  client: any,
+  npm: string,
+  owner: string,
+  operator: string
+): Promise<boolean> {
+  try {
+    const abi = [
+      {
+        name: "isApprovedForAll",
+        type: "function",
+        stateMutability: "view",
+        inputs: [
+          { name: "owner", type: "address" },
+          { name: "operator", type: "address" },
+        ],
+        outputs: [{ name: "", type: "bool" }],
+      },
+    ] as const;
+    const v = await client.readContract({
+      address: npm as `0x${string}`,
+      abi,
+      functionName: "isApprovedForAll",
+      args: [owner as `0x${string}`, operator as `0x${string}`],
+    });
+    return Boolean(v);
+  } catch {
+    return false;
+  }
 }
 
 /** 查询 ERC20 授权额度（失败返回 0n，前端会按"需要授权"处理） */

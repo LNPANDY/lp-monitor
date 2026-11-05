@@ -12,7 +12,13 @@ export function EditableRow({
   actions,
   disabled,
 }: {
-  fields: { key: string; label: string; placeholder?: string; type?: string; options?: Array<{ value: string; label: string }> }[];
+  fields: {
+    key: string;
+    label: string;
+    placeholder?: string;
+    type?: string;
+    options?: Array<{ value: string; label: string }>;
+  }[];
   values: Record<string, any>;
   onSave: (updates: Record<string, any>) => Promise<void>;
   display?: React.ReactNode;
@@ -27,26 +33,31 @@ export function EditableRow({
   function startEdit() {
     const init: Record<string, any> = {};
     for (const f of fields) init[f.key] = values[f.key] ?? "";
-    // 数组字段（如 rpc_urls）转成字符串方便编辑
-    for (const k in init) { if (Array.isArray(init[k])) init[k] = (init[k] as string[]).join(" "); }
+    for (const k in init) {
+      if (Array.isArray(init[k])) init[k] = (init[k] as string[]).join(" ");
+    }
     setForm(init);
     setEditing(true);
     setErr("");
   }
 
   async function handleSave() {
-    setBusy(true); setErr("");
+    setBusy(true);
+    setErr("");
     try {
       await onSave(form);
       setEditing(false);
-    } catch (e: any) { setErr(e.message); }
-    finally { setBusy(false); }
+    } catch (e: any) {
+      setErr(e.message);
+    } finally {
+      setBusy(false);
+    }
   }
 
   if (editing) {
     return (
-      <div className="rounded-md border-2 border-ink/20 p-3">
-        <div className="grid grid-cols-2 gap-2 md:grid-cols-3">
+      <div className="rounded-lg border border-brand/40 bg-surface-raised/90 p-3 space-y-2.5">
+        <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 md:grid-cols-3">
           {fields.map((f) => (
             <label key={f.key} className="block">
               <span className="label">{f.label}</span>
@@ -54,7 +65,9 @@ export function EditableRow({
                 <select
                   className="input"
                   value={form[f.key] ?? ""}
-                  onChange={(e) => setForm({ ...form, [f.key]: e.target.value })}
+                  onChange={(e) =>
+                    setForm({ ...form, [f.key]: e.target.value })
+                  }
                 >
                   <option value="">无关联</option>
                   {f.options?.map((option) => (
@@ -68,26 +81,44 @@ export function EditableRow({
                   className="input"
                   value={form[f.key] ?? ""}
                   placeholder={f.placeholder ?? ""}
-                  onChange={(e) => setForm({ ...form, [f.key]: e.target.value })}
+                  onChange={(e) =>
+                    setForm({ ...form, [f.key]: e.target.value })
+                  }
                 />
               )}
             </label>
           ))}
         </div>
-        {err && <p className="mt-1 text-xs text-warn">{err}</p>}
-        <div className="mt-2 flex gap-2">
-          <button className="btn-primary" onClick={handleSave} disabled={busy}>{busy ? "保存中…" : "保存"}</button>
-          <button className="btn-ghost" onClick={() => setEditing(false)} disabled={busy}>取消</button>
+        {err && <p className="text-xs text-danger">{err}</p>}
+        <div className="flex gap-2">
+          <button
+            className="btn-primary btn-xs"
+            onClick={handleSave}
+            disabled={busy}
+          >
+            {busy ? "保存中…" : "保存"}
+          </button>
+          <button
+            className="btn-ghost btn-xs"
+            onClick={() => setEditing(false)}
+            disabled={busy}
+          >
+            取消
+          </button>
         </div>
       </div>
     );
   }
 
   return (
-    <div className="flex items-center justify-between rounded-md border border-slate-200 px-3 py-2 text-sm">
+    <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-white/[0.08] bg-surface-raised/40 px-3 py-2 text-sm hover:border-white/[0.15] transition">
       <div className="min-w-0 flex-1">{display}</div>
-      <div className="ml-2 flex items-center gap-2">
-        {!disabled && <button className="btn-ghost text-xs" onClick={startEdit}>编辑</button>}
+      <div className="flex items-center gap-2 shrink-0">
+        {!disabled && (
+          <button className="btn-ghost btn-xs" onClick={startEdit}>
+            编辑
+          </button>
+        )}
         {actions}
       </div>
     </div>

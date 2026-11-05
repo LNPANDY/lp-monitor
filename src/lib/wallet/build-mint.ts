@@ -130,8 +130,12 @@ export function buildMintCalldata(npm: string, p: MintParams): { to: string; dat
   return { to: npm, data };
 }
 
-/** 构造 ERC20 approve 的 calldata */
-export function buildApproveCalldata(token: string, spender: string, amount: bigint): { to: string; data: string } {
+/** 构造 ERC20 approve 的 calldata（默认无限授权 MAX_UINT256） */
+export function buildApproveCalldata(
+  token: string,
+  spender: string,
+  amount: bigint = (1n << 256n) - 1n
+): { to: string; data: string } {
   const data = encodeFunctionData({
     abi: ERC20_APPROVE_ABI,
     functionName: "approve",
@@ -150,7 +154,7 @@ export function buildStakeDepositCalldata(stakerContract: string, tokenId: bigin
   return { to: stakerContract, data };
 }
 
-/** ERC721 approve 的 ABI 片段（NFT 授权给质押合约用） */
+/** ERC721 approve / setApprovalForAll 的 ABI 片段（NFT 授权给质押合约用） */
 const ERC721_APPROVE_ABI = [
   {
     name: "approve",
@@ -162,14 +166,38 @@ const ERC721_APPROVE_ABI = [
     ],
     outputs: [],
   },
+  {
+    name: "setApprovalForAll",
+    type: "function",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "operator", type: "address" },
+      { name: "approved", type: "bool" },
+    ],
+    outputs: [],
+  },
 ] as const;
 
-/** 构造 ERC721 approve 的 calldata（把 NFT 授权给质押合约） */
+/** 构造 ERC721 approve 的 calldata（把单个 NFT 授权给质押合约） */
 export function buildNftApproveCalldata(npm: string, to: string, tokenId: bigint): { to: string; data: string } {
   const data = encodeFunctionData({
     abi: ERC721_APPROVE_ABI,
     functionName: "approve",
     args: [to as `0x${string}`, tokenId],
+  });
+  return { to: npm, data };
+}
+
+/** 构造 ERC721 setApprovalForAll 的 calldata（一键开启/撤销对该质押合约的免重复 NFT 授权） */
+export function buildSetApprovalForAllCalldata(
+  npm: string,
+  operator: string,
+  approved: boolean
+): { to: string; data: string } {
+  const data = encodeFunctionData({
+    abi: ERC721_APPROVE_ABI,
+    functionName: "setApprovalForAll",
+    args: [operator as `0x${string}`, approved],
   });
   return { to: npm, data };
 }

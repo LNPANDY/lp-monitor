@@ -21,11 +21,11 @@
  * cex_alert_mutes 根据 chain_key + token0 + token1 恢复静音状态。
  * 默认勾选项 enabled 生效。
  */
-import { getDb } from "../db";
+import { getDb, setPairFlip } from "../db";
 import { invalidateClients } from "../chains";
 import { invalidateTokenCache } from "../chains/tokens";
 
-const EXPORT_VERSION = 3;
+const EXPORT_VERSION = 4;
 
 export interface ConfigBundle {
   version: number;
@@ -46,24 +46,41 @@ export function exportConfig(): ConfigBundle {
   const chains = (db.prepare("SELECT key,name,chain_id,rpc_urls,explorer_url,symbol,enabled FROM chains").all() as any[])
     .map((c) => ({ ...c, rpc_urls: safeParse(c.rpc_urls), enabled: !!c.enabled }));
   const dexes = (db.prepare(
-    `SELECT c.key AS chain_key, d.name, d.type, d.factory, d.npm, d.enabled
+    `SELECT c.key AS chain_key, d.name, d.type, d.factory, d.npm, d.stateview, d.quoter, d.router02, d.swaprouter, d.enabled
      FROM dexes d JOIN chains c ON c.id=d.chain_id_ref`
-  ).all() as any[]).map((d) => ({ ...d, enabled: !!d.enabled, factory: d.factory.toLowerCase(), npm: d.npm.toLowerCase() }));
+  ).all() as any[]).map((d) => ({
+    ...d,
+    enabled: !!d.enabled,
+    factory: (d.factory || "").toLowerCase(),
+    npm: (d.npm || "").toLowerCase(),
+    stateview: (d.stateview || "").toLowerCase(),
+    quoter: (d.quoter || "").toLowerCase(),
+    router02: (d.router02 || "").toLowerCase(),
+    swaprouter: (d.swaprouter || "").toLowerCase(),
+  }));
   const staking = (db.prepare(
-    `SELECT c.key AS chain_key, s.platform, s.pair_label, s.contract, s.read_type, s.enabled
-     FROM staking_contracts s JOIN chains c ON c.id=s.chain_id_ref`
-  ).all() as any[]).map((s) => ({ ...s, enabled: !!s.enabled, contract: s.contract.toLowerCase() }));
+    `SELECT c.key AS chain_key, s.platform, s.pair_label, s.contract, s.read_type, s.enabled, d.name AS dex_name
+     FROM staking_contracts s
+     JOIN chains c ON c.id=s.chain_id_ref
+     LEFT JOIN dexes d ON d.id=s.dex_id`
+  ).all() as any[]).map((s) => ({
+    ...s,
+    enabled: !!s.enabled,
+    contract: s.contract.toLowerCase(),
+    dex_name: s.dex_name || "",
+  }));
   const wallets = (db.prepare(
     `SELECT c.key AS chain_key, w.address, w.label, w.enabled
      FROM wallets w JOIN chains c ON c.id=w.chain_id_ref`
   ).all() as any[]).map((w) => ({ ...w, enabled: !!w.enabled, address: w.address.toLowerCase() }));
   const cexMappings = (db.prepare(
-    `SELECT c.key AS chain_key, ts.token_addr, ts.token_symbol, ts.cex_symbol, ts.fixed_price, ts.quote, ts.inverted, ts.enabled
+    `SELECT c.key AS chain_key, ts.token_addr, ts.token_symbol, ts.cex_symbol, ts.fixed_price, ts.quote, ts.inverted, ts.is_stable, ts.enabled
      FROM token_symbols ts JOIN chains c ON c.id=ts.chain_id_ref`
   ).all() as any[]).map((m) => ({
     ...m,
     enabled: !!m.enabled,
     inverted: m.inverted === 1,
+    is_stable: m.is_stable === 1,
     token_addr: m.token_addr.toLowerCase(),
     cex_symbol: m.cex_symbol.toUpperCase(),
     quote: (m.quote || "").toUpperCase(),
@@ -90,51 +107,53 @@ export function exportConfig(): ConfigBundle {
     muted: true,
   }));
 
-  // 获取收藏项目的token symbol（从快照、positions表或实时查询）
   const getFavoriteTokenSymbols = (row: any) => {
-    // 如果快照中有symbol，直接使用
-    if (row.token0_symbol !== '?' && row.token1_symbol !== '?') {
+    if (row.fav_token0_symbol && row.fav_token1_symbol) {
       return {
-        token0_symbol: row.token0_symbol,
-        token1_symbol: row.token1_symbol
+        token0_symbol: row.fav_token0_symbol,
+        token1_symbol: row.fav_token1_symbol,
       };
     }
-    
-    // 尝试从positions表获取
+    if (row.token0_symbol !== "?" && row.token1_symbol !== "?") {
+      return {
+        token0_symbol: row.token0_symbol,
+        token1_symbol: row.token1_symbol,
+      };
+    }
     const pos = db.prepare(`
-      SELECT token0_symbol, token1_symbol 
-      FROM positions 
-      WHERE chain_id_ref = ? AND pool = ? AND COALESCE(staker_contract, '') = COALESCE(?, '')
-      ORDER BY last_checked_at DESC 
+      SELECT token0_symbol, token1_symbol
+      FROM positions
+      WHERE chain_id_ref = ? AND LOWER(pool) = LOWER(?)
+      ORDER BY last_checked_at DESC
       LIMIT 1
-    `).get(row.chain_id_ref, row.pool_addr, row.staker_addr) as { token0_symbol: string; token1_symbol: string } | undefined;
-    
+    `).get(row.chain_id_ref, row.pool_addr) as { token0_symbol: string; token1_symbol: string } | undefined;
+
     if (pos && pos.token0_symbol && pos.token1_symbol) {
       return {
         token0_symbol: pos.token0_symbol,
-        token1_symbol: pos.token1_symbol
+        token1_symbol: pos.token1_symbol,
       };
     }
-    
-    // 如果都没有，标记为需要查询（在导入时处理）
     return {
-      token0_symbol: '?',
-      token1_symbol: '?'
+      token0_symbol: "?",
+      token1_symbol: "?",
     };
   };
 
   const liquidityFavorites = (db.prepare(`
-    SELECT 
+    SELECT
       c.key AS chain_key, c.name AS chain_name, c.symbol AS chain_symbol,
       lf.label, lf.pool_addr, lf.staker_addr, lf.npm_addr, lf.sort_order,
+      lf.token0, lf.token1, lf.token0_symbol AS fav_token0_symbol, lf.token1_symbol AS fav_token1_symbol,
+      lf.monitor_cex,
       d.name AS dex_name, d.type AS dex_type,
       COALESCE(ls.token0_symbol, '?') AS token0_symbol,
       COALESCE(ls.token1_symbol, '?') AS token1_symbol,
       COALESCE(json_extract(ls.payload, '$.fee'), 0) AS fee,
       lf.chain_id_ref
-    FROM liquidity_favorites lf 
+    FROM liquidity_favorites lf
     JOIN chains c ON c.id = lf.chain_id_ref
-    LEFT JOIN dexes d ON d.chain_id_ref = lf.chain_id_ref AND d.factory = lf.npm_addr
+    LEFT JOIN dexes d ON d.chain_id_ref = lf.chain_id_ref AND LOWER(d.npm) = LOWER(lf.npm_addr)
     LEFT JOIN (
       SELECT chain_id_ref, pool_addr, staker_addr, token0_symbol, token1_symbol, payload
       FROM liquidity_snapshots
@@ -154,6 +173,9 @@ export function exportConfig(): ConfigBundle {
       staker_addr: r.staker_addr?.toLowerCase() || null,
       npm_addr: r.npm_addr?.toLowerCase() || null,
       sort_order: r.sort_order || 0,
+      monitor_cex: r.monitor_cex === 1,
+      token0: (r.token0 || "").toLowerCase(),
+      token1: (r.token1 || "").toLowerCase(),
       dex_name: r.dex_name,
       dex_type: r.dex_type,
       token0_symbol: symbols.token0_symbol,
@@ -192,7 +214,6 @@ export function importConfig(bundle: Partial<ConfigBundle>, mode: "merge" | "ove
   void mode;
 
   const tx = db.transaction(() => {
-    // 先建链，后续按 chain_key 找 id
     const chainKeyToId = new Map<string, number>();
     for (const ch of bundle.chains ?? []) {
       if (!ch.key || !ch.chain_id || !Array.isArray(ch.rpc_urls) || ch.rpc_urls.length === 0) continue;
@@ -217,17 +238,21 @@ export function importConfig(bundle: Partial<ConfigBundle>, mode: "merge" | "ove
 
     for (const d of bundle.dexes ?? []) {
       const chainId = chainKeyToId.get(d.chain_key);
-      if (!chainId || !d.factory || !d.npm) continue;
-      const factory = d.factory.toLowerCase();
-      const npm = d.npm.toLowerCase();
+      if (!chainId || (!d.factory && d.type !== "v4")) continue;
+      const factory = (d.factory || "").toLowerCase();
+      const npm = (d.npm || "").toLowerCase();
+      const stateview = (d.stateview || "").toLowerCase();
+      const quoter = (d.quoter || "").toLowerCase();
+      const router02 = (d.router02 || "").toLowerCase();
+      const swaprouter = (d.swaprouter || "").toLowerCase();
       const existing = db.prepare("SELECT id FROM dexes WHERE chain_id_ref=? AND factory=?").get(chainId, factory) as any;
       if (existing) {
-        db.prepare(`UPDATE dexes SET name=?, type=?, npm=?, enabled=? WHERE id=?`)
-          .run(d.name ?? "DEX", d.type ?? "v3-fork", npm, d.enabled === false ? 0 : 1, existing.id);
+        db.prepare(`UPDATE dexes SET name=?, type=?, npm=?, stateview=?, quoter=?, router02=?, swaprouter=?, enabled=? WHERE id=?`)
+          .run(d.name ?? "DEX", d.type ?? "v3-fork", npm, stateview, quoter, router02, swaprouter, d.enabled === false ? 0 : 1, existing.id);
         res.dexes.updated++;
       } else {
-        db.prepare(`INSERT INTO dexes (chain_id_ref, name, type, factory, npm, enabled) VALUES (?,?,?,?,?,?)`)
-          .run(chainId, d.name ?? "DEX", d.type ?? "v3-fork", factory, npm, d.enabled === false ? 0 : 1);
+        db.prepare(`INSERT INTO dexes (chain_id_ref, name, type, factory, npm, stateview, quoter, router02, swaprouter, enabled) VALUES (?,?,?,?,?,?,?,?,?,?)`)
+          .run(chainId, d.name ?? "DEX", d.type ?? "v3-fork", factory, npm, stateview, quoter, router02, swaprouter, d.enabled === false ? 0 : 1);
         res.dexes.added++;
       }
     }
@@ -236,14 +261,19 @@ export function importConfig(bundle: Partial<ConfigBundle>, mode: "merge" | "ove
       const chainId = chainKeyToId.get(s.chain_key);
       if (!chainId || !s.contract) continue;
       const contract = s.contract.toLowerCase();
+      let dexId: number | null = null;
+      if (s.dex_name) {
+        const dexRow = db.prepare("SELECT id FROM dexes WHERE chain_id_ref=? AND name=? LIMIT 1").get(chainId, s.dex_name) as { id: number } | undefined;
+        dexId = dexRow?.id ?? null;
+      }
       const existing = db.prepare("SELECT id FROM staking_contracts WHERE chain_id_ref=? AND contract=?").get(chainId, contract) as any;
       if (existing) {
-        db.prepare(`UPDATE staking_contracts SET platform=?, pair_label=?, read_type=?, enabled=? WHERE id=?`)
-          .run(s.platform ?? "", s.pair_label ?? "", s.read_type ?? "deposits_owner", s.enabled === false ? 0 : 1, existing.id);
+        db.prepare(`UPDATE staking_contracts SET platform=?, pair_label=?, read_type=?, dex_id=COALESCE(?, dex_id), enabled=? WHERE id=?`)
+          .run(s.platform ?? "", s.pair_label ?? "", s.read_type ?? "deposits_owner", dexId, s.enabled === false ? 0 : 1, existing.id);
         res.staking.updated++;
       } else {
-        db.prepare(`INSERT INTO staking_contracts (chain_id_ref, platform, pair_label, contract, read_type, enabled) VALUES (?,?,?,?,?,?)`)
-          .run(chainId, s.platform ?? "", s.pair_label ?? "", contract, s.read_type ?? "deposits_owner", s.enabled === false ? 0 : 1);
+        db.prepare(`INSERT INTO staking_contracts (chain_id_ref, platform, pair_label, contract, read_type, dex_id, enabled) VALUES (?,?,?,?,?,?,?)`)
+          .run(chainId, s.platform ?? "", s.pair_label ?? "", contract, s.read_type ?? "deposits_owner", dexId, s.enabled === false ? 0 : 1);
         res.staking.added++;
       }
     }
@@ -275,35 +305,26 @@ export function importConfig(bundle: Partial<ConfigBundle>, mode: "merge" | "ove
       const fixedPrice = (m.fixed_price != null && Number(m.fixed_price) > 0) ? Number(m.fixed_price) : null;
       const quote = (m.quote || "").toUpperCase();
       const inverted = m.inverted ? 1 : 0;
+      const isStable = m.is_stable ? 1 : 0;
       const enabled = m.enabled === false ? 0 : 1;
       if (existing) {
-        db.prepare(`UPDATE token_symbols SET token_symbol=?, cex_symbol=?, fixed_price=?, quote=?, inverted=?, enabled=? WHERE id=?`)
-          .run(tokenSymbol, cexSymbol, fixedPrice, quote, inverted, enabled, existing.id);
+        db.prepare(`UPDATE token_symbols SET token_symbol=?, cex_symbol=?, fixed_price=?, quote=?, inverted=?, is_stable=?, enabled=? WHERE id=?`)
+          .run(tokenSymbol, cexSymbol, fixedPrice, quote, inverted, isStable, enabled, existing.id);
         res.cex_mappings.updated++;
       } else {
-        db.prepare(`INSERT INTO token_symbols (chain_id_ref, token_addr, token_symbol, cex_symbol, fixed_price, quote, inverted, enabled) VALUES (?,?,?,?,?,?,?,?)`)
-          .run(chainId, tokenAddr, tokenSymbol, cexSymbol, fixedPrice, quote, inverted, enabled);
+        db.prepare(`INSERT INTO token_symbols (chain_id_ref, token_addr, token_symbol, cex_symbol, fixed_price, quote, inverted, is_stable, enabled) VALUES (?,?,?,?,?,?,?,?,?)`)
+          .run(chainId, tokenAddr, tokenSymbol, cexSymbol, fixedPrice, quote, inverted, isStable, enabled);
         res.cex_mappings.added++;
       }
     }
 
-    // pair_flips：写入 pair_flips 独立表 + 同步更新现有 positions 行
+    // pair_flips：使用统一 setPairFlip 写入并同步 positions
     for (const pf of bundle.pair_flips ?? []) {
       const chainId = chainKeyToId.get(pf.chain_key);
-      if (!chainId || !pf.dex_name || !pf.token0 || !pf.token1) continue;
-      const token0 = pf.token0.toLowerCase();
-      const token1 = pf.token1.toLowerCase();
+      if (!chainId || !pf.token0 || !pf.token1) continue;
       if (pf.pair_flip) {
-        // 写入独立翻转偏好表（即使 positions 暂无该行也能保留）
-        db.prepare(
-          `INSERT OR IGNORE INTO pair_flips (chain_id_ref, dex_name, token0, token1) VALUES (?,?,?,?)`
-        ).run(chainId, pf.dex_name, token0, token1);
-        // 同步更新已存在的 positions 行
-        const result = db.prepare(
-          `UPDATE positions SET pair_flip = 1
-           WHERE chain_id_ref = ? AND dex_name = ? AND token0 = ? AND token1 = ? AND pair_flip = 0`
-        ).run(chainId, pf.dex_name, token0, token1);
-        res.pair_flips.applied += result.changes;
+        setPairFlip(chainId, pf.token0, pf.token1, true, pf.dex_name || "");
+        res.pair_flips.applied++;
       }
     }
 
@@ -326,32 +347,42 @@ export function importConfig(bundle: Partial<ConfigBundle>, mode: "merge" | "ove
       const chainId = chainKeyToId.get(lf.chain_key);
       if (!chainId || !lf.pool_addr) continue;
       const poolAddr = lf.pool_addr.toLowerCase();
-      // 确保 staker_addr 不为 null，数据库要求 NOT NULL
       const stakerAddr = (lf.staker_addr?.toLowerCase() || "") || "";
       const npmAddr = lf.npm_addr?.toLowerCase() || "";
       const label = lf.label || "";
       const sortOrder = lf.sort_order || 0;
-      
+      const monitorCex = lf.monitor_cex ? 1 : 0;
+      const token0 = (lf.token0 || "").toLowerCase();
+      const token1 = (lf.token1 || "").toLowerCase();
+      const sym0 = lf.token0_symbol && lf.token0_symbol !== "?" ? lf.token0_symbol : "";
+      const sym1 = lf.token1_symbol && lf.token1_symbol !== "?" ? lf.token1_symbol : "";
+
       const existing = db.prepare(
         `SELECT id FROM liquidity_favorites WHERE chain_id_ref=? AND pool_addr=? AND COALESCE(staker_addr, '') = COALESCE(?, '')`
       ).get(chainId, poolAddr, stakerAddr) as any;
-      
+
       if (existing) {
         db.prepare(
-          `UPDATE liquidity_favorites SET label=?, npm_addr=?, sort_order=?, token0_symbol=?, token1_symbol=? WHERE id=?`
-        ).run(label, npmAddr, sortOrder, lf.token0_symbol || "", lf.token1_symbol || "", existing.id);
+          `UPDATE liquidity_favorites
+           SET label=?, npm_addr=?, sort_order=?, monitor_cex=?,
+               token0=COALESCE(NULLIF(?, ''), token0),
+               token1=COALESCE(NULLIF(?, ''), token1),
+               token0_symbol=COALESCE(NULLIF(?, ''), token0_symbol),
+               token1_symbol=COALESCE(NULLIF(?, ''), token1_symbol)
+           WHERE id=?`
+        ).run(label, npmAddr, sortOrder, monitorCex, token0, token1, sym0, sym1, existing.id);
         res.liquidity_favorites.updated++;
       } else {
         db.prepare(
-          `INSERT INTO liquidity_favorites (chain_id_ref, label, pool_addr, staker_addr, npm_addr, sort_order, token0_symbol, token1_symbol) VALUES (?,?,?,?,?,?,?,?)`
-        ).run(chainId, label, poolAddr, stakerAddr, npmAddr, sortOrder, lf.token0_symbol || "", lf.token1_symbol || "");
+          `INSERT INTO liquidity_favorites (chain_id_ref, label, pool_addr, staker_addr, npm_addr, sort_order, monitor_cex, token0, token1, token0_symbol, token1_symbol)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?)`
+        ).run(chainId, label, poolAddr, stakerAddr, npmAddr, sortOrder, monitorCex, token0, token1, sym0, sym1);
         res.liquidity_favorites.added++;
       }
     }
   });
 
   tx();
-  // 配置变了，缓存可能失效
   invalidateClients();
   invalidateTokenCache();
   return res;
