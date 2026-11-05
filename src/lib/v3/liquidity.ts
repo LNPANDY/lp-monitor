@@ -29,14 +29,29 @@ import {
   FEE_TO_TICK_SPACING,
 } from "./math";
 
-// Pool ABI 补充：liquidity()、tickSpacing()、fee()、token0()、token1()
+import { resolveTokens } from "../chains/tokens";
+
+// Pool ABI 补充：liquidity()、tickSpacing()、fee()、token0()、token1()、factory()
 const POOL_EXTRA_ABI = [
   { name: "liquidity", type: "function", stateMutability: "view", inputs: [], outputs: [{ name: "", type: "uint128" }] },
   { name: "tickSpacing", type: "function", stateMutability: "view", inputs: [], outputs: [{ name: "", type: "int24" }] },
   { name: "fee", type: "function", stateMutability: "view", inputs: [], outputs: [{ name: "", type: "uint24" }] },
   { name: "token0", type: "function", stateMutability: "view", inputs: [], outputs: [{ name: "", type: "address" }] },
   { name: "token1", type: "function", stateMutability: "view", inputs: [], outputs: [{ name: "", type: "address" }] },
+  { name: "factory", type: "function", stateMutability: "view", inputs: [], outputs: [{ name: "", type: "address" }] },
 ] as const;
+
+export interface PoolStaticMeta {
+  fee: number;
+  tickSpacing: number;
+  token0: `0x${string}`;
+  token1: `0x${string}`;
+  factory: string;
+  decimals0: number;
+  decimals1: number;
+  symbol0: string;
+  symbol1: string;
+}
 
 // ==================== 公共类型 ====================
 
@@ -73,12 +88,6 @@ export interface LiquidityResult {
 
 // ==================== 读取链上数据 ====================
 
-/**
- * 受控并发地映射数组。viem 的 multicall 批处理会把同一批次多个 readContract 合并成
- * 一个 eth_call；若对上百个 tokenId 一次性 Promise.all，会产生一个超大 payload 的
- * multicall，超出节点 gas/size 上限 → 挂起或报错 → API 502/空响应。
- * 这里限制同时进行的 RPC 读数量，避免触发巨型 multicall。
- */
 async function mapWithConcurrency<T, R>(
   items: T[],
   limit: number,
@@ -98,7 +107,7 @@ async function mapWithConcurrency<T, R>(
 }
 
 /** 读取 pool 的 slot0（sqrtPriceX96 + tick）和当前流动性 L。 */
-async function readPoolState(client: PublicClient, pool: `0x${string}`) {
+export async function readPoolState(client: PublicClient, pool: `0x${string}`) {
   const [slot0, liquidity] = await Promise.all([
     client.readContract({ address: pool, abi: V3_POOL_ABI, functionName: "slot0" }),
     client.readContract({ address: pool, abi: POOL_EXTRA_ABI, functionName: "liquidity" }),
@@ -111,10 +120,18 @@ async function readPoolState(client: PublicClient, pool: `0x${string}`) {
   };
 }
 
-/** 池子静态元数据缓存（fee / tickSpacing / token0 / token1 在链上永不改变） */
+/** HMR 安全的全局池子静态元数据缓存（fee / tickSpacing / token0 / token1 / factory / decimals / symbol 永不改变） */
+function getPoolStaticCache(): Map<string, PoolStaticMeta> {
+  const g = globalThis as any;
+  if (!g.__lpMonitorPoolStaticCache__) {
+    g.__lpMonitorPoolStaticCache__ = new Map<string, PoolStaticMeta>();
+  }
+  return g.__lpMonitorPoolStaticCache__;
+}
+
 const poolInfoCache = new Map<
   string,
-  { fee: number; tickSpacing: number; token0: `0x${string}`; token1: `0x${string}` }
+  { fee: number; tickSpacing: number; token0: `0x${string}`; token1: `0x${string}`; factory: string }
 >();
 
 /** NFT 静态池子与区间缓存（token0 / token1 / fee / tickLower / tickUpper 铸造后永不改变） */
@@ -129,25 +146,56 @@ const closedNftSet = new Set<string>();
 /** Vault 持有 tokenId 列表短期缓存（15 秒 TTL，避免连续切换探针时重复枚举） */
 const ownedTokenIdsCache = new Map<string, { ts: number; ids: bigint[] }>();
 
-/** 读取 pool 的 fee / tickSpacing / token0 / token1（带永久内存缓存）。 */
+/** 读取 pool 的 fee / tickSpacing / token0 / token1 / factory（带永久内存缓存）。 */
 async function readPoolInfo(client: PublicClient, pool: `0x${string}`) {
   const k = pool.toLowerCase();
   const cached = poolInfoCache.get(k);
   if (cached) return cached;
-  const [fee, tickSpacing, token0, token1] = await Promise.all([
+  const [fee, tickSpacing, token0, token1, factory] = await Promise.all([
     client.readContract({ address: pool, abi: POOL_EXTRA_ABI, functionName: "fee" }),
     client.readContract({ address: pool, abi: POOL_EXTRA_ABI, functionName: "tickSpacing" }),
     client.readContract({ address: pool, abi: POOL_EXTRA_ABI, functionName: "token0" }),
     client.readContract({ address: pool, abi: POOL_EXTRA_ABI, functionName: "token1" }),
+    client.readContract({ address: pool, abi: POOL_EXTRA_ABI, functionName: "factory" }).catch(() => ""),
   ]);
   const info = {
     fee: Number(fee),
-    tickSpacing: Number(tickSpacing),
-    token0: token0 as `0x${string}`,
-    token1: token1 as `0x${string}`,
+    tickSpacing: Number(tickSpacing) || FEE_TO_TICK_SPACING[Number(fee)] || 1,
+    token0: (token0 as string).toLowerCase() as `0x${string}`,
+    token1: (token1 as string).toLowerCase() as `0x${string}`,
+    factory: String(factory || "").toLowerCase(),
   };
   poolInfoCache.set(k, info);
   return info;
+}
+
+/**
+ * 获取池子完整静态元数据（含 token0/token1 的 symbol 与 decimals），进程级永久缓存。
+ * 命中缓存后 0 RPC 调用！
+ */
+export async function getPoolStaticMeta(
+  client: PublicClient,
+  chainId: number,
+  pool: `0x${string}`
+): Promise<PoolStaticMeta> {
+  const key = `${chainId}:${pool.toLowerCase()}`;
+  const cache = getPoolStaticCache();
+  const hit = cache.get(key);
+  if (hit) return hit;
+
+  const info = await readPoolInfo(client, pool);
+  const tokenMap = await resolveTokens(client, chainId, [info.token0, info.token1]);
+  const m0 = tokenMap.get(info.token0.toLowerCase());
+  const m1 = tokenMap.get(info.token1.toLowerCase());
+  const meta: PoolStaticMeta = {
+    ...info,
+    decimals0: m0?.decimals ?? 18,
+    decimals1: m1?.decimals ?? 18,
+    symbol0: m0?.symbol || info.token0.slice(0, 8),
+    symbol1: m1?.symbol || info.token1.slice(0, 8),
+  };
+  cache.set(key, meta);
+  return meta;
 }
 
 /**
@@ -385,6 +433,10 @@ export interface MinRangeProbeResult {
   tickUpper: number;
   /** 当前 tick */
   currentTick: number;
+  /** 当前 sqrtPriceX96 字符串（供建仓面板直接复用） */
+  sqrtPriceX96?: string;
+  /** 原始活跃流动性字符串（供建仓面板直接复用） */
+  rawLiquidity?: string;
   /** 该最小窗口内的流动性（token0/token1） */
   liquidity: LiquidityBreakdown;
   /** 价格区间 [low, high] */
@@ -403,10 +455,7 @@ export interface MinRangeProbeResult {
  * 场景C：给定池子地址，算 fee 对应 tickSpacing 的最小窗口流动性 + 价格区间。
  *
  * 最小区间 = [当前 tick 向下取整到 tickSpacing 的倍数, +tickSpacing]
- * 用 Pool.liquidity()（当前价格净流动性）作为该窗口的流动性近似。
- *
- * @param stakerAddr 可选。若提供，则额外用 vault 枚举统计该窗口内同池子 LP 的总流动性；
- *                   否则只用 Pool.liquidity()。
+ * 直接使用 V3 Pool.liquidity()（当前 tick 活跃净流动性，含直持与质押在 Vault 中的所有 LP，仅需 1 次 RPC）。
  */
 export async function probeMinRange(
   client: PublicClient,
@@ -415,8 +464,8 @@ export async function probeMinRange(
   decimals1: number,
   symbol0: string,
   symbol1: string,
-  npm?: `0x${string}`,
-  stakerAddr?: `0x${string}`
+  _npm?: `0x${string}`,
+  _stakerAddr?: `0x${string}`
 ): Promise<MinRangeProbeResult> {
   const [{ sqrtPriceX96, currentTick, liquidity: poolLiquidity }, info] = await Promise.all([
     readPoolState(client, pool),
@@ -430,35 +479,22 @@ export async function probeMinRange(
   const sqrtA = tickToSqrtPriceX96(tickLower);
   const sqrtB = tickToSqrtPriceX96(tickUpper);
 
-  let effectiveLiquidity = poolLiquidity;
-  if (npm && stakerAddr) {
-    // vault 场景：枚举并统计该窗口内同池子 LP 流动性（带静态缓存前置过滤）
-    const tokenIds = await enumerateOwnedTokenIds(client, npm, stakerAddr);
-    const poolKey = `${info.token0.toLowerCase()}-${info.token1.toLowerCase()}-${info.fee}`;
-    let agg = 0n;
-    await mapWithConcurrency(tokenIds, 8, async (tokenId) => {
-      const liq = await readMatchingPositionLiquidity(
-        client,
-        npm,
-        tokenId,
-        poolKey,
-        tickLower,
-        tickUpper
-      );
-      if (liq && liq > 0n) {
-        agg += liq;
-      }
-    });
-    if (agg > 0n) effectiveLiquidity = agg;
-  }
-
-  const liquidity = getAmountsForLiquidity(sqrtPriceX96, sqrtA, sqrtB, effectiveLiquidity, decimals0, decimals1);
+  const liquidity = getAmountsForLiquidity(
+    sqrtPriceX96,
+    sqrtA,
+    sqrtB,
+    poolLiquidity,
+    decimals0,
+    decimals1
+  );
 
   return {
     tickSpacing,
     tickLower,
     tickUpper,
     currentTick,
+    sqrtPriceX96: sqrtPriceX96.toString(),
+    rawLiquidity: poolLiquidity.toString(),
     liquidity,
     priceLow: tickToPriceDisplay(tickLower, decimals0, decimals1),
     priceHigh: tickToPriceDisplay(tickUpper, decimals0, decimals1),
@@ -470,3 +506,4 @@ export async function probeMinRange(
     sampledAt: new Date().toISOString(),
   };
 }
+

@@ -305,7 +305,7 @@ export default function DashboardPage() {
 
       {/* 底部版本号 */}
       <div className="text-center text-xs text-ink-muted">
-        LP Monitor v{process.env.NEXT_PUBLIC_VERSION || "0.19.3"}
+        LP Monitor v{process.env.NEXT_PUBLIC_VERSION || "0.19.4"}
       </div>
     </div>
   );

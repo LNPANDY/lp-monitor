@@ -27,6 +27,8 @@ import {
 interface Props {
   chainId: number;
   pool: string;
+  externalData?: any;
+  probeLoading?: boolean;
   onClose?: () => void;
   onCreated?: () => void;
   onFlipChanged?: () => void;
@@ -35,6 +37,8 @@ interface Props {
 export function MintPositionPanel({
   chainId: initialChainId,
   pool: initialPool,
+  externalData,
+  probeLoading,
   onClose,
   onCreated,
   onFlipChanged,
@@ -52,15 +56,21 @@ export function MintPositionPanel({
   const [pool, setPool] = useState(initialPool || "");
 
   // 区间：默认留空 = 使用最小窗口；可手动改
-  const [tickLower, setTickLower] = useState<string>("");
-  const [tickUpper, setTickUpper] = useState<string>("");
+  const [tickLower, setTickLower] = useState<string>(
+    externalData?.range ? String(externalData.range.tickLower) : ""
+  );
+  const [tickUpper, setTickUpper] = useState<string>(
+    externalData?.range ? String(externalData.range.tickUpper) : ""
+  );
 
   // 单侧金额输入
-  const [side, setSide] = useState<"token0" | "token1">("token0");
+  const [side, setSide] = useState<"token0" | "token1">(
+    externalData?.pairFlip === 1 ? "token1" : "token0"
+  );
   const [amount, setAmount] = useState("");
 
   // 后端返回的状态
-  const [data, setData] = useState<any>(null);
+  const [data, setData] = useState<any>(externalData ?? null);
   const [busy, setBusy] = useState(false);
   const [togglingAllApprove, setTogglingAllApprove] = useState(false);
   const [msg, setMsg] = useState("");
@@ -158,40 +168,74 @@ export function MintPositionPanel({
     [chainId, pool, address, amount, side, tickLower, tickUpper]
   );
 
-  /** 初始加载或外部换池时自动拉取 */
+  /** 当外部探针返回 mintInit 数据时，直接注入（0 额外请求） */
   useEffect(() => {
-    if (initialPool && initialChainId) {
-      setChainId(initialChainId);
-      setPool(initialPool);
-      setTickLower("");
-      setTickUpper("");
-      fetchPool({
-        chainOverride: initialChainId,
-        poolOverride: initialPool,
-        withCompute: !!amount,
-        withWallet: !!address,
-      });
+    if (!externalData || !externalData.pool) return;
+    const extChain = externalData.chain?.id ?? initialChainId;
+    const extPool = (externalData.pool.address || initialPool || "").toLowerCase();
+    setChainId(extChain);
+    setPool(extPool);
+    setData(externalData);
+    setMsg("");
+    if (externalData.range) {
+      setTickLower(String(externalData.range.tickLower));
+      setTickUpper(String(externalData.range.tickUpper));
     }
+    const poolKey = `${extChain}:${extPool}:${externalData.pairFlip ?? 0}`;
+    if (initializedPoolRef.current !== poolKey) {
+      initializedPoolRef.current = poolKey;
+      setSide(externalData.pairFlip === 1 ? "token1" : "token0");
+    }
+  }, [externalData, initialChainId, initialPool]);
+
+  /** 仅当没有外部探针同步数据且非探针加载中时，才主动拉取 */
+  useEffect(() => {
+    if (!initialPool || !initialChainId) return;
+    setChainId(initialChainId);
+    setPool(initialPool);
+    if (probeLoading) return;
+    if (
+      externalData?.pool?.address &&
+      externalData.pool.address.toLowerCase() === initialPool.toLowerCase()
+    ) {
+      return;
+    }
+    setTickLower("");
+    setTickUpper("");
+    fetchPool({
+      chainOverride: initialChainId,
+      poolOverride: initialPool,
+      withCompute: !!amount,
+      withWallet: !!address,
+    });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [initialChainId, initialPool]);
 
-  /** 金额/侧向变化时自动重算（防抖 500ms） */
+  /** 金额/侧向变化时自动重算（防抖 400ms） */
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEffect(() => {
     if (!data || !amount) return;
     if (debounceRef.current) clearTimeout(debounceRef.current);
     debounceRef.current = setTimeout(() => {
       fetchPool({ withCompute: true, withWallet: !!address });
-    }, 500);
+    }, 400);
     return () => {
       if (debounceRef.current) clearTimeout(debounceRef.current);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [amount, side]);
 
-  /** 钱包连接状态变化时刷新一次，拿到最新的授权额度和余额 */
+  /** 钱包连接状态变化且当前缺少余额/授权信息时刷新一次 */
+  const lastFetchedWalletRef = useRef<string>("");
   useEffect(() => {
     if (!data || !address) return;
+    const key = `${chainId}:${pool.toLowerCase()}:${address.toLowerCase()}`;
+    if (data.balances && lastFetchedWalletRef.current === "") {
+      lastFetchedWalletRef.current = key;
+      return;
+    }
+    if (lastFetchedWalletRef.current === key) return;
+    lastFetchedWalletRef.current = key;
     fetchPool({ withCompute: !!amount, withWallet: true });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [address]);

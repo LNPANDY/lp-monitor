@@ -30,6 +30,12 @@ export interface ExternalSwapPair {
   token1: string;
   token0Symbol: string;
   token1Symbol: string;
+  token0Decimals?: number;
+  token1Decimals?: number;
+  balances?: {
+    token0: string;
+    token1: string;
+  } | null;
   pairFlip?: number;
   ts?: number;
 }
@@ -170,14 +176,29 @@ export function SwapQuoteSection({
     }
     const sym0 = externalPair.token0Symbol || short(externalPair.token0);
     const sym1 = externalPair.token1Symbol || short(externalPair.token1);
+    const dec0 = externalPair.token0Decimals ?? 18;
+    const dec1 = externalPair.token1Decimals ?? 18;
     // 默认把主币放卖出或按翻转方向设置，点击 ⇄ 可一键互换
-    if (externalPair.pairFlip === 1) {
-      setInSym(sym1);
-      setOutSym(sym0);
-    } else {
-      setInSym(sym0);
-      setOutSym(sym1);
+    const nextInSym = externalPair.pairFlip === 1 ? sym1 : sym0;
+    const nextOutSym = externalPair.pairFlip === 1 ? sym0 : sym1;
+    setInSym(nextInSym);
+    setOutSym(nextOutSym);
+
+    // 若探针已顺带返回钱包双币余额，直接注入，免去重复调 /api/token-balances
+    if (externalPair.balances) {
+      const isFlipped = externalPair.pairFlip === 1;
+      setBalances({
+        in: isFlipped ? externalPair.balances.token1 : externalPair.balances.token0,
+        out: isFlipped ? externalPair.balances.token0 : externalPair.balances.token1,
+        decIn: isFlipped ? dec1 : dec0,
+        decOut: isFlipped ? dec0 : dec1,
+      });
+      const targetDexId = matchedDex?.chain_id_ref ?? externalPair.chainId;
+      if (address) {
+        initialLoadedRef.current = `${targetDexId}-${nextInSym}-${nextOutSym}-${address}`;
+      }
     }
+
     if (externalPair.fee) {
       setFeeOverride(externalPair.fee);
     } else {
@@ -185,7 +206,7 @@ export function SwapQuoteSection({
     }
     setQuote(null);
     setErr("");
-  }, [externalPair, dexOptions]);
+  }, [externalPair, dexOptions, address]);
 
   // 默认初始化两个代币
   useEffect(() => {

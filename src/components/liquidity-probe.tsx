@@ -4,6 +4,7 @@ import useSWR, { mutate } from "swr";
 import { fetcher, authHeaders, short, fmtFull } from "./util";
 import { MintPositionPanel } from "./mint-position-panel";
 import { SwapQuoteSection, type ExternalSwapPair } from "./swap-quote-section";
+import { useWallet } from "@/lib/wallet/use-wallet";
 
 /**
  * 最小区间探针结果（场景C），与后端 MinRangeProbeResult 对齐。
@@ -24,10 +25,13 @@ interface ProbeResult {
   token1: string;
   token0Symbol: string;
   token1Symbol: string;
+  token0Decimals?: number;
+  token1Decimals?: number;
   sampledAt: string;
   cached?: boolean;
   pairFlip?: number;
   cex?: CexPricePayload;
+  mintInit?: any;
 }
 
 /** CEX 价差结构（与后端 CexPricePayload / scanner 对齐） */
@@ -81,16 +85,17 @@ interface Favorite {
 const pctSigned = (x: number) => `${x >= 0 ? "+" : ""}${(x * 100).toFixed(2)}%`;
 
 /**
- * 三段式右侧极速工作台：
+ * 三段式左侧极速工作台：
  *   ① 收藏池一键点选 + 🔬 最小区间探针完整检测信息
- *   ② ➕ 极速建仓 & 自动质押面板（自动带入选中池）
- *   ③ 💱 当前池双币极速兑换 Swap（自动锁定选中池的 token0/token1）
+ *   ② ➕ 极速建仓 & 自动质押面板（自动复用探针返回的池况、余额与授权，0 额外请求）
+ *   ③ 💱 当前池双币极速兑换 Swap（自动锁定选中池的 token0/token1 及钱包余额）
  */
 export function LiquidityProbe({
   externalPool,
 }: {
   externalPool?: { chainId: number; pool: string; ts: number } | null;
 }) {
+  const { address: walletAddr } = useWallet();
   const { data: chains } = useSWR<Chain[]>("/api/chains", fetcher);
   const { data: allDexes } = useSWR<Dex[]>("/api/dexes", fetcher);
   const { data: favorites, mutate: reloadFav } = useSWR<Favorite[]>(
@@ -153,6 +158,7 @@ export function LiquidityProbe({
       staker?: string;
       npm?: string;
       dexId?: string;
+      needReloadFav?: boolean;
     }
   ) {
     const cId = overrides?.chainId ?? chainId;
@@ -184,6 +190,7 @@ export function LiquidityProbe({
       const body: any = { chainId: Number(cId), pool: p };
       if (s && s.trim()) body.staker = s.trim();
       if (npmAddr && npmAddr.trim()) body.npm = npmAddr.trim();
+      if (walletAddr) body.wallet = walletAddr;
       if (force) body.force = true;
       const r = await fetch("/api/liquidity-probe", {
         method: "POST",
@@ -196,7 +203,7 @@ export function LiquidityProbe({
       setResult(data);
       setLocalFlip(data.pairFlip ?? 0);
 
-      // 同步当前探测池的两个代币到第 3 段 Swap 面板
+      // 同步当前探测池的两个代币与余额到第 3 段 Swap 面板（免去重复请求 /api/token-balances）
       if (data.token0 && data.token1) {
         setSwapPair({
           chainId: Number(cId),
@@ -206,13 +213,17 @@ export function LiquidityProbe({
           token1: data.token1,
           token0Symbol: data.token0Symbol || short(data.token0),
           token1Symbol: data.token1Symbol || short(data.token1),
+          token0Decimals: data.token0Decimals ?? 18,
+          token1Decimals: data.token1Decimals ?? 18,
+          balances: data.mintInit?.balances ?? null,
           pairFlip: data.pairFlip ?? 0,
           ts: Date.now(),
         });
       }
 
-      // 探针成功后刷新收藏列表——后端会把 token symbol 写回 favorites
-      reloadFav();
+      if (overrides?.needReloadFav) {
+        reloadFav();
+      }
     } catch (e: any) {
       setError(e.message || "探针查询失败");
     } finally {
@@ -330,6 +341,7 @@ export function LiquidityProbe({
       staker: f.staker_addr || "",
       npm: npmParam,
       dexId: matchedDexId,
+      needReloadFav: !f.token0_symbol || !f.token1_symbol,
     });
   }
 
@@ -748,9 +760,10 @@ export function LiquidityProbe({
 
       {/* ==================== 第 2 段：➕ 极速建仓 & 自动质押 ==================== */}
       <MintPositionPanel
-        key={`${mintChainId || Number(chainId) || 0}-${mintPool || pool}`}
         chainId={mintChainId || Number(chainId) || 0}
         pool={mintPool || pool}
+        externalData={result?.mintInit}
+        probeLoading={loading}
         onCreated={() => {
           mutate("/api/positions");
         }}
