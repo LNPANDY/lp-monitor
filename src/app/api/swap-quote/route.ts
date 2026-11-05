@@ -367,6 +367,47 @@ export async function POST(req: Request) {
           }
         }
       }
+      // 兜底：若两侧均非 is_stable，但两侧均在 token_symbols 配置了 CEX 映射，按 1 tokenIn = ? tokenOut 口径对比
+      if (!cexCompare && executionPrice > 0) {
+        const pairRows = db.prepare(
+          `SELECT token_addr, cex_symbol, fixed_price, quote, inverted
+           FROM token_symbols
+           WHERE chain_id_ref=? AND enabled=1 AND LOWER(token_addr) IN (LOWER(?), LOWER(?))`
+        ).all(b.chain_id, inMeta.addr, outMeta.addr) as {
+          token_addr: string;
+          cex_symbol: string;
+          fixed_price: number | null;
+          quote: string;
+          inverted: number;
+        }[];
+        if (pairRows.length >= 2) {
+          const quotes = await buildQuotesByAddr(
+            pairRows.map((r) => ({
+              chainIdRef: b.chain_id!,
+              tokenAddr: r.token_addr.toLowerCase(),
+              cexSymbol: (r.cex_symbol || "").toUpperCase(),
+              fixedPrice: r.fixed_price,
+              quote: r.quote,
+              inverted: r.inverted === 1,
+            }))
+          );
+          const qIn = quotes.get(inMeta.addr.toLowerCase());
+          const qOut = quotes.get(outMeta.addr.toLowerCase());
+          if (qIn && qOut && qIn.price > 0 && qOut.price > 0) {
+            const cexPrice = qIn.price / qOut.price;
+            const diffPct = ((executionPrice - cexPrice) / cexPrice) * 100;
+            cexCompare = {
+              stableSymbol: symOut,
+              otherSymbol: symIn,
+              cexPrice,
+              executionPriceInStable: executionPrice,
+              diffPct,
+              cexSymbolLabel: `${qIn.symbol}/${qOut.symbol}`,
+              displayPrice: executionPrice,
+            };
+          }
+        }
+      }
     } catch { /* CEX 对比失败不影响主报价 */ }
 
     // 7. 滑点后最小获得

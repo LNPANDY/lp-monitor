@@ -704,15 +704,18 @@ export function LiquidityProbe({
               </PRow>
             )}
             {result.cex && (
-              <PRow label="CEX差价">
-                <span
-                  className={
-                    result.cex.absDiff >= 0.01
-                      ? "text-warn font-semibold font-mono"
-                      : "font-mono text-ok"
-                  }
-                >
-                  {pctSigned(result.cex.diff)}
+              <PRow label="CEX 对比">
+                <span className="font-mono text-ink">
+                  CEX {fmtFull(displayCexRate)} · DEX {displayPriceCurrent} ·{" "}
+                  <span
+                    className={
+                      result.cex.absDiff >= 0.01
+                        ? "text-warn font-semibold"
+                        : "text-ok"
+                    }
+                  >
+                    {pctSigned(result.cex.diff)}
+                  </span>
                 </span>
               </PRow>
             )}

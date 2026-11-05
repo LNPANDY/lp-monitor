@@ -708,7 +708,10 @@ export function SwapQuoteSection({
             )}
           {quote.cexCompare && (
             <div className="flex items-center justify-between border-t border-white/[0.06] pt-1">
-              <span className="text-ink-soft">
+              <span
+                className="text-ink-soft"
+                title="同口径对比：CEX 报价 vs 本次 DEX 实际成交价"
+              >
                 CEX 对比 ({quote.cexCompare.otherSymbol}→
                 {quote.cexCompare.stableSymbol})
               </span>
@@ -719,7 +722,8 @@ export function SwapQuoteSection({
                     : "font-mono text-ink"
                 }
               >
-                CEX {quote.cexCompare.cexPrice.toPrecision(6)} ·{" "}
+                CEX {quote.cexCompare.cexPrice.toPrecision(6)} · DEX{" "}
+                {quote.cexCompare.executionPriceInStable.toPrecision(6)} ·{" "}
                 <span
                   className={
                     quote.cexCompare.diffPct >= 0 ? "text-ok" : "text-warn"
