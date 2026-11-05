@@ -3,7 +3,63 @@ import { useState, useEffect } from "react";
 import useSWR, { mutate } from "swr";
 import { fetcher, authHeaders, short, fmtFull } from "./util";
 import { MintPositionPanel } from "./mint-position-panel";
-import { toast } from "./toast";
+
+/**
+ * 最小区间探针结果（场景C），与后端 MinRangeProbeResult 对齐。
+ */
+interface ProbeResult {
+  pool?: string;
+  tickSpacing: number;
+  tickLower: number;
+  tickUpper: number;
+  currentTick: number;
+  liquidity: { amount0: string; amount1: string };
+  priceLow: string;
+  priceHigh: string;
+  priceCurrent: string;
+  priceLabel: string;
+  fee: number;
+  token0: string;
+  token1: string;
+  token0Symbol: string;
+  token1Symbol: string;
+  sampledAt: string;
+  cached?: boolean;
+  pairFlip?: number;
+  cex?: CexPricePayload;
+}
+
+/** CEX 价差结构（与后端 CexPricePayload / scanner 对齐） */
+interface CexPricePayload {
+  pairLabel: string;
+  token0CexSymbol: string;
+  token1CexSymbol: string;
+  quote: string;
+  dexRate: number;
+  cexRate: number;
+  diff: number;
+  absDiff: number;
+  exceedsThreshold?: boolean;
+  token0Price?: number;
+  token1Price?: number;
+  token0Quote?: string;
+  token1Quote?: string;
+}
+
+interface Chain {
+  id: number;
+  name: string;
+}
+
+interface Dex {
+  id: number;
+  chain_id_ref: number;
+  name: string;
+  type: string;
+  factory: string;
+  npm: string;
+  enabled: number;
+}
 
 interface Favorite {
   id: number;
@@ -13,174 +69,128 @@ interface Favorite {
   pool_addr: string;
   staker_addr: string;
   npm_addr: string;
-  token0?: string;
-  token1?: string;
-  token0_symbol: string;
-  token1_symbol: string;
-  fee: number | null;
-  monitor_cex: number;
+  sort_order: number;
+  token0_symbol?: string;
+  token1_symbol?: string;
+  fee?: number | null;
+  monitor_cex?: number;
   pair_flip?: number;
 }
 
+const pctSigned = (x: number) => `${x >= 0 ? "+" : ""}${(x * 100).toFixed(2)}%`;
+
+/**
+ * 最小区间流动性探针（场景C）+ 收藏 + 创建仓位面板。
+ */
 export function LiquidityProbe({
   externalPool,
 }: {
   externalPool?: { chainId: number; pool: string; ts: number } | null;
 }) {
-  const { data: chains } = useSWR<any[]>("/api/chains", fetcher);
-  const { data: allStaking } = useSWR<any[]>("/api/staking", fetcher);
+  const { data: chains } = useSWR<Chain[]>("/api/chains", fetcher);
+  const { data: allDexes } = useSWR<Dex[]>("/api/dexes", fetcher);
   const { data: favorites, mutate: reloadFav } = useSWR<Favorite[]>(
     "/api/liquidity-favorites",
     fetcher
   );
-
-  const [chainId, setChainId] = useState<number | "">("");
-  const [poolAddr, setPoolAddr] = useState("");
-  const [stakerAddr, setStakerAddr] = useState("");
-  const [favLabel, setFavLabel] = useState("");
-  const [showManualSearch, setShowManualSearch] = useState(false);
-
+  const [chainId, setChainId] = useState("");
+  const [dexId, setDexId] = useState("");
+  const [pool, setPool] = useState("");
+  const [staker, setStaker] = useState("");
+  const [npm, setNpm] = useState("");
+  const [result, setResult] = useState<ProbeResult | null>(null);
   const [loading, setLoading] = useState(false);
-  const [err, setErr] = useState("");
-  const [result, setResult] = useState<any | null>(null);
+  const [showMint, setShowMint] = useState(false);
+  // 创建仓位面板选中的池子（点击收藏带入）
+  const [mintPool, setMintPool] = useState("");
+  const [mintChainId, setMintChainId] = useState(0);
+  const [error, setError] = useState("");
+  const [favMsg, setFavMsg] = useState("");
+  // 翻转状态（来自后端返回，或本地切换暂存）
+  const [localFlip, setLocalFlip] = useState(0);
+  const [flipLoading, setFlipLoading] = useState(false);
 
-  // 建仓面板联动状态：默认直接展开，点任意收藏池即同步切换探针 + 建仓池
-  const [showMint, setShowMint] = useState(true);
-  const [mintChainId, setMintChainId] = useState<number>(0);
-  const [mintPool, setMintPool] = useState<string>("");
-
-  const favList = favorites ?? [];
-  const chainStaking = (allStaking ?? []).filter(
-    (s) => s.enabled && (!chainId || s.chain_id_ref === Number(chainId))
-  );
-
-  // 首次拿到收藏列表时，默认自动选中第一个收藏池到建仓面板（方便一打开页面就能直接操作）
-  useEffect(() => {
-    if (favList.length > 0 && !mintPool && !externalPool) {
-      const f = favList[0];
-      setMintChainId(f.chain_id_ref);
-      setMintPool(f.pool_addr);
-      setChainId(f.chain_id_ref);
-      setPoolAddr(f.pool_addr);
-      setStakerAddr(f.staker_addr || "");
-    }
-  }, [favList, mintPool, externalPool]);
-
-  // 响应从左侧仓位卡片传来的「🔄 撤池重开」或「🎯 载入建仓台」指令
+  // 响应从外部传入的建仓指令（如仓位卡片点「重开」）
   useEffect(() => {
     if (externalPool && externalPool.pool) {
-      setChainId(externalPool.chainId);
-      setPoolAddr(externalPool.pool);
+      setChainId(String(externalPool.chainId));
+      setPool(externalPool.pool);
       setMintChainId(externalPool.chainId);
       setMintPool(externalPool.pool);
       setShowMint(true);
-      doQuery({
-        chainId: externalPool.chainId,
-        pool: externalPool.pool,
-      });
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [externalPool?.ts]);
+  }, [externalPool?.ts, externalPool]);
 
-  async function doQuery(params: {
-    chainId: number;
-    pool: string;
-    staker?: string;
-    npm?: string;
-  }) {
+  // 根据选择的链过滤可用的 DEX
+  const availableDexes = chainId
+    ? (allDexes ?? []).filter((d) => d.chain_id_ref === Number(chainId) && d.enabled)
+    : [];
+
+  // 当前生效的翻转状态（优先用后端返回的 pairFlip）
+  const flip = (result?.pairFlip ?? localFlip) === 1;
+
+  async function probe(
+    force: boolean,
+    overrides?: {
+      chainId?: string;
+      pool?: string;
+      staker?: string;
+      npm?: string;
+      dexId?: string;
+    }
+  ) {
+    const cId = overrides?.chainId ?? chainId;
+    const p = overrides?.pool ?? pool;
+    const s = overrides?.staker ?? staker;
+    const dId = overrides?.dexId ?? dexId;
+    const n = overrides?.npm ?? npm;
+    if (!cId || !p) {
+      setError("请选择链并填入池子地址");
+      return;
+    }
+
+    // 根据 dexId 获取 npm 地址
+    let npmAddr = n;
+    if (dId && !npmAddr) {
+      const selectedDex = (allDexes ?? []).find((d) => d.id === Number(dId));
+      if (selectedDex) {
+        npmAddr = selectedDex.npm;
+      }
+    }
+
     setLoading(true);
-    setErr("");
+    setError("");
     try {
+      const body: any = { chainId: Number(cId), pool: p.trim() };
+      if (s && s.trim()) body.staker = s.trim();
+      if (npmAddr && npmAddr.trim()) body.npm = npmAddr.trim();
+      if (force) body.force = true;
       const r = await fetch("/api/liquidity-probe", {
         method: "POST",
         headers: authHeaders({ "Content-Type": "application/json" }),
-        body: JSON.stringify({
-          chainId: params.chainId,
-          pool: params.pool.trim(),
-          staker: params.staker?.trim() || undefined,
-          npm: params.npm?.trim() || undefined,
-        }),
+        body: JSON.stringify(body),
       });
       const j = await r.json();
-      if (!j.ok) throw new Error(j.error || "查询失败");
-      setResult(j.data);
-      // 探针成功后，后端已自动把 token0/token1/symbol 写回收藏表，刷新收藏显示并同步建仓面板
+      if (!j.ok) throw new Error(j.error || "探针失败");
+      setResult(j.data as ProbeResult);
+      setLocalFlip(j.data.pairFlip ?? 0);
+      // 探针成功后刷新收藏列表——后端会把 token symbol 写回 favorites
       reloadFav();
-      if (j.data?.pool) {
-        setMintChainId(params.chainId);
-        setMintPool(j.data.pool);
-      }
     } catch (e: any) {
-      setErr(e.message);
-      toast.error(e.message || "探针查询失败");
+      setError(e.message || "探针查询失败");
     } finally {
       setLoading(false);
     }
   }
 
-  /** 点收藏项：一键同时触发「流动性探测」+「建仓面板载入该池」 */
-  function applyFavoriteAndProbe(f: Favorite) {
-    setChainId(f.chain_id_ref);
-    setPoolAddr(f.pool_addr);
-    setStakerAddr(f.staker_addr || "");
-    setMintChainId(f.chain_id_ref);
-    setMintPool(f.pool_addr);
-    setShowMint(true);
-    doQuery({
-      chainId: f.chain_id_ref,
-      pool: f.pool_addr,
-      staker: f.staker_addr,
-      npm: f.npm_addr,
-    });
-  }
-
-  async function saveFavorite() {
-    if (!result || !chainId) return;
-    try {
-      const r = await fetch("/api/liquidity-favorites", {
-        method: "POST",
-        headers: authHeaders({ "Content-Type": "application/json" }),
-        body: JSON.stringify({
-          chain_id: Number(chainId),
-          pool: result.pool,
-          staker: stakerAddr.trim(),
-          label: favLabel.trim(),
-        }),
-      });
-      const j = await r.json();
-      if (!j.ok) throw new Error(j.error);
-      setFavLabel("");
-      reloadFav();
-      toast.success("已添加到收藏池");
-    } catch (e: any) {
-      toast.error(e.message || "保存收藏失败");
-    }
-  }
-
-  async function removeFavorite(id: number) {
-    await fetch(`/api/liquidity-favorites/${id}`, {
-      method: "DELETE",
-      headers: authHeaders(),
-    });
-    reloadFav();
-    toast.info("已移除收藏池");
-  }
-
-  async function toggleFavCexMonitor(f: Favorite) {
-    await fetch(`/api/liquidity-favorites/${f.id}`, {
-      method: "PATCH",
-      headers: authHeaders({ "Content-Type": "application/json" }),
-      body: JSON.stringify({ monitor_cex: f.monitor_cex ? 0 : 1 }),
-    });
-    reloadFav();
-    toast.info(
-      f.monitor_cex ? "已关闭该收藏池的 CEX 差价监控" : "已开启该收藏池的 CEX 差价监控"
-    );
-  }
-
+  /** 翻转交易对 */
   async function handleFlip() {
-    if (!result || !chainId) return;
+    if (!chainId || !result) return;
+    setFlipLoading(true);
     try {
+      const npmAddr = dexId
+        ? (allDexes ?? []).find((d) => d.id === Number(dexId))?.npm ?? npm
+        : npm;
       const r = await fetch("/api/liquidity-probe/pair-flip", {
         method: "PUT",
         headers: authHeaders({ "Content-Type": "application/json" }),
@@ -188,437 +198,527 @@ export function LiquidityProbe({
           chain_id: Number(chainId),
           token0: result.token0,
           token1: result.token1,
-          flip: result.pairFlip !== 1,
+          flip: !flip,
+          npm: npmAddr,
         }),
       });
       const j = await r.json();
       if (!j.ok) throw new Error(j.error || "翻转失败");
-      await doQuery({
-        chainId: Number(chainId),
-        pool: result.pool,
-        staker: stakerAddr,
-      });
+      // 翻转成功后重新探测并同步收藏与仓位卡片
+      await probe(false);
       reloadFav();
       mutate("/api/positions");
-      toast.success("已翻转交易对计价方向（全局同步）");
     } catch (e: any) {
-      toast.error(e.message || "翻转失败");
+      alert("翻转失败：" + e.message);
+    } finally {
+      setFlipLoading(false);
     }
   }
 
-  function fmtAmt(s: string) {
-    const n = Number(s);
-    if (!Number.isFinite(n)) return s;
-    if (n === 0) return "0";
-    if (n >= 1000) return n.toLocaleString("en-US", { maximumFractionDigits: 2 });
-    if (n >= 1) return n.toLocaleString("en-US", { maximumFractionDigits: 4 });
-    return n.toPrecision(4);
+  /** 收藏当前输入的查询。 */
+  async function saveFavorite() {
+    if (!chainId || !pool) {
+      setFavMsg("请先选择链并填入池子地址");
+      return;
+    }
+    setFavMsg("");
+    try {
+      let npmAddr = npm;
+      if (dexId && !npmAddr) {
+        const selectedDex = (allDexes ?? []).find((d) => d.id === Number(dexId));
+        if (selectedDex) {
+          npmAddr = selectedDex.npm;
+        }
+      }
+
+      const r = await fetch("/api/liquidity-favorites", {
+        method: "POST",
+        headers: authHeaders({ "Content-Type": "application/json" }),
+        body: JSON.stringify({
+          chain_id: Number(chainId),
+          pool,
+          staker,
+          npm: npmAddr,
+        }),
+      });
+      const j = await r.json();
+      if (!j.ok) throw new Error(j.error || "收藏失败");
+      setFavMsg("✅ 已收藏");
+      reloadFav();
+    } catch (e: any) {
+      setFavMsg(`❌ ${e.message}`);
+    }
   }
 
-  const isAlreadyFav =
-    result &&
-    chainId &&
-    favList.some(
-      (f) =>
-        f.chain_id_ref === Number(chainId) &&
-        f.pool_addr.toLowerCase() === result.pool.toLowerCase()
-    );
+  /** 加载某条收藏到表单并立即探测。 */
+  function applyFavoriteAndProbe(f: Favorite) {
+    setChainId(String(f.chain_id_ref));
+    setPool(f.pool_addr || "");
+    setStaker(f.staker_addr || "");
+    setNpm(f.npm_addr || "");
 
-  // 根据 pairFlip 处理探针结果展示
-  const isResultFlipped = result?.pairFlip === 1;
-  const resBaseSym = result
-    ? isResultFlipped
+    let matchedDexId = "";
+    if (f.npm_addr) {
+      const favNpmLower = (f.npm_addr || "").toLowerCase();
+      const matchedDex = (allDexes ?? []).find(
+        (d) => (d.npm || "").toLowerCase() === favNpmLower
+      );
+      if (matchedDex) {
+        matchedDexId = String(matchedDex.id);
+      }
+    }
+    setDexId(matchedDexId);
+
+    setError("");
+    setResult(null);
+
+    let npmParam = f.npm_addr || "";
+    if (!npmParam && matchedDexId) {
+      const selectedDex = (allDexes ?? []).find((d) => d.id === Number(matchedDexId));
+      if (selectedDex) {
+        npmParam = selectedDex.npm;
+      }
+    }
+
+    probe(false, {
+      chainId: String(f.chain_id_ref),
+      pool: f.pool_addr,
+      staker: f.staker_addr || "",
+      npm: npmParam,
+      dexId: matchedDexId,
+    });
+  }
+
+  async function deleteFavorite(id: number) {
+    try {
+      await fetch(`/api/liquidity-favorites/${id}`, {
+        method: "DELETE",
+        headers: authHeaders(),
+      });
+      reloadFav();
+    } catch {
+      // ignore
+    }
+  }
+
+  /** 切换收藏池的快速扫描监控开关（monitor_cex） */
+  async function toggleFavoriteMonitor(f: Favorite) {
+    try {
+      await fetch(`/api/liquidity-favorites/${f.id}`, {
+        method: "PATCH",
+        headers: authHeaders({ "Content-Type": "application/json" }),
+        body: JSON.stringify({ monitor_cex: f.monitor_cex ? 0 : 1 }),
+      });
+      reloadFav();
+    } catch {
+      // ignore
+    }
+  }
+
+  // 探针结果：翻转后的展示计算
+  const displaySym0 = result
+    ? flip
       ? result.token1Symbol
       : result.token0Symbol
     : "";
-  const resQuoteSym = result
-    ? isResultFlipped
+  const displaySym1 = result
+    ? flip
       ? result.token0Symbol
       : result.token1Symbol
     : "";
-  const resPriceCurrent = result
-    ? isResultFlipped && Number(result.priceCurrent) > 0
-      ? 1 / Number(result.priceCurrent)
-      : Number(result.priceCurrent)
+  const displayPair = result
+    ? flip
+      ? `${result.token1Symbol}/${result.token0Symbol}`
+      : `${result.token0Symbol}/${result.token1Symbol}`
+    : "";
+  const displayPriceCurrent = result?.priceCurrent
+    ? fmtFull(flip ? 1 / Number(result.priceCurrent) : Number(result.priceCurrent))
+    : "";
+  const displayCexRate = result?.cex
+    ? flip
+      ? 1 / result.cex.cexRate
+      : result.cex.cexRate
     : 0;
-  const resPriceLow = result
-    ? isResultFlipped && Number(result.priceHigh) > 0
-      ? 1 / Number(result.priceHigh)
-      : Number(result.priceLow)
+  const displayToken0Cex = result?.cex
+    ? flip
+      ? result.cex.token1CexSymbol
+      : result.cex.token0CexSymbol
+    : "";
+  const displayToken1Cex = result?.cex
+    ? flip
+      ? result.cex.token0CexSymbol
+      : result.cex.token1CexSymbol
+    : "";
+  // CEX 单边报价（跟随翻转换侧）
+  const displayCexQuote0 = result?.cex
+    ? (flip ? result.cex.token1Price : result.cex.token0Price) ?? 0
     : 0;
-  const resPriceHigh = result
-    ? isResultFlipped && Number(result.priceLow) > 0
-      ? 1 / Number(result.priceLow)
-      : Number(result.priceHigh)
+  const displayCexQuote1 = result?.cex
+    ? (flip ? result.cex.token0Price : result.cex.token1Price) ?? 0
     : 0;
-  const resPrimaryAmt = result?.total
-    ? isResultFlipped
-      ? result.total.amount1
-      : result.total.amount0
-    : "0";
-  const resSecondaryAmt = result?.total
-    ? isResultFlipped
-      ? result.total.amount0
-      : result.total.amount1
-    : "0";
+  // 翻转后流动性 amount0/amount1 也要交换
+  const displayAmount0 = result?.liquidity
+    ? flip
+      ? result.liquidity.amount1
+      : result.liquidity.amount0
+    : "";
+  const displayAmount1 = result?.liquidity
+    ? flip
+      ? result.liquidity.amount0
+      : result.liquidity.amount1
+    : "";
+  // 翻转后价格区间取倒数并交换 low/high
+  const displayPriceLow = result?.priceLow
+    ? fmtFull(flip ? 1 / Number(result.priceHigh) : Number(result.priceLow))
+    : "";
+  const displayPriceHigh = result?.priceHigh
+    ? fmtFull(flip ? 1 / Number(result.priceLow) : Number(result.priceHigh))
+    : "";
 
   return (
-    <div className="space-y-3">
-      {/* 1. 收藏池快捷工作条（点击即探针 + 同步建仓池） */}
-      <div className="card p-3.5 space-y-2.5">
-        <div className="flex items-center justify-between gap-2">
-          <div className="flex items-center gap-2">
-            <span className="text-xs font-semibold uppercase tracking-wider text-ink-soft">
-              ★ 收藏池工作台
-            </span>
-            <span className="text-[11px] text-ink-muted">
-              (点选自动探测深度并载入建仓)
-            </span>
-          </div>
-          <div className="flex items-center gap-1.5">
-            <button
-              type="button"
-              onClick={() => setShowManualSearch((v) => !v)}
-              className={`btn-ghost btn-xs ${
-                showManualSearch
-                  ? "border-brand/40 text-brand-light bg-brand/10"
-                  : ""
-              }`}
-            >
-              {showManualSearch ? "收起手动查池" : "➕ 手动查池/加收藏"}
-            </button>
-          </div>
-        </div>
+    <div className="card p-5">
+      <div className="mb-3 flex flex-wrap items-center gap-2">
+        <h2 className="text-base font-semibold">🔬 最小区间流动性探针</h2>
+        <span className="text-xs text-ink-soft">
+          给定池子，算 fee→tickSpacing 最小窗口的流动性与价格区间
+        </span>
+        <button
+          className="ml-auto btn-primary text-xs"
+          onClick={() => setShowMint((v) => !v)}
+        >
+          {showMint ? "收起创建面板" : "＋ 直接创建仓位"}
+        </button>
+      </div>
 
-        {favList.length === 0 ? (
-          <div className="rounded-lg border border-dashed border-white/[0.1] p-3 text-xs text-ink-soft">
-            暂无收藏池。请点击右上角「➕ 手动查池/加收藏」查询一次池地址并点击「☆ 收藏此池」。
+      {/* 创建仓位面板：从收藏列表选择交易对后带入 */}
+      {showMint && (
+        <div className="mb-4">
+          <MintPositionPanel
+            key={`${mintChainId}-${mintPool}`}
+            chainId={mintChainId || Number(chainId) || 0}
+            pool={mintPool}
+            onClose={() => {
+              setShowMint(false);
+              setMintPool("");
+            }}
+            onCreated={() => {
+              mutate("/api/positions");
+            }}
+            onFlipChanged={() => {
+              reloadFav();
+              if (chainId && pool) probe(false);
+            }}
+          />
+        </div>
+      )}
+
+      <div className="flex flex-wrap items-end gap-2.5">
+        <label className="text-xs">
+          <div className="mb-1 text-ink-soft">链</div>
+          <select
+            className="input w-[140px]"
+            value={chainId}
+            onChange={(e) => {
+              setChainId(e.target.value);
+              setDexId(""); // 链变化时重置 DEX 选择
+            }}
+          >
+            <option value="">选择链</option>
+            {(chains ?? []).map((c) => (
+              <option key={c.id} value={c.id}>
+                {c.name}
+              </option>
+            ))}
+          </select>
+        </label>
+
+        <label className="text-xs">
+          <div className="mb-1 text-ink-soft">DEX 平台</div>
+          <select
+            className="input w-[160px]"
+            value={dexId}
+            onChange={(e) => setDexId(e.target.value)}
+            disabled={!chainId || availableDexes.length === 0}
+          >
+            <option value="">自动选择</option>
+            {availableDexes.map((d) => (
+              <option key={d.id} value={d.id}>
+                {d.name}
+              </option>
+            ))}
+          </select>
+        </label>
+
+        <label className="text-xs">
+          <div className="mb-1 text-ink-soft">池子地址</div>
+          <input
+            className="input w-[320px] font-mono"
+            value={pool}
+            onChange={(e) => setPool(e.target.value)}
+            placeholder="0x… pool 地址"
+          />
+        </label>
+
+        <label className="text-xs">
+          <div className="mb-1 text-ink-soft">质押/Vault（可选）</div>
+          <input
+            className="input w-[260px] font-mono"
+            value={staker}
+            onChange={(e) => setStaker(e.target.value)}
+            placeholder="填入则枚举 vault 同池 LP 聚合"
+          />
+        </label>
+
+        <button
+          className="btn-primary text-xs h-[32px]"
+          disabled={loading || !chainId || !pool}
+          onClick={() => probe(false)}
+        >
+          {loading ? "探测中…" : "探测"}
+        </button>
+        <button
+          className="btn-ghost text-xs h-[32px]"
+          disabled={!chainId || !pool}
+          onClick={saveFavorite}
+        >
+          ⭐ 收藏当前
+        </button>
+      </div>
+      {favMsg && <div className="mt-1.5 text-xs">{favMsg}</div>}
+
+      {/* 收藏列表 */}
+      {(favorites ?? []).length > 0 && (
+        <div className="mt-3.5">
+          <div className="mb-1.5 text-xs text-ink-soft">
+            {showMint
+              ? "收藏（点击带入上方创建仓位面板）"
+              : "收藏（点击一键查询最小区间流动性）"}
           </div>
-        ) : (
           <div className="flex flex-wrap gap-1.5">
-            {favList.map((f) => {
-              const flipped = f.pair_flip === 1;
-              const pairLabel =
-                f.token0_symbol && f.token1_symbol
-                  ? flipped
-                    ? `${f.token1_symbol}/${f.token0_symbol}`
-                    : `${f.token0_symbol}/${f.token1_symbol}`
-                  : f.label || short(f.pool_addr);
-              const feePct = f.fee ? `${(f.fee / 10000).toFixed(2)}%` : "";
-              const isSelected =
+            {(favorites ?? []).map((f) => {
+              const favNpmLower = (f.npm_addr || "").toLowerCase();
+              const matchedDex = favNpmLower
+                ? (allDexes ?? []).find(
+                    (d) => (d.npm || "").toLowerCase() === favNpmLower
+                  )
+                : undefined;
+              const dexName = matchedDex?.name || "自动选择";
+              const isFavFlipped = f.pair_flip === 1;
+              const hasPair = f.token0_symbol && f.token1_symbol;
+              const rawPair = hasPair
+                ? isFavFlipped
+                  ? `${f.token1_symbol}/${f.token0_symbol}`
+                  : `${f.token0_symbol}/${f.token1_symbol}`
+                : "";
+              const pairLabel = hasPair
+                ? `${rawPair} ${f.fee != null ? f.fee / 10000 + "%" : ""}`.trim()
+                : `${f.chain_name} · ${dexName} · ${short(f.pool_addr || "")}`;
+
+              const isSelectedForMint =
+                showMint &&
                 mintChainId === f.chain_id_ref &&
-                mintPool.toLowerCase() === f.pool_addr.toLowerCase();
+                (mintPool || "").toLowerCase() === (f.pool_addr || "").toLowerCase();
 
               return (
-                <div
+                <span
                   key={f.id}
-                  className={`group inline-flex items-center gap-1 rounded-lg border px-2 py-1 text-xs transition ${
-                    isSelected
-                      ? "border-brand bg-brand/15 text-ink shadow-glow-cyan"
-                      : "border-white/[0.08] bg-surface-raised/70 text-ink-soft hover:border-white/[0.18] hover:text-ink"
+                  className={`inline-flex items-center gap-1.5 rounded-lg border px-2.5 py-1 text-xs transition ${
+                    isSelectedForMint
+                      ? "border-cyan-400 bg-cyan-500/20 text-white"
+                      : f.monitor_cex
+                        ? "border-cyan-500/40 bg-cyan-500/10 text-ink"
+                        : "border-white/[0.12] bg-surface-raised text-ink"
                   }`}
                 >
                   <button
-                    type="button"
-                    className="flex items-center gap-1 text-left"
-                    onClick={() => applyFavoriteAndProbe(f)}
-                    title={`${f.chain_name} · ${f.pool_addr}\n点击探测最小区间流动性并加载至建仓面板`}
+                    className="font-medium hover:text-cyan-300 transition-colors"
+                    title={
+                      showMint
+                        ? `${f.chain_name} · ${dexName} · 点击带入创建仓位`
+                        : `${f.chain_name} · ${dexName} · ${f.pool_addr}${
+                            f.staker_addr ? " · " + f.staker_addr : ""
+                          }`
+                    }
+                    onClick={() => {
+                      if (showMint) {
+                        setMintPool(f.pool_addr);
+                        setMintChainId(f.chain_id_ref);
+                      } else {
+                        applyFavoriteAndProbe(f);
+                      }
+                    }}
                   >
-                    <span className="font-semibold text-ink">{pairLabel}</span>
-                    {flipped && (
+                    {f.label || pairLabel}
+                    {isFavFlipped && (
                       <span
-                        className="text-[10px] text-brand-light"
+                        className="ml-1 text-[10px] text-cyan-300"
                         title="已翻转计价"
                       >
                         ⇄
                       </span>
                     )}
-                    {feePct && (
-                      <span className="font-mono text-[10px] text-ink-muted">
-                        {feePct}
-                      </span>
-                    )}
-                    {f.label && f.token0_symbol && (
-                      <span className="rounded bg-brand/15 px-1 text-[10px] text-brand-light">
-                        {f.label}
-                      </span>
-                    )}
                   </button>
-
-                  <div className="ml-0.5 flex items-center gap-1 border-l border-white/[0.08] pl-1">
-                    <button
-                      type="button"
-                      onClick={() => toggleFavCexMonitor(f)}
-                      className={`rounded px-1 text-[10px] transition ${
-                        f.monitor_cex
-                          ? "bg-ok/20 text-ok font-medium"
-                          : "text-ink-muted hover:text-ink-soft"
-                      }`}
-                      title={
-                        f.monitor_cex
-                          ? "CEX 差价监控已开启（点击关闭）"
-                          : "开启该收藏池的 CEX 差价监控与推送"
-                      }
-                    >
-                      CEX
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => removeFavorite(f.id)}
-                      className="text-[10px] text-ink-muted opacity-60 hover:opacity-100 hover:text-danger"
-                      title="删除该收藏"
-                    >
-                      ✕
-                    </button>
-                  </div>
-                </div>
+                  <button
+                    className={`rounded px-1.5 py-0.5 text-[11px] font-medium transition ${
+                      f.monitor_cex
+                        ? "bg-amber-500/25 text-amber-200 border border-amber-500/40"
+                        : "bg-white/[0.08] text-ink-soft hover:bg-white/[0.15] hover:text-white"
+                    }`}
+                    title={
+                      f.monitor_cex
+                        ? "快速扫描监控：已开启（点击取消）"
+                        : "快速扫描监控：未开启（点击开启，池价与 CEX 差价过大时推送提醒）"
+                    }
+                    onClick={() => toggleFavoriteMonitor(f)}
+                  >
+                    {f.monitor_cex ? "已监控" : "监控"}
+                  </button>
+                  <button
+                    className="text-ink-muted hover:text-rose-400 transition-colors"
+                    title="删除收藏"
+                    onClick={() => deleteFavorite(f.id)}
+                  >
+                    ✕
+                  </button>
+                </span>
               );
             })}
           </div>
-        )}
-
-        {/* 手动查询/新增收藏折叠抽屉 */}
-        {showManualSearch && (
-          <div className="mt-2 rounded-lg border border-white/[0.08] bg-surface-raised/60 p-3 space-y-2">
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
-              <select
-                className="input text-xs"
-                value={chainId}
-                onChange={(e) => {
-                  setChainId(e.target.value ? Number(e.target.value) : "");
-                  setStakerAddr("");
-                }}
-              >
-                <option value="">选择链</option>
-                {(chains ?? [])
-                  .filter((c) => c.enabled)
-                  .map((c) => (
-                    <option key={c.id} value={c.id}>
-                      {c.name}
-                    </option>
-                  ))}
-              </select>
-
-              <input
-                className="input font-mono text-xs sm:col-span-2"
-                value={poolAddr}
-                onChange={(e) => setPoolAddr(e.target.value)}
-                placeholder="V3 池子合约地址 0x…"
-              />
-            </div>
-
-            <div className="flex flex-wrap items-center gap-2">
-              <select
-                className="input text-xs flex-1"
-                value={stakerAddr}
-                onChange={(e) => setStakerAddr(e.target.value)}
-              >
-                <option value="">可选：关联质押合约（统计质押池同窗口深度）</option>
-                {chainStaking.map((s) => (
-                  <option key={s.id} value={s.contract}>
-                    {s.platform} · {s.pair_label} ({short(s.contract)})
-                  </option>
-                ))}
-              </select>
-              <button
-                type="button"
-                className="btn-primary text-xs shrink-0"
-                disabled={loading || !chainId || !poolAddr.trim()}
-                onClick={() =>
-                  doQuery({
-                    chainId: Number(chainId),
-                    pool: poolAddr,
-                    staker: stakerAddr,
-                  })
-                }
-              >
-                {loading ? "探测中…" : "探测并载入"}
-              </button>
-            </div>
-          </div>
-        )}
-
-        {/* 2. 探针实时查询结果卡片 */}
-        {err && <div className="text-xs text-danger">❌ {err}</div>}
-
-        {result && (
-          <div className="rounded-xl border border-white/[0.08] bg-surface-raised/80 p-3 text-xs space-y-2">
-            <div className="flex flex-wrap items-center justify-between gap-2">
-              <div className="flex flex-wrap items-center gap-1.5">
-                <span className="text-sm font-bold text-ink">
-                  {resBaseSym} / {resQuoteSym}
-                </span>
-                <span className="tag-muted font-mono">
-                  {(result.fee / 10000).toFixed(2)}%
-                </span>
-                <button
-                  type="button"
-                  onClick={handleFlip}
-                  className={`btn-ghost btn-xs ${
-                    isResultFlipped
-                      ? "border-brand/40 text-brand-light bg-brand/10"
-                      : ""
-                  }`}
-                  title="翻转该交易对的主币/计价币方向（全局生效）"
-                >
-                  ⇄ 翻转
-                </button>
-                <button
-                  type="button"
-                  onClick={() =>
-                    doQuery({
-                      chainId: Number(chainId || mintChainId),
-                      pool: result.pool,
-                      staker: stakerAddr,
-                    })
-                  }
-                  disabled={loading}
-                  className="btn-ghost btn-xs"
-                >
-                  {loading ? "刷新中…" : "↻ 刷新探针"}
-                </button>
-              </div>
-
-              {/* 收藏操作 */}
-              {!isAlreadyFav ? (
-                <div className="flex items-center gap-1">
-                  <input
-                    className="input h-6 w-24 px-2 py-0.5 text-[11px]"
-                    value={favLabel}
-                    onChange={(e) => setFavLabel(e.target.value)}
-                    placeholder="备注(可选)"
-                  />
-                  <button
-                    type="button"
-                    className="btn-primary btn-xs"
-                    onClick={saveFavorite}
-                  >
-                    ☆ 收藏此池
-                  </button>
-                </div>
-              ) : (
-                <span className="text-[11px] text-ok">★ 已收藏</span>
-              )}
-            </div>
-
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 pt-1 border-t border-white/[0.06]">
-              <div>
-                <div className="text-[11px] text-ink-muted">
-                  当前池价 (Tick {result.currentTick})
-                </div>
-                <div className="font-mono text-sm font-semibold text-brand-light">
-                  1 {resBaseSym} = {fmtFull(resPriceCurrent)} {resQuoteSym}
-                </div>
-              </div>
-              <div>
-                <div className="text-[11px] text-ink-muted">
-                  最小区间 [{result.tickLower}, {result.tickUpper}] 全池深度
-                </div>
-                <div className="font-mono text-ink font-medium">
-                  {fmtAmt(resPrimaryAmt)} {resBaseSym}{" "}
-                  <span className="text-ink-muted">+</span>{" "}
-                  {fmtAmt(resSecondaryAmt)} {resQuoteSym}
-                </div>
-              </div>
-            </div>
-
-            {result.staked && (
-              <div className="rounded border border-white/[0.05] bg-surface/60 px-2.5 py-1.5 text-[11px] flex flex-wrap items-center justify-between gap-1">
-                <span className="text-ink-soft">
-                  🌾 质押池同窗口 ({result.staked.positionCount} 个仓位):
-                </span>
-                <span className="font-mono text-ink">
-                  {fmtAmt(
-                    isResultFlipped
-                      ? result.staked.amount1
-                      : result.staked.amount0
-                  )}{" "}
-                  {resBaseSym} +{" "}
-                  {fmtAmt(
-                    isResultFlipped
-                      ? result.staked.amount0
-                      : result.staked.amount1
-                  )}{" "}
-                  {resQuoteSym}
-                </span>
-              </div>
-            )}
-
-            <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] text-ink-soft font-mono">
-              <span>
-                区间价格: {fmtFull(resPriceLow)} ~ {fmtFull(resPriceHigh)}{" "}
-                {resQuoteSym}
-              </span>
-              <span>池 {short(result.pool)}</span>
-            </div>
-
-            {/* CEX 对比（如有） */}
-            {result.cex &&
-              (() => {
-                const c = result.cex;
-                const diffPct = ((c.absDiff ?? Math.abs(c.diff ?? 0)) * 100).toFixed(2);
-                const sign = (c.diff ?? 0) >= 0 ? "+" : "-";
-                const cexDisplay =
-                  isResultFlipped && c.cexRate > 0 ? 1 / c.cexRate : c.cexRate;
-                return (
-                  <div
-                    className={`rounded-lg border px-2.5 py-1.5 text-[11px] flex flex-wrap items-center justify-between gap-2 ${
-                      c.exceedsThreshold
-                        ? "border-warn/40 bg-warn/10 text-warn"
-                        : "border-ok/30 bg-ok/10 text-ok"
-                    }`}
-                  >
-                    <span>
-                      📊 币安参考: 1 {resBaseSym} ={" "}
-                      <strong className="font-mono">
-                        {fmtFull(cexDisplay)}
-                      </strong>{" "}
-                      {resQuoteSym}
-                    </span>
-                    <span className="font-mono font-semibold">
-                      偏差 {sign}
-                      {diffPct}%{" "}
-                      {c.exceedsThreshold ? "⚠️ 超阈值" : "(正常)"}
-                    </span>
-                  </div>
-                );
-              })()}
-          </div>
-        )}
-      </div>
-
-      {/* 3. 常驻极速建仓 & 自动质押面板（与上方收藏池无缝联动） */}
-      {showMint && mintChainId > 0 && mintPool ? (
-        <MintPositionPanel
-          chainId={mintChainId}
-          pool={mintPool}
-          onCreated={() => {
-            mutate("/api/positions");
-          }}
-          onFlipChanged={() => {
-            if (mintChainId && mintPool) {
-              doQuery({
-                chainId: mintChainId,
-                pool: mintPool,
-                staker: stakerAddr,
-              });
-            }
-          }}
-        />
-      ) : (
-        <div className="card p-3.5 flex items-center justify-between text-xs text-ink-soft">
-          <span>点选上方任意收藏池即可展开「极速建仓 & 自动质押」面板</span>
-          {favList.length > 0 && (
-            <button
-              type="button"
-              className="btn-primary btn-xs"
-              onClick={() => applyFavoriteAndProbe(favList[0])}
-            >
-              载入默认收藏池
-            </button>
-          )}
         </div>
       )}
+
+      {error && <div className="mt-2.5 text-xs text-warn">❌ {error}</div>}
+
+      {result && (
+        <div className="mt-3.5 panel-inset p-3.5 text-xs">
+          <div className="mb-2 flex items-center gap-2">
+            <span className="text-sm font-semibold text-ink">{displayPair}</span>
+            <span className="tag-muted">{result.fee / 10000}%</span>
+            <span className="tag-muted">ts {result.tickSpacing}</span>
+            {flip && (
+              <span
+                className="tag-info"
+                title="交易对已翻转"
+              >
+                翻转
+              </span>
+            )}
+          </div>
+          <div className="space-y-1">
+            <PRow label="当前 tick / 窗口">
+              <span className="font-mono">
+                {result.currentTick} [{result.tickLower}, {result.tickUpper}]
+              </span>
+            </PRow>
+            <PRow label="窗口流动性">
+              <span className="font-mono font-medium">
+                {displayAmount0} {displaySym0} / {displayAmount1} {displaySym1}
+              </span>
+            </PRow>
+            <PRow label="当前价格">
+              <span className="font-mono">
+                1 {displaySym0} ≈ {displayPriceCurrent} {displaySym1}
+              </span>
+            </PRow>
+            <PRow label="价格区间">
+              <span className="font-mono">
+                {displayPriceLow} ~ {displayPriceHigh} {displaySym1}/{displaySym0}
+              </span>
+            </PRow>
+            {result.cex && displayToken0Cex && displayToken1Cex && (
+              <PRow label={`CEX 汇率 (${displayToken0Cex}÷${displayToken1Cex})`}>
+                <span className="font-mono">
+                  1 {displaySym0} = {fmtFull(displayCexRate)} {displaySym1}
+                </span>
+              </PRow>
+            )}
+            {result.cex && displayCexQuote0 > 0 && displayCexQuote1 > 0 && (
+              <PRow label={`CEX 报价比值 (${displayToken0Cex}/${displayToken1Cex})`}>
+                <span className="font-mono">
+                  {fmtFull(displayCexQuote0)} / {fmtFull(displayCexQuote1)} ={" "}
+                  <span className="font-semibold">{fmtFull(displayCexRate)}</span>
+                </span>
+              </PRow>
+            )}
+            {result.cex && (
+              <PRow label="CEX差价">
+                <span
+                  className={
+                    result.cex.absDiff >= 0.01
+                      ? "text-warn font-semibold font-mono"
+                      : "font-mono text-ok"
+                  }
+                >
+                  {pctSigned(result.cex.diff)}
+                </span>
+              </PRow>
+            )}
+            <PRow label="采样时间">
+              {new Date(result.sampledAt).toLocaleString()}
+            </PRow>
+          </div>
+
+          {/* 当前 tick 在最小窗口内的位置 */}
+          <div className="mt-2.5">
+            <div className="relative h-2 w-full rounded bg-white/[0.1]">
+              <div
+                className="absolute top-1/2 h-3.5 w-1.5 -translate-y-1/2 rounded bg-cyan-400 shadow-[0_0_8px_rgba(34,211,238,0.8)]"
+                style={{
+                  left: `${Math.min(
+                    Math.max(
+                      ((result.currentTick - result.tickLower) /
+                        Math.max(result.tickUpper - result.tickLower, 1)) *
+                        100,
+                      0
+                    ),
+                    100
+                  )}%`,
+                }}
+              />
+            </div>
+          </div>
+
+          <div className="mt-2.5 flex flex-wrap gap-2">
+            <button className="btn-ghost text-xs" onClick={() => probe(true)}>
+              重新探测
+            </button>
+            <button
+              className="btn-ghost text-xs"
+              onClick={handleFlip}
+              disabled={flipLoading}
+            >
+              {flipLoading ? "翻转中…" : flip ? "🔄 取消翻转" : "🔄 翻转交易对"}
+            </button>
+            {pool && chainId && (
+              <button
+                className="btn-secondary text-xs"
+                onClick={() => {
+                  setMintChainId(Number(chainId));
+                  setMintPool(pool);
+                  setShowMint(true);
+                }}
+              >
+                ＋ 用此池创建仓位
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function PRow({
+  label,
+  children,
+}: {
+  label: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <div className="flex justify-between gap-2 py-0.5">
+      <span className="text-ink-soft">{label}</span>
+      <span className="text-right break-all text-ink">{children}</span>
     </div>
   );
 }

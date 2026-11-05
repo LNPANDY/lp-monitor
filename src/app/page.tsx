@@ -1,565 +1,322 @@
 "use client";
-import { useState, useEffect, useMemo } from "react";
-import useSWR, { mutate as globalMutate } from "swr";
+import { useState, useEffect, useRef } from "react";
+import useSWR, { mutate } from "swr";
 import { fetcher, authHeaders, short, timeAgo, fmtFull } from "@/components/util";
+import { SwapQuoteSection } from "@/components/swap-quote-section";
+import { useWallet } from "@/lib/wallet/use-wallet";
 import { LiquidityButton } from "@/components/liquidity-button";
 import { LiquidityProbe } from "@/components/liquidity-probe";
-import { SwapQuoteSection } from "@/components/swap-quote-section";
 import { RemovePositionButton } from "@/components/remove-position-button";
-import { toast } from "@/components/toast";
+import { Field } from "@/components/form";
+
+/** 推送冷却可选值（分钟） */
+const COOLDOWN_OPTIONS = [0, 2, 5, 10, 20, 30, 60];
+
+/** 将常见的 cron 表达式转为人类可读标签 */
+function cronToLabel(cron: string): string {
+  const m = cron.trim();
+  const sixStarSlash = m.match(/^\*\/(\d+)\s+\*\s+\*\s+\*\s+\*\s+\*$/);
+  if (sixStarSlash) {
+    const n = Number(sixStarSlash[1]);
+    if (n < 60) return `${n} 秒`;
+    if (n % 60 === 0)
+      return n % 3600 === 0 ? `${n / 3600} 小时` : `${n / 60} 分钟`;
+    return `${n} 秒`;
+  }
+  const starSlash = m.match(/^\*\/(\d+)\s+\*\s+\*\s+\*\s+\*$/);
+  if (starSlash) {
+    const n = Number(starSlash[1]);
+    if (n >= 60) return `${Math.round(n / 60)} 小时`;
+    return `${n} 分钟`;
+  }
+  if (m === "0 * * * *") return "1 小时";
+  return m;
+}
 
 interface Position {
   id: number;
-  chain_id_ref: number;
-  chain_id: number;
-  chain_name: string;
-  explorer_url: string;
-  dex_id: number | null;
   dex_name: string;
   dex_display_name?: string;
-  wallet_address: string;
-  wallet_label: string;
-  pool: string;
+  dex_id?: number;
   token_id: string;
   token0: string;
   token1: string;
-  token0_symbol: string;
-  token1_symbol: string;
-  pair_flip: number;
-  cex_alert_muted: number;
+  token0_symbol?: string;
+  token1_symbol?: string;
   fee: number;
+  pool: string;
   tick_lower: number;
   tick_upper: number;
-  last_tick: number;
-  last_liquidity: string;
+  last_current_tick: number;
   last_in_range: number;
+  last_price0: string;
+  last_checked_at: string;
+  notify_state: string;
   source: string;
   staker_contract: string;
-  notify_state: string;
-  last_checked_at: string;
-  price_lower?: string;
-  price_upper?: string;
-  price_current?: string;
-  cex_price?: string;
-  dex_price?: string;
-  cex_diff_ratio?: number;
-  cex_quote?: string;
+  chain_id_ref: number;
+  chain_name: string;
+  chain_key: string;
+  chain_id: number;
+  explorer_url: string;
+  wallet_label: string;
+  wallet_address: string;
+  last_alert_type?: string;
+  last_cex_price?: string;
+  pair_flip?: number;
+  cex_alert_muted?: number;
 }
 
-interface AlertSettings {
-  tick_move_enabled: boolean;
-  tick_move_threshold: number;
-  cex_price_enabled: boolean;
-  push_cooldown_minutes: number;
-  cooldown_cex: number;
-  cooldown_range_state: number;
-  cooldown_tick_move: number;
+interface MonitorState {
+  combinedRunning: boolean;
+  fullRunning: boolean;
+  combinedCron: string;
+  fullCron: string;
+  lastCombined: any;
+  lastFull: any;
 }
-
-type WorkbenchTab = "mint" | "swap" | "portfolio" | "all";
-type PosFilter = "active" | "out" | "in" | "staked" | "closed";
 
 export default function DashboardPage() {
-  const { data: positions, mutate } = useSWR<Position[]>(
+  const { data: positions, mutate: reloadPos } = useSWR<Position[]>(
+    "/api/positions",
+    fetcher,
+    { refreshInterval: 60_000 }
+  );
+  const { data: closedPositions } = useSWR<Position[]>(
     "/api/positions?all=1",
     fetcher,
-    { refreshInterval: 30_000 }
+    { refreshInterval: 60_000 }
   );
-  const { data: status, mutate: mStatus } = useSWR<any>(
+  const { data: mon, mutate: reloadMon } = useSWR<MonitorState>(
     "/api/monitor",
     fetcher,
-    { refreshInterval: 15_000 }
+    { refreshInterval: 10_000 }
   );
-  const { data: alertSettings, mutate: mAlertSettings } = useSWR<AlertSettings>(
-    "/api/alert-settings",
-    fetcher,
-    { refreshInterval: 30_000 }
+
+  const list = positions ?? [];
+  const outOfRange = list.filter((p) => p.last_in_range === 0);
+  const closed = (closedPositions ?? []).filter(
+    (p) => p.notify_state === "closed"
   );
-  const [scanning, setScanning] = useState(false);
+  const [showClosed, setShowClosed] = useState(false);
 
-  // 左侧仓位矩阵筛选状态
-  const [posFilter, setPosFilter] = useState<PosFilter>("active");
-  const [chainFilter, setChainFilter] = useState<string>("all");
-  const [searchQuery, setSearchQuery] = useState<string>("");
-
-  // 右侧工作台标签状态（支持单面板切换或「全部同屏展开」）
-  const [workbenchTab, setWorkbenchTab] = useState<WorkbenchTab>("mint");
-  // 当从左侧点击「撤池重开」或「载入建仓台」时传给右侧 LiquidityProbe & MintPositionPanel
+  // 从仓位卡片触发「撤池并重开」时，同步传给探针内的创建仓位面板并滚动过去
   const [externalPool, setExternalPool] = useState<{
     chainId: number;
     pool: string;
     ts: number;
   } | null>(null);
+  const probeRef = useRef<HTMLDivElement | null>(null);
 
-  useEffect(() => {
-    try {
-      const saved = localStorage.getItem(
-        "lp_workbench_tab"
-      ) as WorkbenchTab | null;
-      if (saved && ["mint", "swap", "portfolio", "all"].includes(saved)) {
-        setWorkbenchTab(saved);
-      }
-    } catch {}
-  }, []);
-
-  function switchWorkbenchTab(t: WorkbenchTab) {
-    setWorkbenchTab(t);
-    try {
-      localStorage.setItem("lp_workbench_tab", t);
-    } catch {}
+  function handleReopenPool(chainId: number, pool: string) {
+    setExternalPool({ chainId, pool, ts: Date.now() });
+    probeRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
   }
 
-  function handleLoadPoolToWorkbench(chainIdRef: number, poolAddr: string) {
-    setExternalPool({ chainId: chainIdRef, pool: poolAddr, ts: Date.now() });
-    if (workbenchTab !== "mint" && workbenchTab !== "all") {
-      switchWorkbenchTab("mint");
-    }
-    toast.info(`已将池 ${short(poolAddr)} 载入右侧建仓工作台`);
-  }
-
-  async function triggerScan(mode: "combined" | "deep" = "combined") {
-    setScanning(true);
-    try {
-      const r = await fetch("/api/monitor", {
-        method: "POST",
-        headers: authHeaders({ "Content-Type": "application/json" }),
-        body: JSON.stringify({ mode }),
-      });
-      const j = await r.json();
-      await Promise.all([mutate(), mStatus()]);
-      if (j.ok) {
-        toast.success(mode === "deep" ? "深度全量发现完成" : "快速扫描完成");
-      } else {
-        toast.warn(j.error || "扫描任务进行中");
-      }
-    } catch (e: any) {
-      toast.error(e.message || "扫描失败");
-    } finally {
-      setScanning(false);
-    }
-  }
-
-  async function updateScanCron(cron: string) {
-    await fetch("/api/monitor", {
-      method: "PUT",
+  async function triggerScanDeep() {
+    const r = await fetch("/api/monitor", {
+      method: "POST",
       headers: authHeaders({ "Content-Type": "application/json" }),
-      body: JSON.stringify({ cron }),
+      body: JSON.stringify({ mode: "deep" }),
     });
-    await mStatus();
-    toast.info(`自动扫描周期已更新`);
+    const j = await r.json();
+    if (!j.ok) alert(j.error);
+    reloadPos();
+    reloadMon();
+    setTimeout(() => {
+      reloadPos();
+      reloadMon();
+    }, 8_000);
+    setTimeout(() => {
+      reloadPos();
+      reloadMon();
+    }, 30_000);
+    setTimeout(() => {
+      reloadPos();
+      reloadMon();
+    }, 90_000);
   }
 
-  async function updateAlertSettings(patch: Record<string, any>) {
-    await fetch("/api/alert-settings", {
-      method: "PUT",
+  async function triggerScanCombined() {
+    const r = await fetch("/api/monitor", {
+      method: "POST",
       headers: authHeaders({ "Content-Type": "application/json" }),
-      body: JSON.stringify(patch),
+      body: JSON.stringify({ mode: "combined" }),
     });
-    await mAlertSettings();
+    const j = await r.json();
+    if (!j.ok) alert(j.error);
+    reloadPos();
+    reloadMon();
+    setTimeout(() => {
+      reloadPos();
+      reloadMon();
+    }, 5_000);
+    setTimeout(() => {
+      reloadPos();
+      reloadMon();
+    }, 15_000);
   }
-
-  const allList = positions ?? [];
-  const active = useMemo(
-    () =>
-      allList.filter(
-        (p) =>
-          p.notify_state !== "closed" &&
-          p.last_liquidity !== "0" &&
-          p.last_liquidity !== ""
-      ),
-    [allList]
-  );
-  const closed = useMemo(
-    () =>
-      allList.filter(
-        (p) =>
-          p.notify_state === "closed" ||
-          p.last_liquidity === "0" ||
-          p.last_liquidity === ""
-      ),
-    [allList]
-  );
-  const outOfRange = useMemo(
-    () => active.filter((p) => p.last_in_range === 0),
-    [active]
-  );
-  const inRange = useMemo(
-    () => active.filter((p) => p.last_in_range === 1),
-    [active]
-  );
-  const stakedPositions = useMemo(
-    () => active.filter((p) => p.source === "staking" || !!p.staker_contract),
-    [active]
-  );
-
-  const uniqueChains = useMemo(() => {
-    const map = new Map<string, string>();
-    for (const p of allList) {
-      if (p.chain_name) map.set(p.chain_name, p.chain_name);
-    }
-    return Array.from(map.keys());
-  }, [allList]);
-
-  // 过滤与排序后的展示列表（越界告警永远优先置顶）
-  const filteredPositions = useMemo(() => {
-    let base: Position[] = [];
-    if (posFilter === "active") {
-      base = [...outOfRange, ...inRange];
-    } else if (posFilter === "out") {
-      base = outOfRange;
-    } else if (posFilter === "in") {
-      base = inRange;
-    } else if (posFilter === "staked") {
-      base = stakedPositions;
-    } else {
-      base = closed;
-    }
-
-    if (chainFilter !== "all") {
-      base = base.filter((p) => p.chain_name === chainFilter);
-    }
-
-    const q = searchQuery.trim().toLowerCase();
-    if (q) {
-      base = base.filter(
-        (p) =>
-          p.token_id.toLowerCase().includes(q) ||
-          (p.token0_symbol || "").toLowerCase().includes(q) ||
-          (p.token1_symbol || "").toLowerCase().includes(q) ||
-          (p.pool || "").toLowerCase().includes(q) ||
-          (p.dex_name || "").toLowerCase().includes(q) ||
-          (p.wallet_label || "").toLowerCase().includes(q)
-      );
-    }
-    return base;
-  }, [
-    posFilter,
-    outOfRange,
-    inRange,
-    stakedPositions,
-    closed,
-    chainFilter,
-    searchQuery,
-  ]);
-
-  const isRunning = scanning || status?.combinedRunning || status?.fullRunning;
 
   return (
-    <div className="space-y-4">
-      {/* ============ 顶部紧凑型全局控制台 ============ */}
-      <div className="card px-3.5 py-2.5 flex flex-wrap items-center justify-between gap-3">
-        {/* 左侧：实时核心指标 + 扫描触发器 */}
-        <div className="flex flex-wrap items-center gap-2">
-          {/* 指标胶囊 */}
-          <div className="flex items-center gap-1.5 rounded-lg border border-white/[0.07] bg-surface-raised/70 px-2.5 py-1 text-xs">
-            <span className="text-ink-soft">监控中</span>
-            <span className="font-mono font-bold text-ink">{active.length}</span>
-            <span className="text-white/15">|</span>
-            <span className="text-ink-soft">越界</span>
-            <span
-              className={`font-mono font-bold ${
-                outOfRange.length > 0 ? "text-danger" : "text-ok"
-              }`}
-            >
-              {outOfRange.length}
-            </span>
-            <span className="text-white/15">|</span>
-            <span className="text-ink-soft">质押</span>
-            <span className="font-mono font-bold text-brand-light">
-              {stakedPositions.length}
-            </span>
+    <div className="space-y-5">
+      {/* 顶部状态条 */}
+      <div className="card flex flex-wrap items-center justify-between gap-3 p-4">
+        <div className="flex items-center gap-5">
+          <Stat label="监控仓位" value={list.length} />
+          <Stat
+            label="越界"
+            value={outOfRange.length}
+            danger={outOfRange.length > 0}
+          />
+          <div className="text-sm text-ink-soft space-y-0.5">
+            <div>
+              合并：
+              <span className="text-ink font-medium">
+                {mon?.combinedCron ? cronToLabel(mon.combinedCron) : "—"}
+              </span>
+              {mon?.combinedRunning
+                ? " (扫描中)"
+                : ` · 上次 ${timeAgo(mon?.lastCombined?.startedAt)}`}
+            </div>
+            <div>
+              深度：
+              {mon?.fullRunning
+                ? "扫描中…"
+                : `上次 ${timeAgo(mon?.lastFull?.at)}`}
+            </div>
           </div>
-
-          <button
-            type="button"
-            className="btn-primary btn-xs py-1.5 px-2.5"
-            onClick={() => triggerScan("combined")}
-            disabled={isRunning}
-            title="快速增量发现新仓位并扫描所有活跃仓位最新 Tick 与 CEX 差价"
-          >
-            {isRunning ? "⟳ 扫描中…" : "⚡ 快速扫描"}
-          </button>
-
-          <button
-            type="button"
-            className="btn-ghost btn-xs py-1.5"
-            onClick={() => triggerScan("deep")}
-            disabled={isRunning}
-            title="全量深度回溯链上历史事件，发现早期鑄造或质押的仓位"
-          >
-            🔍 深度发现
-          </button>
-
-          <div className="flex items-center gap-1 text-xs text-ink-soft">
-            <span>轮询</span>
-            <select
-              className="input h-7 w-24 px-1.5 py-0 text-xs font-mono"
-              value={status?.combinedCron ?? "* * * * *"}
-              onChange={(e) => updateScanCron(e.target.value)}
-            >
-              <option value="*/30 * * * * *">30秒</option>
-              <option value="* * * * *">1分钟</option>
-              <option value="*/2 * * * *">2分钟</option>
-              <option value="*/5 * * * *">5分钟</option>
-              <option value="*/10 * * * *">10分钟</option>
-            </select>
-          </div>
-
-          {status?.lastCombined?.at && (
-            <span className="text-[11px] text-ink-muted hidden xl:inline">
-              上次 {timeAgo(status.lastCombined.at)}
-            </span>
-          )}
         </div>
-
-        {/* 右侧：预警开关 & 冷却时间（已按要求移除「区间波动冷却」下拉框，tick_move 无冷却） */}
-        <div className="flex flex-wrap items-center gap-2 text-xs">
-          {/* 区间内 Tick 波动预警 */}
-          <div className="flex items-center gap-1.5 rounded-lg border border-white/[0.07] bg-surface-raised/50 px-2 py-1">
-            <label className="flex items-center gap-1 text-ink-soft cursor-pointer">
-              <input
-                type="checkbox"
-                checked={alertSettings?.tick_move_enabled ?? false}
-                onChange={(e) =>
-                  updateAlertSettings({
-                    tick_move_enabled: e.target.checked ? "1" : "0",
-                  })
-                }
-              />
-              <span>Tick波动推送</span>
-            </label>
-            <select
-              className="input h-6 w-20 px-1 py-0 text-[11px] font-mono"
-              value={alertSettings?.tick_move_threshold ?? 1}
-              disabled={!alertSettings?.tick_move_enabled}
-              onChange={(e) =>
-                updateAlertSettings({
-                  tick_move_threshold: Number(e.target.value),
-                })
-              }
-            >
-              <option value={0}>任意变动</option>
-              <option value={1}>≥1 tick</option>
-              <option value={2}>≥2 ticks</option>
-              <option value={5}>≥5 ticks</option>
-              <option value={10}>≥10 ticks</option>
-            </select>
-          </div>
-
-          {/* CEX 差价推送总开关 */}
-          <label className="flex items-center gap-1.5 rounded-lg border border-white/[0.07] bg-surface-raised/50 px-2.5 py-1 text-ink-soft cursor-pointer">
-            <input
-              type="checkbox"
-              checked={alertSettings?.cex_price_enabled ?? true}
-              onChange={(e) =>
-                updateAlertSettings({
-                  cex_price_enabled: e.target.checked ? "1" : "0",
-                })
-              }
-            />
-            <span>CEX差价推送</span>
-          </label>
-
-          {/* 冷却设置（仅保留 CEX价差 与 区间越界状态，区间波动无冷却） */}
-          <div className="flex items-center gap-1.5 rounded-lg border border-white/[0.07] bg-surface-raised/50 px-2 py-1 text-[11px] text-ink-soft">
-            <span>冷却:</span>
-            <span>CEX</span>
-            <select
-              className="input h-6 w-16 px-1 py-0 text-[11px] font-mono"
-              value={alertSettings?.cooldown_cex ?? 5}
-              onChange={(e) =>
-                updateAlertSettings({ cooldown_cex: Number(e.target.value) })
-              }
-            >
-              {[1, 2, 3, 5, 10, 15, 30, 60].map((m) => (
-                <option key={m} value={m}>
-                  {m}m
-                </option>
-              ))}
-            </select>
-            <span>越界</span>
-            <select
-              className="input h-6 w-16 px-1 py-0 text-[11px] font-mono"
-              value={alertSettings?.cooldown_range_state ?? 5}
-              onChange={(e) =>
-                updateAlertSettings({
-                  cooldown_range_state: Number(e.target.value),
-                })
-              }
-            >
-              {[1, 2, 3, 5, 10, 15, 30, 60].map((m) => (
-                <option key={m} value={m}>
-                  {m}m
-                </option>
-              ))}
-            </select>
-          </div>
+        <div className="flex items-center gap-2">
+          <button className="btn-primary" onClick={triggerScanCombined}>
+            立即扫描
+          </button>
+          <button className="btn-secondary" onClick={triggerScanDeep}>
+            完整扫描
+          </button>
         </div>
       </div>
 
-      {/* ============ 主工作区：左 7 列仓位监控矩阵 + 右 5 列一站式操作台 ============ */}
-      <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 items-start">
-        {/* ────── 左侧 7 列：LP 仓位实时监控与一键撤池矩阵 ────── */}
-        <div className="lg:col-span-7 space-y-3">
-          {/* 仓位筛选与搜索栏 */}
-          <div className="card p-2.5 flex flex-wrap items-center justify-between gap-2">
-            <div className="flex flex-wrap items-center gap-1">
-              {(
-                [
-                  {
-                    key: "active" as PosFilter,
-                    label: "全部活跃",
-                    count: active.length,
-                    badgeClass: "text-ink",
-                  },
-                  {
-                    key: "out" as PosFilter,
-                    label: "🚨 越界告警",
-                    count: outOfRange.length,
-                    badgeClass:
-                      outOfRange.length > 0
-                        ? "text-danger font-bold"
-                        : "text-ink-soft",
-                  },
-                  {
-                    key: "in" as PosFilter,
-                    label: "✅ 区间内",
-                    count: inRange.length,
-                    badgeClass: "text-ok",
-                  },
-                  {
-                    key: "staked" as PosFilter,
-                    label: "🌾 质押中",
-                    count: stakedPositions.length,
-                    badgeClass: "text-brand-light",
-                  },
-                  {
-                    key: "closed" as PosFilter,
-                    label: "已归档",
-                    count: closed.length,
-                    badgeClass: "text-ink-muted",
-                  },
-                ] as const
-              ).map((tab) => {
-                const activeTab = posFilter === tab.key;
-                return (
-                  <button
-                    key={tab.key}
-                    type="button"
-                    onClick={() => setPosFilter(tab.key)}
-                    className={`rounded-lg px-2.5 py-1 text-xs font-medium transition flex items-center gap-1.5 ${
-                      activeTab
-                        ? "bg-brand/20 text-brand-light border border-brand/40 shadow-glow-cyan"
-                        : "text-ink-soft hover:bg-white/[0.04] hover:text-ink border border-transparent"
-                    }`}
-                  >
-                    <span>{tab.label}</span>
-                    <span className={`font-mono text-[11px] ${tab.badgeClass}`}>
-                      {tab.count}
-                    </span>
-                  </button>
-                );
-              })}
-            </div>
+      {/* 扫描频率和告警阈值设置 */}
+      <ScanIntervalAndAlerts
+        combinedCron={mon?.combinedCron ?? ""}
+        onChanged={() => reloadMon()}
+      />
 
-            <div className="flex items-center gap-1.5 flex-1 sm:flex-initial justify-end">
-              {uniqueChains.length > 1 && (
-                <select
-                  className="input h-7 w-28 px-2 py-0 text-xs"
-                  value={chainFilter}
-                  onChange={(e) => setChainFilter(e.target.value)}
-                >
-                  <option value="all">全部链</option>
-                  {uniqueChains.map((c) => (
-                    <option key={c} value={c}>
-                      {c}
-                    </option>
-                  ))}
-                </select>
-              )}
-              <input
-                className="input h-7 w-36 sm:w-44 px-2.5 py-0 text-xs"
-                value={searchQuery}
-                onChange={(e) => setSearchQuery(e.target.value)}
-                placeholder="搜币种 / #ID / 池…"
+      {/* 链上资产统计 */}
+      <PortfolioSection />
+
+      {/* 代币兑换报价（QuoterV2） */}
+      <SwapQuoteSection />
+
+      {/* 最小区间流动性探针 + 收藏 + 创建仓位 */}
+      <div ref={probeRef}>
+        <LiquidityProbe externalPool={externalPool} />
+      </div>
+
+      {/* 越界告警区（如有） */}
+      {outOfRange.length > 0 && (
+        <section>
+          <h2 className="mb-2.5 flex items-center gap-2 text-base font-semibold text-warn">
+            ⚠️ 越界仓位（{outOfRange.length}）
+          </h2>
+          <div className="grid grid-cols-1 gap-3.5 md:grid-cols-2 lg:grid-cols-3">
+            {outOfRange.map((p) => (
+              <PositionCard
+                key={p.id}
+                p={p}
+                highlight
+                onFlipped={reloadPos}
+                onReopenPool={handleReopenPool}
               />
-            </div>
+            ))}
           </div>
+        </section>
+      )}
 
-          {/* 仓位卡片列表 */}
-          {filteredPositions.length === 0 ? (
-            <div className="card p-8 text-center space-y-2">
-              <div className="text-sm font-medium text-ink">
-                {active.length === 0
-                  ? "当前暂无活跃 LP 仓位"
-                  : "当前筛选条件下没有匹配的仓位"}
-              </div>
-              <p className="text-xs text-ink-soft">
-                您可以在右侧「★ 收藏池工作台」点选任意池子一键建仓+质押，或点击上方「🔍 深度发现」同步链上已有仓位。
-              </p>
-            </div>
-          ) : (
-            <div className="space-y-2.5">
-              {filteredPositions.map((p) => (
+      {/* 全部仓位 */}
+      <section>
+        <h2 className="mb-2.5 text-base font-semibold">
+          全部仓位（{list.length}）
+        </h2>
+        {list.length === 0 ? (
+          <EmptyHint />
+        ) : (
+          <div className="grid grid-cols-1 gap-3.5 md:grid-cols-2 lg:grid-cols-3">
+            {list.map((p) => (
+              <PositionCard
+                key={p.id}
+                p={p}
+                onFlipped={reloadPos}
+                onReopenPool={handleReopenPool}
+              />
+            ))}
+          </div>
+        )}
+      </section>
+
+      {/* 已平仓仓位（折叠） */}
+      {closed.length > 0 && (
+        <section>
+          <button
+            className="mb-2 flex items-center gap-2 text-sm font-medium text-ink-soft hover:text-ink"
+            onClick={() => setShowClosed(!showClosed)}
+          >
+            <span
+              className={`transition-transform ${
+                showClosed ? "rotate-90" : ""
+              }`}
+            >
+              ▶
+            </span>
+            已平仓仓位（{closed.length}）
+          </button>
+          {showClosed && (
+            <div className="grid grid-cols-1 gap-3.5 md:grid-cols-2 lg:grid-cols-3 opacity-70">
+              {closed.map((p) => (
                 <PositionCard
                   key={p.id}
                   p={p}
-                  onMutate={() => mutate()}
-                  onReopenPool={handleLoadPoolToWorkbench}
+                  closed
+                  onFlipped={reloadPos}
                 />
               ))}
             </div>
           )}
-        </div>
+        </section>
+      )}
 
-        {/* ────── 右侧 5 列：常驻粘性工作台（探针 + 建仓质押 + 兑换 + 资产统计） ────── */}
-        <div className="lg:col-span-5 lg:sticky lg:top-16 space-y-3">
-          {/* 工作台模块切换导航 */}
-          <div className="card p-1.5 flex items-center justify-between gap-1">
-            {(
-              [
-                { key: "mint" as WorkbenchTab, label: "🔬 探针 & 建仓质押" },
-                { key: "swap" as WorkbenchTab, label: "💱 询价兑换" },
-                { key: "portfolio" as WorkbenchTab, label: "📊 资产统计" },
-                { key: "all" as WorkbenchTab, label: "📑 全部展开" },
-              ] as const
-            ).map((t) => (
-              <button
-                key={t.key}
-                type="button"
-                onClick={() => switchWorkbenchTab(t.key)}
-                className={`flex-1 rounded-lg px-2 py-1.5 text-xs font-medium transition text-center ${
-                  workbenchTab === t.key
-                    ? "bg-brand/20 text-brand-light border border-brand/40 shadow-glow-cyan"
-                    : "text-ink-soft hover:text-ink hover:bg-white/[0.04] border border-transparent"
-                }`}
-              >
-                {t.label}
-              </button>
-            ))}
-          </div>
-
-          {/* 模块 1：收藏池探针 + 一键建仓&质押 */}
-          {(workbenchTab === "mint" || workbenchTab === "all") && (
-            <LiquidityProbe externalPool={externalPool} />
-          )}
-
-          {/* 模块 2：多费率询价 & 兑换 */}
-          {(workbenchTab === "swap" || workbenchTab === "all") && (
-            <SwapQuoteSection />
-          )}
-
-          {/* 模块 3：监控钱包资产汇总统计 */}
-          {(workbenchTab === "portfolio" || workbenchTab === "all") && (
-            <PortfolioSection />
-          )}
-        </div>
+      {/* 底部版本号 */}
+      <div className="text-center text-xs text-ink-muted">
+        LP Monitor v{process.env.NEXT_PUBLIC_VERSION || "0.18.2"}
       </div>
     </div>
   );
 }
 
-/* ============ 监控钱包资产统计面板（对齐 GET /api/portfolio?chain_id=N&address=0x...） ============ */
+function Stat({
+  label,
+  value,
+  danger,
+}: {
+  label: string;
+  value: number;
+  danger?: boolean;
+}) {
+  return (
+    <div>
+      <div
+        className={`text-2xl font-bold font-mono ${
+          danger ? "text-warn" : "text-ink"
+        }`}
+      >
+        {value}
+      </div>
+      <div className="text-xs text-ink-soft">{label}</div>
+    </div>
+  );
+}
+
+/* ============ 链上资产统计 ============ */
 interface AssetItem {
   kind: "native" | "erc20" | "lp";
   symbol: string;
@@ -567,7 +324,6 @@ interface AssetItem {
   valueUsd: number | null;
   subItems?: { symbol: string; amount: string; valueUsd: number | null }[];
 }
-
 interface PortfolioResult {
   items: AssetItem[];
   totalUsd: number;
@@ -577,509 +333,1011 @@ interface PortfolioResult {
 
 function PortfolioSection() {
   const { data: chains } = useSWR<any[]>("/api/chains", fetcher);
-  const { data: wallets } = useSWR<any[]>("/api/wallets", fetcher);
-
-  const [selectedChain, setSelectedChain] = useState<number>(0);
-  const [selectedWallet, setSelectedWallet] = useState<string>("");
-  const [customWallet, setCustomWallet] = useState<string>("");
-  const [loading, setLoading] = useState(false);
-  const [err, setErr] = useState("");
-  const [result, setResult] = useState<PortfolioResult | null>(null);
-
-  const enabledChains = (chains ?? []).filter((c) => c.enabled);
-  const enabledWallets = (wallets ?? []).filter(
-    (w) => w.enabled && (!selectedChain || w.chain_id_ref === selectedChain)
+  const { address: walletAddr } = useWallet();
+  const [chainId, setChainId] = useState<number | "">("");
+  const [addr, setAddr] = useState("");
+  useEffect(() => {
+    if (walletAddr && !addr) setAddr(walletAddr);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [walletAddr]);
+  const [query, setQuery] = useState<{
+    chainId: number;
+    addr: string;
+    seq: number;
+  } | null>(null);
+  const [history, setHistory] = useState<
+    { chainId: number; chainName: string; address: string; ts: number }[]
+  >([]);
+  const [erc20Open, setErc20Open] = useState(true);
+  const { data, error, isLoading } = useSWR<PortfolioResult>(
+    query
+      ? `/api/portfolio?chain_id=${query.chainId}&address=${encodeURIComponent(
+          query.addr
+        )}&_=${query.seq}`
+      : null,
+    fetcher
   );
 
   useEffect(() => {
-    if (!selectedChain && enabledChains.length > 0) {
-      setSelectedChain(enabledChains[0].id);
+    try {
+      const raw = localStorage.getItem("lp_monitor_portfolio_history");
+      if (raw) setHistory(JSON.parse(raw));
+    } catch {
+      /* ignore */
     }
-  }, [selectedChain, enabledChains]);
+  }, []);
 
   useEffect(() => {
-    if (!selectedWallet && enabledWallets.length > 0) {
-      setSelectedWallet(enabledWallets[0].address);
-    }
-  }, [selectedWallet, enabledWallets]);
+    if (!data || !query) return;
+    const chainName =
+      (chains ?? []).find((c: any) => c.id === query.chainId)?.name ??
+      `chain#${query.chainId}`;
+    setHistory((prev) => {
+      const next = [
+        { chainId: query.chainId, chainName, address: query.addr, ts: Date.now() },
+        ...prev.filter(
+          (h) =>
+            !(
+              h.chainId === query.chainId &&
+              (h.address || "").toLowerCase() ===
+                (query.addr || "").toLowerCase()
+            )
+        ),
+      ].slice(0, 10);
+      try {
+        localStorage.setItem(
+          "lp_monitor_portfolio_history",
+          JSON.stringify(next)
+        );
+      } catch {
+        /* ignore */
+      }
+      return next;
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [data]);
 
-  async function queryPortfolio() {
-    const addr = (customWallet.trim() || selectedWallet).trim();
-    if (!selectedChain || !addr) {
-      toast.warn("请选择链并选择或输入钱包地址");
-      return;
-    }
-    setLoading(true);
-    setErr("");
+  function removeHistory(ts: number) {
+    setHistory((prev) => {
+      const next = prev.filter((h) => h.ts !== ts);
+      try {
+        localStorage.setItem(
+          "lp_monitor_portfolio_history",
+          JSON.stringify(next)
+        );
+      } catch {
+        /* ignore */
+      }
+      return next;
+    });
+  }
+
+  function clearHistory() {
+    setHistory([]);
     try {
-      const sp = new URLSearchParams({
-        chain_id: String(selectedChain),
-        address: addr,
-      });
-      const r = await fetch(`/api/portfolio?${sp.toString()}`, {
-        headers: authHeaders(),
-      });
-      const j = await r.json();
-      if (!j.ok) throw new Error(j.error || "资产统计失败");
-      setResult(j.data);
-    } catch (e: any) {
-      setErr(e.message || String(e));
-    } finally {
-      setLoading(false);
+      localStorage.removeItem("lp_monitor_portfolio_history");
+    } catch {
+      /* ignore */
     }
   }
 
-  function fmtUsd(v: number | null | undefined) {
-    if (v === null || v === undefined || !Number.isFinite(v)) return "—";
-    return (
-      "$" +
-      v.toLocaleString("en-US", {
-        minimumFractionDigits: 2,
-        maximumFractionDigits: 2,
-      })
-    );
+  function doQuery() {
+    if (!chainId || !/^0x[a-fA-F0-9]{40}$/.test(addr.trim())) return;
+    setQuery((prev) => ({
+      chainId: Number(chainId),
+      addr: addr.trim(),
+      seq: (prev?.seq ?? 0) + 1,
+    }));
   }
 
   return (
-    <div className="card p-3.5 space-y-3">
-      <div className="flex flex-wrap items-center justify-between gap-2 border-b border-white/[0.07] pb-2.5">
-        <div>
-          <h3 className="text-sm font-semibold text-ink">
-            📊 钱包链上资产统计
-          </h3>
-          <p className="text-[11px] text-ink-muted">
-            汇总 GAS 原生币、ERC20 余额与活跃 LP 拆解估值（已遵循交易对翻转）
-          </p>
-        </div>
-        {result && (
-          <div className="rounded-lg border border-ok/30 bg-ok/10 px-2.5 py-1 text-xs">
-            <span className="text-ink-soft mr-1">总估值</span>
-            <span className="font-mono font-bold text-ok">
-              {fmtUsd(result.totalUsd)}
-            </span>
-          </div>
-        )}
-      </div>
-
-      <div className="grid grid-cols-1 sm:grid-cols-12 gap-2 items-end">
-        <div className="sm:col-span-4">
-          <span className="label">链</span>
+    <section className="card p-5">
+      <h2 className="mb-1 text-base font-semibold">链上资产统计</h2>
+      <p className="mb-3 text-xs text-ink-soft">
+        选择链并输入钱包地址，实时统计该钱包的 GAS 余额、ERC20 代币余额 + LP 仓位价值（含直接持有与质押，按 CEX 报价折算）。
+      </p>
+      <div className="mb-4 grid grid-cols-1 gap-3 md:grid-cols-[1fr_2fr_auto]">
+        <Field label="链">
           <select
             className="input"
-            value={selectedChain || ""}
-            onChange={(e) => {
-              setSelectedChain(Number(e.target.value));
-              setSelectedWallet("");
-              setResult(null);
-            }}
+            value={chainId}
+            onChange={(e) =>
+              setChainId(e.target.value ? Number(e.target.value) : "")
+            }
           >
-            {enabledChains.map((c) => (
+            <option value="">选择链</option>
+            {(chains ?? []).map((c: any) => (
               <option key={c.id} value={c.id}>
                 {c.name}
               </option>
             ))}
           </select>
-        </div>
-
-        <div className="sm:col-span-5">
-          <span className="label">监控钱包</span>
-          <select
-            className="input"
-            value={selectedWallet}
-            onChange={(e) => {
-              setSelectedWallet(e.target.value);
-              setCustomWallet("");
-              setResult(null);
-            }}
-          >
-            <option value="">选择监控钱包…</option>
-            {enabledWallets.map((w) => (
-              <option key={w.id} value={w.address}>
-                {w.label ? `${w.label} (${short(w.address)})` : short(w.address)}
-              </option>
-            ))}
-          </select>
-        </div>
-
-        <div className="sm:col-span-3">
+        </Field>
+        <Field label="钱包地址">
+          <input
+            className="input font-mono"
+            value={addr}
+            onChange={(e) => setAddr(e.target.value)}
+            placeholder="0x…"
+          />
+        </Field>
+        <div className="flex items-end">
           <button
-            type="button"
-            className="btn-primary w-full h-[34px] text-xs"
-            onClick={queryPortfolio}
-            disabled={loading || !selectedChain}
+            className="btn-primary w-full h-[32px]"
+            onClick={doQuery}
+            disabled={!chainId || !addr}
           >
-            {loading ? "统计中…" : "查询资产"}
+            统计
           </button>
         </div>
       </div>
 
-      <input
-        className="input font-mono text-xs"
-        value={customWallet}
-        onChange={(e) => setCustomWallet(e.target.value)}
-        placeholder="或粘贴任意钱包地址 0x… 进行即时盘点"
-      />
-
-      {err && <div className="text-xs text-danger">❌ {err}</div>}
-
-      {result && (
-        <div className="space-y-2 pt-1">
-          {result.items.map((item, idx) => {
-            const catLabel =
-              item.kind === "native"
-                ? "GAS"
-                : item.kind === "lp"
-                ? "LP 仓位"
-                : "ERC20";
-            const catClass =
-              item.kind === "lp"
-                ? "tag-info"
-                : item.kind === "native"
-                ? "tag-ok"
-                : "tag-muted";
-
-            return (
-              <div
-                key={`${item.kind}-${item.symbol}-${idx}`}
-                className="rounded-lg border border-white/[0.07] bg-surface-raised/50 px-2.5 py-2 text-xs space-y-1"
+      {/* 最近查询记录 */}
+      {history.length > 0 && (
+        <div className="mb-4 flex flex-wrap items-center gap-1.5">
+          <span className="text-xs text-ink-soft">最近查询：</span>
+          {history.map((h) => (
+            <span
+              key={h.ts}
+              className="inline-flex items-center gap-1.5 rounded-lg border border-white/[0.12] bg-surface-raised px-2.5 py-1 text-xs"
+            >
+              <button
+                className="text-ink hover:text-cyan-300 transition-colors"
+                title={`${h.chainName} · ${h.address}`}
+                onClick={() => {
+                  setChainId(h.chainId);
+                  setAddr(h.address);
+                  setQuery({
+                    chainId: h.chainId,
+                    addr: h.address,
+                    seq: Date.now(),
+                  });
+                }}
               >
-                <div className="flex items-center justify-between gap-2">
-                  <div className="flex items-center gap-1.5 min-w-0">
-                    <span className={catClass}>{catLabel}</span>
-                    <span className="font-semibold text-ink truncate">
-                      {item.symbol}
-                    </span>
-                    {item.kind !== "lp" && (
-                      <span className="font-mono text-ink-soft">
-                        {item.amount}
-                      </span>
-                    )}
-                  </div>
-                  <span className="font-mono font-semibold text-ok shrink-0">
-                    {fmtUsd(item.valueUsd)}
-                  </span>
-                </div>
-
-                {item.subItems && item.subItems.length > 0 && (
-                  <div className="flex flex-wrap gap-3 pl-2 pt-1 border-t border-white/[0.05] text-[11px] font-mono text-ink-soft">
-                    {item.subItems.map((sub, sIdx) => (
-                      <span key={sIdx}>
-                        {sub.amount} {sub.symbol}{" "}
-                        {sub.valueUsd !== null ? `(${fmtUsd(sub.valueUsd)})` : ""}
-                      </span>
-                    ))}
-                  </div>
-                )}
-              </div>
-            );
-          })}
+                {h.chainName} · {short(h.address)}
+              </button>
+              <button
+                className="text-ink-muted hover:text-rose-400"
+                onClick={() => removeHistory(h.ts)}
+              >
+                ×
+              </button>
+            </span>
+          ))}
+          <button
+            className="text-xs text-ink-soft hover:text-warn"
+            onClick={clearHistory}
+          >
+            清空
+          </button>
         </div>
+      )}
+
+      {isLoading && (
+        <p className="text-sm text-ink-soft">
+          统计中…（需读取链上余额与池子状态）
+        </p>
+      )}
+      {error && (
+        <p className="text-sm text-warn">❌ {(error as any)?.message ?? error}</p>
+      )}
+      {data && !isLoading && (
+        <>
+          {data.items.length === 0 ? (
+            <p className="text-sm text-ink-soft">
+              未发现资产（该钱包未登记或无仓位）。
+            </p>
+          ) : (
+            (() => {
+              const nativeItems = data.items.filter(
+                (it) => it.kind === "native"
+              );
+              const erc20Items = data.items.filter((it) => it.kind === "erc20");
+              const lpItems = data.items.filter((it) => it.kind === "lp");
+              return (
+                <div className="overflow-hidden rounded-lg border border-white/[0.1] bg-surface-raised/60">
+                  {/* GAS 原生代币 */}
+                  {nativeItems.map((it, i) => (
+                    <div
+                      key={`native-${i}`}
+                      className="flex items-center justify-between bg-surface-raised px-3.5 py-2 text-sm"
+                    >
+                      <span className="font-medium text-ink">
+                        {it.symbol}
+                        <span className="ml-1 font-mono text-ink-soft">
+                          : {it.amount}
+                        </span>
+                      </span>
+                      <span
+                        className={`font-mono ${
+                          it.valueUsd === null ? "text-ink-soft" : "text-ink"
+                        }`}
+                      >
+                        {it.valueUsd === null
+                          ? "—"
+                          : `${it.valueUsd.toFixed(1)}U`}
+                      </span>
+                    </div>
+                  ))}
+                  {/* ERC20 代币折叠区域 */}
+                  {erc20Items.length > 0 && (
+                    <>
+                      <div className="flex items-center justify-between border-t border-white/[0.08] px-3.5 py-1.5 text-xs">
+                        <span className="font-medium text-ink-soft">
+                          ERC20 代币（{erc20Items.length} 种）
+                        </span>
+                        <button
+                          className="text-ink-soft hover:text-ink transition-colors"
+                          onClick={() => setErc20Open((v) => !v)}
+                        >
+                          {erc20Open ? "收起 ▲" : "展开 ▼"}
+                        </button>
+                      </div>
+                      {erc20Open &&
+                        erc20Items.map((it, i) => (
+                          <div
+                            key={`erc20-${i}`}
+                            className="flex items-center justify-between px-3.5 py-2 text-sm border-t border-white/[0.04]"
+                          >
+                            <span className="font-medium text-ink">
+                              {it.symbol}
+                              <span className="ml-1 font-mono text-ink-soft">
+                                : {it.amount}
+                              </span>
+                            </span>
+                            <span
+                              className={`font-mono ${
+                                it.valueUsd === null
+                                  ? "text-ink-soft"
+                                  : "text-ink"
+                              }`}
+                            >
+                              {it.valueUsd === null
+                                ? "—"
+                                : `${it.valueUsd.toFixed(1)}U`}
+                            </span>
+                          </div>
+                        ))}
+                    </>
+                  )}
+                  {/* LP 仓位 */}
+                  {lpItems.map((it, i) => (
+                    <div key={`lp-${i}`}>
+                      <div className="flex items-center justify-between border-t border-white/[0.08] px-3.5 py-2 text-sm">
+                        <span className="font-medium text-ink">{it.symbol}</span>
+                        <span
+                          className={`font-mono font-semibold ${
+                            it.valueUsd === null
+                              ? "text-ink-soft"
+                              : "text-cyan-300"
+                          }`}
+                        >
+                          {it.valueUsd === null
+                            ? "—"
+                            : `${it.valueUsd.toFixed(1)}U`}
+                        </span>
+                      </div>
+                      {it.subItems?.map((s, j) => (
+                        <div
+                          key={j}
+                          className="flex items-center justify-between px-3.5 py-1.5 pl-6 text-xs text-ink-soft font-mono"
+                        >
+                          <span>
+                            {s.symbol}: {s.amount}
+                          </span>
+                          <span>
+                            {s.valueUsd === null
+                              ? "—"
+                              : `${s.valueUsd.toFixed(1)}U`}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  ))}
+                  {/* 总价值 */}
+                  <div className="flex items-center justify-between border-t border-white/[0.1] bg-surface-raised px-3.5 py-2.5 text-sm font-bold">
+                    <span className="text-ink">总价值</span>
+                    <span className="font-mono text-ok text-base">
+                      {data.totalUsd.toFixed(1)}U
+                    </span>
+                  </div>
+                </div>
+              );
+            })()
+          )}
+          {data.warnings.length > 0 && (
+            <div className="mt-2 space-y-0.5">
+              {data.warnings.map((w, i) => (
+                <p key={i} className="text-xs text-warn">
+                  ⚠ {w}
+                </p>
+              ))}
+            </div>
+          )}
+        </>
+      )}
+    </section>
+  );
+}
+
+function ScanIntervalAndAlerts({
+  combinedCron,
+  onChanged,
+}: {
+  combinedCron: string;
+  onChanged: () => void;
+}) {
+  const [preset, setPreset] = useState("");
+  const [msg, setMsg] = useState("");
+  const [busy, setBusy] = useState(false);
+  const { data: alertData, mutate: mutateAlerts } = useSWR<any>(
+    "/api/alert-settings",
+    fetcher
+  );
+  const [tickThreshold, setTickThreshold] = useState("");
+
+  async function applyScanInterval(intervalSec: number) {
+    setBusy(true);
+    setMsg("");
+    try {
+      const body: any =
+        intervalSec >= 60
+          ? { intervalMin: Math.floor(intervalSec / 60) }
+          : { cron: `*/${intervalSec} * * * * *` };
+      const r = await fetch("/api/monitor", {
+        method: "PUT",
+        headers: authHeaders({ "Content-Type": "application/json" }),
+        body: JSON.stringify(body),
+      });
+      const j = await r.json();
+      if (!j.ok) throw new Error(j.error);
+      setMsg(`✅ 扫描频率已更新`);
+      setPreset("");
+      onChanged();
+    } catch (e: any) {
+      setMsg(`❌ ${e.message}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function toggleTick() {
+    setBusy(true);
+    setMsg("");
+    try {
+      const r = await fetch("/api/alert-settings", {
+        method: "PUT",
+        headers: authHeaders({ "Content-Type": "application/json" }),
+        body: JSON.stringify({
+          tick_move_enabled: alertData?.tick_move_enabled ? "0" : "1",
+        }),
+      });
+      const j = await r.json();
+      if (!j.ok) throw new Error(j.error);
+      mutateAlerts();
+    } catch (e: any) {
+      setMsg(`❌ ${e.message}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function toggleCex() {
+    setBusy(true);
+    setMsg("");
+    try {
+      const r = await fetch("/api/alert-settings", {
+        method: "PUT",
+        headers: authHeaders({ "Content-Type": "application/json" }),
+        body: JSON.stringify({
+          cex_price_enabled: alertData?.cex_price_enabled ? "0" : "1",
+        }),
+      });
+      const j = await r.json();
+      if (!j.ok) throw new Error(j.error);
+      mutateAlerts();
+    } catch (e: any) {
+      setMsg(`❌ ${e.message}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function applyThreshold(threshold?: number) {
+    setBusy(true);
+    setMsg("");
+    try {
+      const body: any = {};
+      if (threshold !== undefined) body.tick_move_threshold = threshold;
+      else if (tickThreshold !== "")
+        body.tick_move_threshold = Number(tickThreshold);
+      const r = await fetch("/api/alert-settings", {
+        method: "PUT",
+        headers: authHeaders({ "Content-Type": "application/json" }),
+        body: JSON.stringify(body),
+      });
+      const j = await r.json();
+      if (!j.ok) throw new Error(j.error);
+      setMsg("✅ 阈值已更新");
+      setTickThreshold("");
+      mutateAlerts();
+    } catch (e: any) {
+      setMsg(`❌ ${e.message}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function applyCooldown(
+    field: "cooldown_cex" | "cooldown_range_state" | "cooldown_tick_move",
+    minutes: number
+  ) {
+    setBusy(true);
+    setMsg("");
+    try {
+      const r = await fetch("/api/alert-settings", {
+        method: "PUT",
+        headers: authHeaders({ "Content-Type": "application/json" }),
+        body: JSON.stringify({ [field]: minutes }),
+      });
+      const j = await r.json();
+      if (!j.ok) throw new Error(j.error);
+      setMsg(`✅ 冷却时间已更新为 ${minutes} 分钟`);
+      mutateAlerts();
+    } catch (e: any) {
+      setMsg(`❌ ${e.message}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="card p-4">
+      <div className="flex flex-wrap items-center gap-4">
+        {/* 扫描频率 */}
+        <div className="flex items-center gap-2 border-r border-white/[0.1] pr-4">
+          <span className="text-sm font-medium">扫描频率：</span>
+          <span className="text-sm text-cyan-300 font-medium">
+            {combinedCron ? cronToLabel(combinedCron) : "—"}
+          </span>
+          <select
+            className="input max-w-[120px] text-xs"
+            value={preset}
+            onChange={(e) => setPreset(e.target.value)}
+          >
+            <option value="">设置频率…</option>
+            <option value="30">30 秒</option>
+            <option value="60">1 分钟</option>
+            <option value="120">2 分钟</option>
+            <option value="180">3 分钟</option>
+            <option value="240">4 分钟</option>
+            <option value="300">5 分钟</option>
+          </select>
+          <button
+            className="btn-ghost text-xs"
+            disabled={!preset || busy}
+            onClick={() => applyScanInterval(Number(preset))}
+          >
+            应用
+          </button>
+        </div>
+
+        {/* 告警阈值 */}
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="text-sm font-medium">告警阈值：</span>
+
+          <button
+            className={
+              alertData?.tick_move_enabled
+                ? "btn-primary text-xs"
+                : "btn-ghost text-xs"
+            }
+            disabled={busy}
+            onClick={toggleTick}
+          >
+            {alertData?.tick_move_enabled ? "波动预警：开" : "波动预警：关"}
+          </button>
+
+          <span className="text-xs text-ink-soft">阈值</span>
+          <select
+            className="input max-w-[80px] text-xs"
+            value={tickThreshold || (alertData?.tick_move_threshold ?? 5)}
+            disabled={busy}
+            onChange={(e) => {
+              setTickThreshold(e.target.value);
+              applyThreshold(Number(e.target.value));
+            }}
+          >
+            {[1, 2, 3, 4, 5, 6, 7, 8, 9, 10].map((n) => (
+              <option key={n} value={n}>
+                {n}%
+              </option>
+            ))}
+          </select>
+
+          <button
+            className={
+              alertData?.cex_price_enabled
+                ? "btn-primary text-xs"
+                : "btn-ghost text-xs"
+            }
+            disabled={busy}
+            onClick={toggleCex}
+          >
+            {alertData?.cex_price_enabled ? "CEX 推送：开" : "CEX 推送：关"}
+          </button>
+          <span className="text-xs text-ink-soft">超过费率 2 倍时提醒</span>
+        </div>
+
+        {/* 推送冷却时间 */}
+        <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
+          <span className="text-sm font-medium">推送冷却：</span>
+          <label className="flex items-center gap-1.5 text-xs">
+            <span className="text-ink-soft">CEX价差</span>
+            <select
+              className="input max-w-[92px] text-xs"
+              value={alertData?.cooldown_cex ?? 2}
+              onChange={(e) =>
+                applyCooldown("cooldown_cex", Number(e.target.value))
+              }
+              disabled={busy}
+            >
+              {COOLDOWN_OPTIONS.map((m) => (
+                <option key={m} value={m}>
+                  {m === 0 ? "无冷却" : `${m}分钟`}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="flex items-center gap-1.5 text-xs">
+            <span className="text-ink-soft">区间状态</span>
+            <select
+              className="input max-w-[92px] text-xs"
+              value={alertData?.cooldown_range_state ?? 30}
+              onChange={(e) =>
+                applyCooldown("cooldown_range_state", Number(e.target.value))
+              }
+              disabled={busy}
+            >
+              {COOLDOWN_OPTIONS.map((m) => (
+                <option key={m} value={m}>
+                  {m === 0 ? "无冷却" : `${m}分钟`}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="flex items-center gap-1.5 text-xs">
+            <span className="text-ink-soft">区间波动</span>
+            <select
+              className="input max-w-[92px] text-xs"
+              value={alertData?.cooldown_tick_move ?? 0}
+              onChange={(e) =>
+                applyCooldown("cooldown_tick_move", Number(e.target.value))
+              }
+              disabled={busy}
+            >
+              {COOLDOWN_OPTIONS.map((m) => (
+                <option key={m} value={m}>
+                  {m === 0 ? "无冷却" : `${m}分钟`}
+                </option>
+              ))}
+            </select>
+          </label>
+        </div>
+      </div>
+
+      {msg && <div className="mt-2 text-xs">{msg}</div>}
+    </div>
+  );
+}
+
+function EmptyHint() {
+  return (
+    <div className="card p-8 text-center text-ink-soft">
+      <p className="mb-3">还没有任何仓位被监控。</p>
+      <ol className="mx-auto inline-block list-decimal text-left text-sm space-y-1">
+        <li>
+          在{" "}
+          <a className="underline text-cyan-300" href="/config">
+            配置页
+          </a>{" "}
+          添加监控钱包
+        </li>
+        <li>确认链上有对应 DEX（默认 Ethereum / Uniswap V3）</li>
+        <li>点击「立即扫描」或等待定时任务</li>
+      </ol>
+    </div>
+  );
+}
+
+function FlipButton({
+  positionId,
+  currentFlip,
+  onFlipped,
+}: {
+  positionId: number;
+  currentFlip: boolean;
+  onFlipped?: () => void;
+}) {
+  const [loading, setLoading] = useState(false);
+
+  const handleFlip = async () => {
+    setLoading(true);
+    try {
+      const response = await fetch(`/api/positions/${positionId}/pair-flip`, {
+        method: "PUT",
+        headers: authHeaders({ "Content-Type": "application/json" }),
+        body: JSON.stringify({ flip: !currentFlip }),
+      });
+      const result = await response.json();
+
+      if (result.ok) {
+        mutate("/api/liquidity-favorites");
+        onFlipped?.();
+      } else {
+        alert(result.error || "操作失败");
+      }
+    } catch (error) {
+      alert("操作失败：" + error);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <button
+      onClick={handleFlip}
+      disabled={loading}
+      className={
+        currentFlip ? "btn-secondary text-xs" : "btn-ghost text-xs"
+      }
+    >
+      {loading ? "..." : currentFlip ? "还原" : "翻转"}
+    </button>
+  );
+}
+
+function CexAlertMuteButton({
+  positionId,
+  currentMuted,
+  onToggled,
+}: {
+  positionId: number;
+  currentMuted: boolean;
+  onToggled?: () => void;
+}) {
+  const [loading, setLoading] = useState(false);
+
+  const handleToggle = async () => {
+    setLoading(true);
+    try {
+      const response = await fetch(
+        `/api/positions/${positionId}/cex-alert-mute`,
+        {
+          method: "PUT",
+          headers: authHeaders({ "Content-Type": "application/json" }),
+          body: JSON.stringify({ mute: !currentMuted }),
+        }
+      );
+      const result = await response.json();
+
+      if (result.ok) {
+        onToggled?.();
+      } else {
+        alert(result.error || "操作失败");
+      }
+    } catch (error) {
+      alert("操作失败：" + error);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <button
+      onClick={handleToggle}
+      disabled={loading}
+      title={
+        currentMuted
+          ? "点击恢复该交易对的 CEX 差价预警"
+          : "点击静音该交易对的 CEX 差价预警"
+      }
+      className={`text-xs px-2.5 py-1 rounded-lg border transition-colors ${
+        currentMuted
+          ? "border-amber-500/40 bg-amber-500/15 text-amber-200 hover:bg-amber-500/25"
+          : "border-emerald-500/35 bg-emerald-500/15 text-emerald-200 hover:bg-emerald-500/25"
+      }`}
+    >
+      {loading ? "..." : currentMuted ? "预警:关" : "预警:开"}
+    </button>
+  );
+}
+
+function PositionCard({
+  p,
+  highlight,
+  closed,
+  onFlipped,
+  onReopenPool,
+}: {
+  p: Position;
+  highlight?: boolean;
+  closed?: boolean;
+  onFlipped?: () => void;
+  onReopenPool?: (chainId: number, pool: string) => void;
+}) {
+  const inRange = p.last_in_range === 1;
+  const explorer = p.explorer_url?.replace(/\/$/, "");
+  const dexLabel = p.dex_display_name || p.dex_name;
+  const marginLower =
+    ((p.last_current_tick - p.tick_lower) /
+      Math.max(p.tick_upper - p.tick_lower, 1)) *
+    100;
+  const marginUpper =
+    ((p.tick_upper - p.last_current_tick) /
+      Math.max(p.tick_upper - p.tick_lower, 1)) *
+    100;
+  const sym0 = p.token0_symbol || short(p.token0);
+  const sym1 = p.token1_symbol || short(p.token1);
+  const pair = p.pair_flip ? `${sym1}/${sym0}` : `${sym0}/${sym1}`;
+  const cexInfo = parseCexPrice(p.last_cex_price);
+  const cexWarnThresh = 0.01;
+
+  const flip = p.pair_flip === 1;
+  const displaySym0 = flip ? sym1 : sym0;
+  const displaySym1 = flip ? sym0 : sym1;
+  const displayPrice0 = p.last_price0
+    ? fmtFull(flip ? 1 / Number(p.last_price0) : Number(p.last_price0))
+    : p.last_price0;
+  const displayCexRate = cexInfo
+    ? flip
+      ? 1 / cexInfo.cexRate
+      : cexInfo.cexRate
+    : 0;
+  const displayToken0Cex = cexInfo
+    ? flip
+      ? cexInfo.token1CexSymbol
+      : cexInfo.token0CexSymbol
+    : "";
+  const displayToken1Cex = cexInfo
+    ? flip
+      ? cexInfo.token0CexSymbol
+      : cexInfo.token1CexSymbol
+    : "";
+
+  return (
+    <div
+      className={`card p-4 ${
+        closed
+          ? "border-dashed border-white/[0.15] bg-surface-raised/50"
+          : highlight
+            ? "border-rose-500/60 shadow-[0_0_20px_-5px_rgba(244,63,94,0.3)]"
+            : ""
+      }`}
+    >
+      <div className="mb-2.5 flex items-start justify-between gap-2">
+        <div className="flex-1">
+          <div className="flex flex-wrap items-center gap-1.5">
+            <span className="font-semibold text-base text-ink">{pair}</span>
+            {p.pair_flip === 1 && (
+              <span className="tag-info" title="交易对已翻转">
+                翻转
+              </span>
+            )}
+            {closed ? (
+              <span className="tag-muted">已平仓</span>
+            ) : inRange ? (
+              <span className="tag-ok">在区间内</span>
+            ) : (
+              <span className="tag-danger">已越界</span>
+            )}
+            {!closed && p.last_alert_type === "tick_move" && (
+              <span className="tag-info">波动</span>
+            )}
+            {!closed && p.last_alert_type === "cex_price" && (
+              <span className="tag-warn">CEX 价差</span>
+            )}
+            {!closed && p.source === "staking" && (
+              <span className="tag-muted">质押中</span>
+            )}
+          </div>
+          <div className="mt-0.5 text-xs text-ink-soft">
+            {p.chain_name} · {dexLabel} · #{p.token_id}
+          </div>
+        </div>
+      </div>
+
+      <div className="space-y-1 text-sm">
+        <Row label="交易对">
+          <span title={`${p.token0} / ${p.token1}`}>
+            {pair} · fee {(p.fee / 10000).toFixed(2)}%
+          </span>
+        </Row>
+        <Row label="当前 tick">
+          <span
+            className={`font-mono ${
+              inRange ? "text-ink" : "text-warn font-semibold"
+            }`}
+          >
+            {p.last_current_tick}
+          </span>
+        </Row>
+        <Row label="区间">
+          <span className="font-mono">
+            [{p.tick_lower}, {p.tick_upper}]
+          </span>
+        </Row>
+        <Row label="价格">
+          <span className="font-mono">
+            1 {displaySym0} ≈ {displayPrice0} {displaySym1}
+          </span>
+        </Row>
+        {cexInfo && displayToken0Cex && displayToken1Cex && (
+          <Row label={`CEX 汇率 (${displayToken0Cex}÷${displayToken1Cex})`}>
+            <span className="font-mono">
+              1 {displaySym0} = {fmtFull(displayCexRate)} {displaySym1}
+            </span>
+          </Row>
+        )}
+        {cexInfo && (
+          <Row label="CEX差价">
+            <span
+              className={`font-mono ${
+                cexInfo.absDiff >= cexWarnThresh
+                  ? "text-warn font-semibold"
+                  : "text-ok"
+              }`}
+            >
+              差 {pctSigned(cexInfo.diff)}
+            </span>
+            <span className="ml-1 font-mono text-ink-soft">
+              {fmtFull(displayCexRate)}
+            </span>
+          </Row>
+        )}
+
+        {/* 区间位置可视化 */}
+        <div className="pt-1.5 pb-0.5">
+          <div className="relative h-2 w-full rounded bg-white/[0.1]">
+            <div
+              className="absolute inset-y-0 left-0 rounded bg-emerald-500/35"
+              style={{
+                width: `${
+                  inRange
+                    ? Math.min(Math.max(marginLower, 2), 98)
+                    : marginLower < 0
+                      ? 0
+                      : 100
+                }%`,
+              }}
+            />
+            <div
+              className="absolute top-1/2 h-3.5 w-1.5 -translate-y-1/2 rounded"
+              style={{
+                left: `${Math.min(
+                  Math.max(
+                    ((p.last_current_tick - p.tick_lower) /
+                      Math.max(p.tick_upper - p.tick_lower, 1)) *
+                      100,
+                    0
+                  ),
+                  100
+                )}%`,
+                background: inRange ? "#10b981" : "#f43f5e",
+              }}
+            />
+          </div>
+          <div className="mt-1 flex justify-between text-[11px] font-mono text-ink-soft">
+            <span>距下界 {marginLower.toFixed(1)}%</span>
+            <span>距上界 {marginUpper.toFixed(1)}%</span>
+          </div>
+        </div>
+
+        <Row label="钱包">{p.wallet_label || short(p.wallet_address)}</Row>
+        <Row label="检查时间">{timeAgo(p.last_checked_at)}</Row>
+        {p.source === "staking" && (
+          <Row label="质押合约">
+            <a
+              className="underline font-mono text-cyan-300"
+              href={`${explorer}/address/${p.staker_contract}`}
+              target="_blank"
+              rel="noreferrer"
+            >
+              {short(p.staker_contract)}
+            </a>
+          </Row>
+        )}
+      </div>
+
+      <div className="mt-3 flex flex-wrap gap-2 text-xs">
+        {explorer && (
+          <a
+            className="btn-ghost text-xs"
+            href={`${explorer}/address/${p.pool}`}
+            target="_blank"
+            rel="noreferrer"
+          >
+            查看 Pool
+          </a>
+        )}
+        <FlipButton
+          positionId={p.id}
+          currentFlip={!!p.pair_flip}
+          onFlipped={onFlipped}
+        />
+        <CexAlertMuteButton
+          positionId={p.id}
+          currentMuted={!!p.cex_alert_muted}
+          onToggled={onFlipped}
+        />
+      </div>
+
+      {!closed && (
+        <LiquidityButton
+          positionId={p.id}
+          staking={p.source === "staking"}
+          pairFlip={p.pair_flip}
+        />
+      )}
+
+      {!closed && (
+        <RemovePositionButton
+          position={p}
+          onRemoved={onFlipped}
+          onReopenPool={
+            onReopenPool
+              ? (chainId, poolAddr) => onReopenPool(chainId, poolAddr)
+              : undefined
+          }
+        />
       )}
     </div>
   );
 }
 
-/* ============ 单张 LP 仓位卡片（高对比度暗色终端风格 + 完整翻转统一） ============ */
-function PositionCard({
-  p,
-  onMutate,
-  onReopenPool,
+function Row({
+  label,
+  children,
 }: {
-  p: Position;
-  onMutate: () => void;
-  onReopenPool: (chainIdRef: number, pool: string) => void;
+  label: string;
+  children: React.ReactNode;
 }) {
-  const isClosed =
-    p.notify_state === "closed" ||
-    p.last_liquidity === "0" ||
-    p.last_liquidity === "";
-  const isOut = p.last_in_range === 0 && !isClosed;
-  const isStaked = p.source === "staking" || !!p.staker_contract;
-
-  const span = p.tick_upper - p.tick_lower;
-  const rawPct = span > 0 ? ((p.last_tick - p.tick_lower) / span) * 100 : 50;
-  const pct = Math.max(0, Math.min(100, rawPct));
-
-  const sym0 = p.token0_symbol || short(p.token0);
-  const sym1 = p.token1_symbol || short(p.token1);
-  const flip = p.pair_flip === 1;
-
-  // 原始数据库存的价格均为 1 token0 = ? token1
-  const pLowerRaw = Number(p.price_lower ?? 0);
-  const pUpperRaw = Number(p.price_upper ?? 0);
-  const pCurrRaw = Number(p.price_current ?? p.dex_price ?? 0);
-
-  // 根据 pair_flip 统一展示口径（flip=1 时 token1 为主币 Base，token0 为计价币 Quote）
-  const baseSym = flip ? sym1 : sym0;
-  const quoteSym = flip ? sym0 : sym1;
-  const lowPrice = flip ? (pUpperRaw > 0 ? 1 / pUpperRaw : 0) : pLowerRaw;
-  const highPrice = flip ? (pLowerRaw > 0 ? 1 / pLowerRaw : 0) : pUpperRaw;
-  const currPrice = flip ? (pCurrRaw > 0 ? 1 / pCurrRaw : 0) : pCurrRaw;
-
-  const pairLabel = `${baseSym}/${quoteSym}`;
-  const feePct = p.fee
-    ? `${(p.fee / 10000).toFixed(p.fee % 100 === 0 ? 2 : 4)}%`
-    : "";
-  const dexDisplay = p.dex_display_name || p.dex_name;
-
-  async function toggleFlip() {
-    try {
-      const r = await fetch(`/api/positions/${p.id}/pair-flip`, {
-        method: "PUT",
-        headers: authHeaders({ "Content-Type": "application/json" }),
-        body: JSON.stringify({ flip: !flip }),
-      });
-      const j = await r.json();
-      if (!j.ok) throw new Error(j.error || "翻转失败");
-      onMutate();
-      globalMutate("/api/liquidity-favorites");
-      toast.success(
-        `已切换计价方向：主币设为 ${!flip ? sym1 : sym0}（全局同步）`
-      );
-    } catch (e: any) {
-      toast.error(e.message || "翻转失败");
-    }
-  }
-
-  async function toggleCexMute() {
-    try {
-      const nextMute = p.cex_alert_muted !== 1;
-      const r = await fetch(`/api/positions/${p.id}/cex-alert-mute`, {
-        method: "PUT",
-        headers: authHeaders({ "Content-Type": "application/json" }),
-        body: JSON.stringify({ mute: nextMute }),
-      });
-      const j = await r.json();
-      if (!j.ok) throw new Error(j.error || "操作失败");
-      onMutate();
-      toast.info(
-        nextMute
-          ? `已静音 ${pairLabel} 的 CEX 差价告警`
-          : `已恢复 ${pairLabel} 的 CEX 差价告警`
-      );
-    } catch (e: any) {
-      toast.error(e.message || "操作失败");
-    }
-  }
-
-  const explorerLink =
-    p.explorer_url && p.pool
-      ? `${p.explorer_url.replace(/\/$/, "")}/address/${p.pool}`
-      : null;
-
-  const hasCex =
-    p.cex_price !== undefined &&
-    p.cex_price !== null &&
-    p.cex_price !== "" &&
-    Number(p.cex_price) > 0;
-  const rawCexPrice = Number(p.cex_price ?? 0);
-  const cexPriceDisplay =
-    flip && rawCexPrice > 0 ? 1 / rawCexPrice : rawCexPrice;
-  const cexDiffPct =
-    p.cex_diff_ratio !== undefined && p.cex_diff_ratio !== null
-      ? Math.abs(Number(p.cex_diff_ratio) * 100)
-      : 0;
-  const cexThresholdPct = p.fee ? (p.fee / 1_000_000) * 2 * 100 : 0.6;
-  const cexExceeded = cexDiffPct >= cexThresholdPct;
-
   return (
-    <div
-      className={`rounded-xl border p-3.5 transition-all ${
-        isOut
-          ? "border-danger/60 bg-danger/[0.05] shadow-[0_0_20px_-6px_rgba(244,63,94,0.35)]"
-          : "border-white/[0.08] bg-surface-card/90 hover:border-white/[0.15]"
-      }`}
-    >
-      {/* 第一行：交易对 + 状态标签 + 链/DEX + 钱包 */}
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <div className="flex flex-wrap items-center gap-1.5">
-          {isClosed ? (
-            <span className="tag-muted">已归档</span>
-          ) : isOut ? (
-            <span className="tag-danger animate-pulse">🚨 越界告警</span>
-          ) : (
-            <span className="tag-ok">● 区间内</span>
-          )}
-
-          <span className="text-sm font-bold text-ink">{pairLabel}</span>
-          {flip && (
-            <span
-              className="rounded bg-brand/15 px-1 text-[10px] font-mono text-brand-light"
-              title="已翻转主币/计价币方向"
-            >
-              ⇄
-            </span>
-          )}
-          {feePct && <span className="tag-muted font-mono">{feePct}</span>}
-
-          <span className="font-mono text-xs text-ink-soft">#{p.token_id}</span>
-
-          {isStaked && <span className="tag-info">🌾 质押中</span>}
-        </div>
-
-        <div className="flex items-center gap-2 text-xs text-ink-soft">
-          <span>
-            {p.chain_name} · {dexDisplay}
-          </span>
-          <span className="text-white/15">|</span>
-          <span className="font-mono">
-            {p.wallet_label || short(p.wallet_address)}
-          </span>
-          {explorerLink && (
-            <a
-              href={explorerLink}
-              target="_blank"
-              rel="noreferrer"
-              className="text-brand-light hover:underline"
-              title="在区块浏览器查看池合约"
-            >
-              ↗
-            </a>
-          )}
-          <span className="text-[11px] text-ink-muted">
-            {timeAgo(p.last_checked_at)}
-          </span>
-        </div>
-      </div>
-
-      {/* 第二行：可视化价格与 Tick 区间进度条 */}
-      <div className="mt-2.5 grid grid-cols-1 md:grid-cols-12 gap-2.5 items-center">
-        {/* 价格与 CEX 差价详情 */}
-        <div className="md:col-span-7 rounded-lg border border-white/[0.06] bg-surface-raised/60 px-2.5 py-2 text-xs space-y-1">
-          <div className="flex flex-wrap items-center justify-between gap-1">
-            <div>
-              <span className="text-ink-muted">当前池价: </span>
-              <span className="font-mono font-bold text-brand-light">
-                {currPrice > 0
-                  ? `1 ${baseSym} = ${fmtFull(currPrice)} ${quoteSym}`
-                  : "—"}
-              </span>
-            </div>
-            {lowPrice > 0 && highPrice > 0 && (
-              <div className="font-mono text-[11px] text-ink-soft">
-                区间: {fmtFull(lowPrice)} ~ {fmtFull(highPrice)}
-              </div>
-            )}
-          </div>
-
-          {/* CEX 差价对比行 */}
-          {hasCex && (
-            <div
-              className={`flex flex-wrap items-center justify-between gap-1 pt-1 border-t border-white/[0.05] text-[11px] ${
-                cexExceeded ? "text-warn font-medium" : "text-ink-soft"
-              }`}
-            >
-              <span>
-                📊 币安: 1 {baseSym} ={" "}
-                <strong className="font-mono text-ink">
-                  {fmtFull(cexPriceDisplay)}
-                </strong>{" "}
-                {quoteSym}
-              </span>
-              <span className="font-mono">
-                差价 {cexDiffPct.toFixed(2)}%{" "}
-                {cexExceeded ? (
-                  <span className="text-warn font-bold">
-                    ⚠️ 超阈值({cexThresholdPct.toFixed(2)}%)
-                  </span>
-                ) : (
-                  <span className="text-ink-muted">
-                    (阈值{cexThresholdPct.toFixed(2)}%)
-                  </span>
-                )}
-              </span>
-            </div>
-          )}
-        </div>
-
-        {/* Tick 视觉滑轨 */}
-        <div className="md:col-span-5 space-y-1">
-          <div className="flex items-center justify-between font-mono text-[11px] text-ink-soft">
-            <span>
-              [{p.tick_lower}, {p.tick_upper}]
-            </span>
-            <span
-              className={
-                isOut ? "text-danger font-bold" : "text-ok font-semibold"
-              }
-            >
-              Tick {p.last_tick}
-            </span>
-          </div>
-          <div className="relative h-2.5 w-full overflow-hidden rounded-full bg-white/[0.07]">
-            <div className="absolute inset-y-0 left-[12%] right-[12%] bg-ok/25 rounded-full" />
-            <div
-              className={`absolute top-0 h-2.5 w-2 -translate-x-1/2 rounded-full transition-all ${
-                isOut
-                  ? "bg-danger shadow-[0_0_8px_#f43f5e]"
-                  : "bg-ok shadow-[0_0_8px_#10b981]"
-              }`}
-              style={{
-                left: `${
-                  isOut
-                    ? p.last_tick < p.tick_lower
-                      ? 4
-                      : 96
-                    : 12 + pct * 0.76
-                }%`,
-              }}
-            />
-          </div>
-        </div>
-      </div>
-
-      {/* 第三行：快捷操作栏（翻转 / CEX静音 / 载入建仓台 / 深度分析 / 一键撤池 & 撤池重开） */}
-      <div className="mt-2.5 pt-2 border-t border-white/[0.06] flex flex-wrap items-center justify-between gap-2">
-        <div className="flex flex-wrap items-center gap-1.5">
-          <button
-            type="button"
-            onClick={toggleFlip}
-            className={`btn-ghost btn-xs ${
-              flip ? "border-brand/40 text-brand-light bg-brand/10" : ""
-            }`}
-            title="翻转该交易对的主币/计价币方向（自动同步至探针与建仓面板）"
-          >
-            ⇄ 翻转
-          </button>
-
-          <button
-            type="button"
-            onClick={toggleCexMute}
-            className={`btn-ghost btn-xs ${
-              p.cex_alert_muted === 1
-                ? "border-warn/40 text-warn bg-warn/10"
-                : ""
-            }`}
-            title="静音或恢复该交易对的 CEX 差价告警推送"
-          >
-            {p.cex_alert_muted === 1 ? "🔕 CEX已静音" : "🔔 CEX告警"}
-          </button>
-
-          {p.pool && (
-            <button
-              type="button"
-              onClick={() => onReopenPool(p.chain_id_ref, p.pool)}
-              className="btn-ghost btn-xs"
-              title="将该仓位所在池载入右侧建仓台"
-            >
-              🎯 载入建仓台
-            </button>
-          )}
-
-          {!isClosed && (
-            <LiquidityButton positionId={p.id} pairFlip={p.pair_flip} />
-          )}
-        </div>
-
-        {/* 右下角：一键撤池 & 撤池重开 */}
-        {!isClosed && (
-          <RemovePositionButton
-            position={p}
-            onRemoved={onMutate}
-            onReopenPool={onReopenPool}
-          />
-        )}
-      </div>
+    <div className="flex justify-between gap-2">
+      <span className="text-ink-soft">{label}</span>
+      <span className="text-right break-all text-ink">{children}</span>
     </div>
   );
+}
+
+interface CexPricePayload {
+  pairLabel: string;
+  token0CexSymbol: string;
+  token1CexSymbol: string;
+  quote: string;
+  dexRate: number;
+  cexRate: number;
+  diff: number;
+  absDiff: number;
+}
+
+function parseCexPrice(raw?: string): CexPricePayload | null {
+  if (!raw) return null;
+  try {
+    const o = JSON.parse(raw);
+    if (
+      typeof o.dexRate === "number" &&
+      typeof o.cexRate === "number" &&
+      typeof o.diff === "number"
+    ) {
+      return o as CexPricePayload;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function pctSigned(x: number): string {
+  return `${x >= 0 ? "+" : ""}${(x * 100).toFixed(2)}%`;
 }

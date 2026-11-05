@@ -146,7 +146,7 @@ export async function POST(req: Request) {
     }
   }
 
-  return ok({ ...result, token0, token1, pairFlip, cex: cexPayload, cached: false });
+  return ok({ ...result, pool: b.pool, token0, token1, pairFlip, cex: cexPayload, cached: false });
   } catch (e) {
     console.error("[liquidity-probe] UNCAUGHT:", e);
     return fail(`未捕获异常：${(e as Error).message}`, 500);

@@ -19,8 +19,8 @@ interface Position {
   dex_name: string;
   pool: string;
   token_id: string;
-  token0_symbol: string;
-  token1_symbol: string;
+  token0_symbol?: string;
+  token1_symbol?: string;
   pair_flip?: number;
   wallet_address: string;
   source: string;
@@ -246,12 +246,12 @@ export function RemovePositionButton({
   }
 
   return (
-    <div className="inline-flex flex-wrap items-center gap-1.5">
+    <div className="mt-2.5 border-t border-white/[0.08] pt-2.5 flex flex-wrap items-center gap-2">
       <button
         type="button"
         onClick={() => handleQuickRemove(false)}
         disabled={!!busyMode}
-        className="btn-danger btn-xs"
+        className="btn-danger text-xs"
         title={
           isStakedPos
             ? "自动连签：解质押 → 移除流动性 → 领取本金与手续费"
@@ -261,8 +261,8 @@ export function RemovePositionButton({
         {busyMode === "remove"
           ? step || "撤池中…"
           : isStakedPos
-          ? "⚡ 解押并撤池"
-          : "⚡ 一键撤池"}
+          ? "🔴 解押并移除仓位"
+          : "🔴 移除仓位"}
       </button>
 
       {onReopenPool && position.pool && (
@@ -270,15 +270,15 @@ export function RemovePositionButton({
           type="button"
           onClick={() => handleQuickRemove(true)}
           disabled={!!busyMode}
-          className="btn-ghost btn-xs border-brand/30 text-brand-light hover:bg-brand/15 hover:border-brand/50"
-          title="撤出当前越界/旧仓位，并同时在右侧建仓台载入该池，按最新 Tick 一键重开"
+          className="btn-secondary text-xs"
+          title="撤出当前越界/旧仓位，并同时在上方探针/建仓面板载入该池，按最新 Tick 一键重开"
         >
-          {busyMode === "reopen" ? step || "处理中…" : "🔄 撤池重开"}
+          {busyMode === "reopen" ? step || "处理中…" : "🔄 撤池并重开"}
         </button>
       )}
 
       {txHashes.length > 0 && (
-        <span className="inline-flex items-center gap-1 font-mono text-[10px] text-ink-soft">
+        <span className="inline-flex items-center gap-1.5 font-mono text-xs text-ink-soft">
           {txHashes.map((h, i) =>
             explorerUrl ? (
               <a
@@ -286,7 +286,7 @@ export function RemovePositionButton({
                 href={`${explorerUrl.replace(/\/$/, "")}/tx/${h}`}
                 target="_blank"
                 rel="noreferrer"
-                className="text-brand-light underline"
+                className="text-cyan-300 underline"
               >
                 Tx{i + 1}↗
               </a>

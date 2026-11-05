@@ -1,9 +1,17 @@
 "use client";
+/**
+ * 直接创建 LP 仓位面板（最小 tickSpacing 窗口）+ 自动质押。
+ *
+ * 1. 读取池子的翻转状态（pairFlip）：若已翻转（如 ETH/USDC.e 中 token1=ETH 为主币），
+ *    自动将默认投入币种切为 token1（ETH），下拉框与计算结果均按主币优先展示。
+ * 2. 支持 ZIA DEX 一键开启 NFT 全局免签质押（setApprovalForAll）+ 质押前链上校验 verifyNftPoolMatch，
+ *    让原本 2~4 步签名压缩到 1~2 步。
+ */
 import { useState, useEffect, useCallback, useRef } from "react";
-import { mutate } from "swr";
+import useSWR, { mutate } from "swr";
+import { fetcher, authHeaders, fmtFull } from "./util";
 import {
   useWallet,
-  waitForTxReceipt,
   verifyNftPoolMatch,
   extractMintedTokenIdFromReceipt,
 } from "@/lib/wallet/use-wallet";
@@ -13,63 +21,15 @@ import {
   buildNftApproveCalldata,
   buildSetApprovalForAllCalldata,
   buildStakeDepositCalldata,
+  MAX_UINT256,
 } from "@/lib/wallet/build-mint";
-import { authHeaders, short, fmtFull } from "./util";
-import { toast } from "./toast";
 
-interface MintData {
-  chain: { id: number; name: string; chain_id: number };
-  pairFlip: number;
-  pool: {
-    address: string;
-    token0: string;
-    token1: string;
-    token0Symbol: string;
-    token1Symbol: string;
-    token0Decimals: number;
-    token1Decimals: number;
-    fee: number;
-    tickSpacing: number;
-    currentTick: number;
-    sqrtPriceX96: string;
-    priceCurrent: number;
-  };
-  range: {
-    tickLower: number;
-    tickUpper: number;
-    priceLow: string | number;
-    priceHigh: string | number;
-    isMinimal: boolean;
-  };
-  compute: null | {
-    liquidity: string;
-    amount0: string;
-    amount1: string;
-    amount0Human: string;
-    amount1Human: string;
-    shareAfter?: number;
-    poolLiquidity?: string;
-    stakedLiquidity?: string;
-    shareInPool?: number;
-  };
-  balances: null | {
-    token0: string;
-    token1: string;
-    token0Human: string;
-    token1Human: string;
-  };
-  matchedStaking: Array<{
-    id: number;
-    platform: string;
-    pair_label: string;
-    contract: string;
-  }>;
-  dex: null | { id: number; name: string; npm: string };
-  approvals: null | {
-    token0: { allowance: string; sufficient: boolean; decimals: number };
-    token1: { allowance: string; sufficient: boolean; decimals: number };
-    nftApprovedForAll?: boolean;
-  };
+interface Props {
+  chainId: number;
+  pool: string;
+  onClose?: () => void;
+  onCreated?: () => void;
+  onFlipChanged?: () => void;
 }
 
 export function MintPositionPanel({
@@ -78,802 +38,872 @@ export function MintPositionPanel({
   onClose,
   onCreated,
   onFlipChanged,
-}: {
-  chainId: number;
-  pool?: string;
-  onClose?: () => void;
-  onCreated?: () => void;
-  onFlipChanged?: () => void;
-}) {
-  const wallet = useWallet();
-  const [poolInput, setPoolInput] = useState(initialPool ?? "");
+}: Props) {
+  const {
+    address,
+    chainId: walletChainId,
+    connect,
+    switchChain,
+    sendTx,
+  } = useWallet();
+  const { data: chains } = useSWR<any[]>("/api/chains", fetcher);
+
+  const [chainId, setChainId] = useState<number>(initialChainId || 0);
+  const [pool, setPool] = useState(initialPool || "");
+
+  // 区间：默认留空 = 使用最小窗口；可手动改
+  const [tickLower, setTickLower] = useState<string>("");
+  const [tickUpper, setTickUpper] = useState<string>("");
+
+  // 单侧金额输入
   const [side, setSide] = useState<"token0" | "token1">("token0");
-  const [amount, setAmount] = useState("100");
-  const [slippageBps, setSlippageBps] = useState(100); // 默认 1%
-  const [autoStake, setAutoStake] = useState(true);
-  const [selectedStaking, setSelectedStaking] = useState<string>("");
+  const [amount, setAmount] = useState("");
 
-  const [data, setData] = useState<MintData | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [err, setErr] = useState("");
-  const [step, setStep] = useState("");
-  const [txHashes, setTxHashes] = useState<string[]>([]);
-  const [mintedTokenId, setMintedTokenId] = useState<string | null>(null);
+  // 后端返回的状态
+  const [data, setData] = useState<any>(null);
+  const [busy, setBusy] = useState(false);
   const [togglingAllApprove, setTogglingAllApprove] = useState(false);
+  const [msg, setMsg] = useState("");
 
-  // 记录上一次已初始化默认方向的池地址，换池或翻转时自动把输入代币切到主币
+  // 记录已初始化默认方向的池，首次加载或翻转变化时自动将投入币种设为主币
   const initializedPoolRef = useRef<string>("");
 
-  const loadParams = useCallback(
+  // 执行进度
+  const [steps, setSteps] = useState<
+    {
+      label: string;
+      status: "pending" | "loading" | "done" | "skipped" | "error";
+      hash?: string;
+    }[]
+  >([]);
+
+  /** 拉取池子状态 + 反算两侧金额 */
+  const fetchPool = useCallback(
     async (opts?: {
-      poolOverride?: string;
+      range?: { tick_lower: number; tick_upper: number };
+      withCompute?: boolean;
+      withWallet?: boolean;
       sideOverride?: "token0" | "token1";
-      amountOverride?: string;
-      walletOverride?: string;
-      silent?: boolean;
-    }): Promise<MintData | null> => {
-      const targetPool = (opts?.poolOverride ?? poolInput).trim();
-      const targetSide = opts?.sideOverride ?? side;
-      const targetAmount = opts?.amountOverride ?? amount;
-      const targetWallet = opts?.walletOverride ?? wallet.address ?? undefined;
-      if (!initialChainId || !targetPool) return null;
-      if (!opts?.silent) setLoading(true);
-      setErr("");
+      poolOverride?: string;
+      chainOverride?: number;
+    }) => {
+      const targetChain = opts?.chainOverride ?? chainId;
+      const targetPool = (opts?.poolOverride ?? pool).trim();
+      if (!targetChain || !/^0x[a-fA-F0-9]{40}$/.test(targetPool)) return;
+      setBusy(true);
+      setMsg("");
       try {
+        const currentSide = opts?.sideOverride ?? side;
+        const body: any = { chain_id: targetChain, pool: targetPool };
+        if ((opts?.withWallet ?? !!address) && address) body.wallet = address;
+        if ((opts?.withCompute ?? !!amount) && amount) {
+          body.input_side = currentSide;
+          body.input_amount = amount;
+        }
+        const rl =
+          opts?.range?.tick_lower ??
+          (tickLower !== "" ? Number(tickLower) : undefined);
+        const ru =
+          opts?.range?.tick_upper ??
+          (tickUpper !== "" ? Number(tickUpper) : undefined);
+        if (rl !== undefined && ru !== undefined && !Number.isNaN(rl) && !Number.isNaN(ru)) {
+          body.tick_lower = rl;
+          body.tick_upper = ru;
+        }
         const r = await fetch("/api/liquidity-mint", {
           method: "POST",
           headers: authHeaders({ "Content-Type": "application/json" }),
-          body: JSON.stringify({
-            chain_id: initialChainId,
-            pool: targetPool,
-            wallet: targetWallet,
-            input_side: targetSide,
-            input_amount: targetAmount || "0",
-          }),
+          body: JSON.stringify(body),
         });
         const j = await r.json();
-        if (!j.ok) throw new Error(j.error || "加载建仓参数失败");
-        let nextData: MintData = j.data;
+        if (!j.ok) throw new Error(j.error);
+        let nextData = j.data;
 
-        if (nextData.matchedStaking?.length > 0 && !selectedStaking) {
-          setSelectedStaking(nextData.matchedStaking[0].contract);
-        }
-
-        // 首次加载该池时：若该池标记了翻转（pairFlip=1，即 token1 为主币如 ETH），自动将默认输入币种设为 token1
-        const poolKey = `${initialChainId}:${nextData.pool.address.toLowerCase()}:${nextData.pairFlip}`;
+        // 首次加载该池时：如果池子设置了翻转（pairFlip === 1，即 token1 为主币如 ETH），
+        // 自动把默认投入币种切为 token1（主币）
+        const poolKey = `${targetChain}:${targetPool.toLowerCase()}:${nextData.pairFlip ?? 0}`;
         if (initializedPoolRef.current !== poolKey && !opts?.sideOverride) {
           initializedPoolRef.current = poolKey;
           const preferredSide: "token0" | "token1" =
             nextData.pairFlip === 1 ? "token1" : "token0";
-          if (preferredSide !== targetSide) {
+          if (preferredSide !== currentSide) {
             setSide(preferredSide);
-            const r2 = await fetch("/api/liquidity-mint", {
-              method: "POST",
-              headers: authHeaders({ "Content-Type": "application/json" }),
-              body: JSON.stringify({
-                chain_id: initialChainId,
-                pool: targetPool,
-                wallet: targetWallet,
-                input_side: preferredSide,
-                input_amount: targetAmount || "0",
-              }),
-            });
-            const j2 = await r2.json();
-            if (j2.ok) nextData = j2.data;
+            if (amount) {
+              const r2 = await fetch("/api/liquidity-mint", {
+                method: "POST",
+                headers: authHeaders({ "Content-Type": "application/json" }),
+                body: JSON.stringify({
+                  ...body,
+                  input_side: preferredSide,
+                  input_amount: amount,
+                }),
+              });
+              const j2 = await r2.json();
+              if (j2.ok) nextData = j2.data;
+            }
           }
         }
 
         setData(nextData);
-        return nextData;
+        if (opts?.range || tickLower === "") {
+          setTickLower(String(nextData.range.tickLower));
+          setTickUpper(String(nextData.range.tickUpper));
+        }
       } catch (e: any) {
-        setErr(e.message || String(e));
-        return null;
+        setMsg(`❌ ${e.message}`);
       } finally {
-        if (!opts?.silent) setLoading(false);
+        setBusy(false);
       }
     },
-    [initialChainId, poolInput, side, amount, wallet.address, selectedStaking]
+    [chainId, pool, address, amount, side, tickLower, tickUpper]
   );
 
-  // 当从外部收藏条或「撤池重开」传入新池子时，立即同步并加载
+  /** 初始加载或外部换池时自动拉取 */
   useEffect(() => {
-    if (initialPool && initialPool !== poolInput) {
-      setPoolInput(initialPool);
-      setTxHashes([]);
-      setMintedTokenId(null);
-      loadParams({ poolOverride: initialPool });
-    } else if (initialPool && !data && !loading) {
-      loadParams({ poolOverride: initialPool });
+    if (initialPool && initialChainId) {
+      setChainId(initialChainId);
+      setPool(initialPool);
+      setTickLower("");
+      setTickUpper("");
+      fetchPool({
+        chainOverride: initialChainId,
+        poolOverride: initialPool,
+        withCompute: !!amount,
+        withWallet: !!address,
+      });
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [initialChainId, initialPool]);
 
-  // 当钱包连接地址变化时，静默刷新余额与授权状态
+  /** 金额/侧向变化时自动重算（防抖 500ms） */
+  const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEffect(() => {
-    if (data && wallet.address) {
-      loadParams({ silent: true });
-    }
+    if (!data || !amount) return;
+    if (debounceRef.current) clearTimeout(debounceRef.current);
+    debounceRef.current = setTimeout(() => {
+      fetchPool({ withCompute: true, withWallet: !!address });
+    }, 500);
+    return () => {
+      if (debounceRef.current) clearTimeout(debounceRef.current);
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [wallet.address]);
+  }, [amount, side]);
 
-  /** 在建仓面板内一键切换翻转状态，同时同步输入主币 */
-  async function handleToggleFlip() {
+  /** 钱包连接状态变化时刷新一次，拿到最新的授权额度和余额 */
+  useEffect(() => {
+    if (!data || !address) return;
+    fetchPool({ withCompute: !!amount, withWallet: true });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [address]);
+
+  /** 刷新 tick（LP 波动快时用，默认对齐最新最小窗口） */
+  async function refreshTick(useMinWindow = false) {
+    if (useMinWindow) {
+      setTickLower("");
+      setTickUpper("");
+      await fetchPool({
+        range: undefined,
+        withCompute: !!amount,
+        withWallet: !!address,
+      });
+    } else {
+      await fetchPool({
+        range: { tick_lower: Number(tickLower), tick_upper: Number(tickUpper) },
+        withCompute: !!amount,
+        withWallet: !!address,
+      });
+    }
+  }
+
+  /** 快捷预设：以当前 tick 为中心的对称区间 */
+  async function applyPreset(pct: number) {
     if (!data) return;
+    const spacing = data.pool.tickSpacing;
+    const current = data.pool.currentTick;
+    if (pct === 0) {
+      // 最小窗口
+      const lower = Math.floor(current / spacing) * spacing;
+      const upper = lower + spacing;
+      await fetchPool({
+        range: { tick_lower: lower, tick_upper: upper },
+        withCompute: !!amount,
+        withWallet: !!address,
+      });
+      return;
+    }
+    const delta = Math.round(Math.log(1 + pct / 100) / Math.log(1.0001));
+    const lower = Math.floor((current - delta) / spacing) * spacing;
+    const upper = Math.ceil((current + delta) / spacing) * spacing;
+    await fetchPool({
+      range: { tick_lower: lower, tick_upper: upper },
+      withCompute: !!amount,
+      withWallet: !!address,
+    });
+  }
+
+  /** 在建仓面板内翻转交易对，并把投入币种同步切到主币 */
+  async function handleFlipInMint() {
+    if (!data) return;
+    setBusy(true);
     try {
+      const nextFlip = data.pairFlip !== 1;
       const r = await fetch("/api/liquidity-probe/pair-flip", {
         method: "PUT",
         headers: authHeaders({ "Content-Type": "application/json" }),
         body: JSON.stringify({
-          chain_id: initialChainId,
+          chain_id: chainId,
           token0: data.pool.token0,
           token1: data.pool.token1,
-          flip: data.pairFlip !== 1,
+          flip: nextFlip,
         }),
       });
       const j = await r.json();
       if (!j.ok) throw new Error(j.error || "翻转失败");
-      const newFlip = data.pairFlip === 1 ? 0 : 1;
-      const nextSide: "token0" | "token1" = newFlip === 1 ? "token1" : "token0";
+      const nextSide: "token0" | "token1" = nextFlip ? "token1" : "token0";
       setSide(nextSide);
-      initializedPoolRef.current = `${initialChainId}:${data.pool.address.toLowerCase()}:${newFlip}`;
-      await loadParams({ sideOverride: nextSide });
+      initializedPoolRef.current = `${chainId}:${pool.toLowerCase()}:${nextFlip ? 1 : 0}`;
+      await fetchPool({
+        sideOverride: nextSide,
+        withCompute: !!amount,
+        withWallet: !!address,
+      });
       mutate("/api/positions");
       mutate("/api/liquidity-favorites");
       onFlipChanged?.();
-      toast.success(
-        `已切换计价方向：主币设为 ${
-          newFlip === 1 ? data.pool.token1Symbol : data.pool.token0Symbol
-        }`
-      );
     } catch (e: any) {
-      toast.error(e.message || "翻转失败");
+      setMsg(`❌ 翻转失败：${e.message}`);
+    } finally {
+      setBusy(false);
     }
   }
 
-  /** 一键开启/撤销 Staker 的 setApprovalForAll（免每次建仓后的单 NFT 授权交易） */
-  async function handleToggleSetApprovalForAll(approve: boolean) {
-    if (!data || !data.dex || !selectedStaking) return;
+  /** 开启/关闭 Staker 的 setApprovalForAll（免每次建仓后的单 NFT 授权签名） */
+  async function handleToggleApprovalForAll(approve: boolean) {
+    if (!data?.dex || !data?.matchedStaking?.[0]) return;
     setTogglingAllApprove(true);
-    setErr("");
+    setMsg("");
     try {
-      let addr = wallet.address;
-      if (!addr) {
-        addr = await wallet.connect();
-        if (!addr) throw new Error("未连接钱包");
+      let currentAddr = address;
+      if (!currentAddr) {
+        currentAddr = await connect();
+        if (!currentAddr) throw new Error("请先连接钱包");
       }
-      if (wallet.chainId !== data.chain.chain_id) {
-        await wallet.switchChain(data.chain.chain_id, {
-          chainName: data.chain.name,
-          rpcUrls: [],
-        });
+      if (walletChainId !== data.chain.chain_id) {
+        await switchChain(data.chain.chain_id);
       }
-      const txParams = buildSetApprovalForAllCalldata(
-        data.dex.npm as `0x${string}`,
-        selectedStaking as `0x${string}`,
+      const staker = data.matchedStaking[0].contract;
+      const tx = buildSetApprovalForAllCalldata(data.dex.npm, staker, approve);
+      await sendTx(tx);
+      await new Promise((r) => setTimeout(r, 1500));
+      await fetchPool({ withCompute: !!amount, withWallet: true });
+      setMsg(
         approve
-      );
-      const h = await wallet.sendTx({ ...txParams, gas: 100000n });
-      toast.info(approve ? "正在授权 Staker 免签通道…" : "正在撤销 Staker 批量授权…");
-      await waitForTxReceipt(h, 45_000);
-      await loadParams({ silent: true, walletOverride: addr });
-      toast.success(
-        approve
-          ? "已开启「免每次 NFT 授权」！后续建仓+质押将直接跳过 NFT 授权步骤"
-          : "已撤销 Staker 的批量 NFT 授权"
+          ? "✅ 已开启 NFT 免签质押！后续建仓后将直接质押，无需再签 NFT 授权交易"
+          : "✅ 已撤销 NFT 免签质押授权"
       );
     } catch (e: any) {
-      toast.error(e.message || String(e));
+      setMsg(`❌ 授权操作失败：${e?.message ?? e}`);
     } finally {
       setTogglingAllApprove(false);
     }
   }
 
-  /** 按钱包余额百分比快捷填入 */
-  function fillBalancePct(pct: number) {
-    if (!data?.balances) return;
-    const rawBal = Number(
-      side === "token0" ? data.balances.token0Human : data.balances.token1Human
-    );
-    if (!Number.isFinite(rawBal) || rawBal <= 0) return;
-    const val = pct >= 100 ? rawBal * 0.9999 : (rawBal * pct) / 100;
-    const decimals =
-      side === "token0" ? data.pool.token0Decimals : data.pool.token1Decimals;
-    const formatted = Number(val.toFixed(Math.min(decimals, 6))).toString();
-    setAmount(formatted);
-    loadParams({ amountOverride: formatted });
-  }
-
+  /** 执行创建流程 */
   async function execute() {
-    if (!data || !data.compute || !data.dex) return;
-    setErr("");
-    setTxHashes([]);
-    setMintedTokenId(null);
+    if (!address) {
+      await connect();
+      return;
+    }
+    if (!data?.compute) {
+      setMsg("❌ 请先输入投入金额");
+      return;
+    }
+    if (!data.dex) {
+      setMsg("❌ 未能匹配到池子所属 DEX（请在配置页添加对应 DEX）");
+      return;
+    }
+
+    setBusy(true);
+    setMsg("");
+    const npm = data.dex.npm;
+    const staker = data.matchedStaking?.[0]?.contract ?? "";
+    const need0 = BigInt(data.compute.amount0);
+    const need1 = BigInt(data.compute.amount1);
+    const appr = data.approvals;
+
+    const skip0 = appr?.token0?.sufficient ?? false;
+    const skip1 = appr?.token1?.sufficient ?? false;
+    const nftApprovedAll = appr?.nftApprovedForAll ?? false;
+
+    const flow: typeof steps = [
+      {
+        label: `授权 ${data.pool.token0Symbol || "token0"}`,
+        status: skip0 ? "skipped" : "pending",
+      },
+      {
+        label: `授权 ${data.pool.token1Symbol || "token1"}`,
+        status: skip1 ? "skipped" : "pending",
+      },
+      { label: "创建仓位 (mint)", status: "pending" },
+      ...(staker
+        ? [
+            {
+              label: `质押到 ${
+                data.matchedStaking[0].pair_label ||
+                data.matchedStaking[0].platform
+              }${nftApprovedAll ? "（已免签 NFT 授权）" : ""}`,
+              status: "pending" as const,
+            },
+          ]
+        : []),
+    ];
+    setSteps(flow);
+
+    const setStep = (i: number, patch: Partial<(typeof steps)[0]>) =>
+      setSteps((prev) =>
+        prev.map((s, idx) => (idx === i ? { ...s, ...patch } : s))
+      );
+
+    const sendWithRetry = async (
+      tx: { to: string; data: string },
+      label: string
+    ): Promise<string> => {
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          return await sendTx(tx);
+        } catch (e: any) {
+          if (attempt === 3) throw e;
+          const shouldRetry = confirm(
+            `${label} 失败：${e?.message ?? e}\n\n是否重试（第 ${attempt + 1}/3 次）？`
+          );
+          if (!shouldRetry) throw e;
+        }
+      }
+      throw new Error("unreachable");
+    };
 
     try {
-      // 1. 连接钱包
-      let addr = wallet.address;
-      if (!addr) {
-        setStep("连接钱包…");
-        addr = await wallet.connect();
-        if (!addr) throw new Error("未连接钱包");
+      await switchChain(data.chain.chain_id);
+
+      const beforeIds = await listOwnedTokenIds(npm, address);
+
+      // Step 1: approve token0
+      if (!skip0) {
+        setStep(0, { status: "loading" });
+        const a0 = buildApproveCalldata(data.pool.token0, npm, MAX_UINT256);
+        const h0 = await sendWithRetry(a0, `授权 ${data.pool.token0Symbol}`);
+        setStep(0, { status: "done", hash: h0 });
+        await new Promise((r) => setTimeout(r, 1200));
       }
 
-      // 2. 切链
-      if (wallet.chainId !== data.chain.chain_id) {
-        setStep(`切换到 ${data.chain.name}…`);
-        await wallet.switchChain(data.chain.chain_id, {
-          chainName: data.chain.name,
-          rpcUrls: [],
-        });
+      // Step 2: approve token1
+      if (!skip1) {
+        setStep(1, { status: "loading" });
+        const a1 = buildApproveCalldata(data.pool.token1, npm, MAX_UINT256);
+        const h1 = await sendWithRetry(a1, `授权 ${data.pool.token1Symbol}`);
+        setStep(1, { status: "done", hash: h1 });
+        await new Promise((r) => setTimeout(r, 1200));
       }
 
-      // 3. 重新带钱包地址拉取最新授权 & 金额
-      setStep("校验余额与授权状态…");
-      const fresh = await loadParams({
-        walletOverride: addr,
-        silent: true,
+      // Step 3: mint
+      setStep(2, { status: "loading" });
+      const mint = buildMintCalldata(npm, {
+        token0: data.pool.token0,
+        token1: data.pool.token1,
+        fee: data.pool.fee,
+        tickLower: Number(tickLower),
+        tickUpper: Number(tickUpper),
+        amount0Desired: need0,
+        amount1Desired: need1,
+        recipient: address,
+        slippagePct: 0.5,
       });
-      if (!fresh || !fresh.compute || !fresh.dex) {
-        throw new Error("无法计算建仓金额，请检查输入或 DEX 配置");
-      }
+      const hm = await sendWithRetry(mint, "创建仓位");
+      const tokenIdBig =
+        (await extractMintedTokenIdFromReceipt(hm, address, npm)) ??
+        (await diffNewTokenId(npm, address, beforeIds));
+      const tokenId = tokenIdBig ? tokenIdBig.toString() : null;
+      setStep(2, { status: "done", hash: hm });
 
-      const npm = fresh.dex.npm as `0x${string}`;
-      const amount0 = BigInt(fresh.compute.amount0);
-      const amount1 = BigInt(fresh.compute.amount1);
+      // Step 4: 质押（自动匹配到才做）
+      if (staker) {
+        if (!tokenIdBig || !tokenId) {
+          setStep(3, { status: "error" });
+          setMsg(`✅ 仓位已创建（未能解析 tokenId，请手动质押）`);
+        } else {
+          setStep(3, { status: "loading" });
+          try {
+            // 安全护栏：质押前链上读取 positions(tokenId)，确认 token0/token1/fee 与当前池一致
+            const check = await verifyNftPoolMatch(
+              npm,
+              tokenIdBig,
+              data.pool.token0,
+              data.pool.token1,
+              data.pool.fee
+            );
+            if (!check.valid) {
+              throw new Error(
+                check.reason || `NFT #${tokenId} 与当前池币种不匹配，已拦截质押`
+              );
+            }
 
-      // 4. Approve token0（若需要）
-      if (fresh.approvals && !fresh.approvals.token0.sufficient && amount0 > 0n) {
-        setStep(`1/3 · 授权 ${fresh.pool.token0Symbol} 给 NPM…`);
-        const tx = buildApproveCalldata(fresh.pool.token0 as `0x${string}`, npm);
-        const h = await wallet.sendTx({ ...tx, gas: 80000n });
-        setTxHashes((p) => [...p, h]);
-        setStep(`等待 ${fresh.pool.token0Symbol} 授权上链…`);
-        await waitForTxReceipt(h, 45_000);
-      }
-
-      // 5. Approve token1（若需要）
-      if (fresh.approvals && !fresh.approvals.token1.sufficient && amount1 > 0n) {
-        setStep(`1/3 · 授权 ${fresh.pool.token1Symbol} 给 NPM…`);
-        const tx = buildApproveCalldata(fresh.pool.token1 as `0x${string}`, npm);
-        const h = await wallet.sendTx({ ...tx, gas: 80000n });
-        setTxHashes((p) => [...p, h]);
-        setStep(`等待 ${fresh.pool.token1Symbol} 授权上链…`);
-        await waitForTxReceipt(h, 45_000);
-      }
-
-      // 6. NPM.mint
-      const factor = BigInt(10000 - slippageBps);
-      const amount0Min = (amount0 * factor) / 10000n;
-      const amount1Min = (amount1 * factor) / 10000n;
-
-      setStep("2/3 · 创建集中流动性仓位（NPM.mint）…");
-      const mintTx = buildMintCalldata(npm, {
-        token0: fresh.pool.token0 as `0x${string}`,
-        token1: fresh.pool.token1 as `0x${string}`,
-        fee: fresh.pool.fee,
-        tickLower: fresh.range.tickLower,
-        tickUpper: fresh.range.tickUpper,
-        amount0Desired: amount0,
-        amount1Desired: amount1,
-        amount0Min,
-        amount1Min,
-        recipient: addr as `0x${string}`,
-      });
-      const mintHash = await wallet.sendTx({ ...mintTx, gas: 550000n });
-      setTxHashes((p) => [...p, mintHash]);
-
-      setStep("等待 Mint 交易确认并解析 NFT #tokenId…");
-      const tokenId = await extractMintedTokenIdFromReceipt(
-        mintHash,
-        addr as `0x${string}`,
-        npm,
-        45_000
-      );
-      if (tokenId !== null) setMintedTokenId(tokenId.toString());
-
-      // 7. 自动质押（如勾选且配置了匹配的质押合约）
-      if (autoStake && selectedStaking && tokenId !== null) {
-        // 前端强校验：核验该 NFT 的底层 (token0, token1, fee) 是否 100% 匹配当前池子，杜绝错池质押
-        setStep(`核验 NFT #${tokenId.toString()} 池子归属…`);
-        const check = await verifyNftPoolMatch(
-          npm,
-          tokenId,
-          fresh.pool.token0,
-          fresh.pool.token1,
-          fresh.pool.fee
-        );
-        if (!check.valid) {
-          throw new Error(
-            check.reason || `NFT #${tokenId.toString()} 校验未通过，已中止质押`
-          );
+            // 如果尚未开启 setApprovalForAll，才需要单次 approve(staker, tokenId)
+            if (!nftApprovedAll) {
+              const approveNft = buildNftApproveCalldata(npm, staker, tokenIdBig);
+              await sendWithRetry(approveNft, "授权 NFT 给质押合约");
+              await new Promise((r) => setTimeout(r, 1500));
+            }
+            const dep = buildStakeDepositCalldata(staker, tokenIdBig);
+            const hd = await sendWithRetry(dep, "质押");
+            setStep(3, { status: "done", hash: hd });
+            setMsg(`✅ 创建并质押成功！tokenId=#${tokenId}`);
+          } catch (e: any) {
+            setStep(3, { status: "error" });
+            setMsg(
+              `⚠️ 仓位已创建（tokenId=#${tokenId}），质押未完成：${e?.message ?? e}`
+            );
+          }
         }
-
-        // 若尚未开启 setApprovalForAll，则执行单笔 approve(staker, tokenId)
-        if (!fresh.approvals?.nftApprovedForAll) {
-          setStep(`3/3 · 授权 NFT #${tokenId.toString()} 给质押合约…`);
-          const approveNftTx = buildNftApproveCalldata(
-            npm,
-            selectedStaking as `0x${string}`,
-            tokenId
-          );
-          const h1 = await wallet.sendTx({ ...approveNftTx, gas: 120000n });
-          setTxHashes((p) => [...p, h1]);
-          setStep(`等待 NFT #${tokenId.toString()} 授权确认…`);
-          await waitForTxReceipt(h1, 45_000);
-        }
-
-        setStep(`3/3 · 质押 NFT #${tokenId.toString()}（deposit）…`);
-        const stakeTx = buildStakeDepositCalldata(
-          selectedStaking as `0x${string}`,
-          tokenId
-        );
-        const h2 = await wallet.sendTx({ ...stakeTx, gas: 320000n });
-        setTxHashes((p) => [...p, h2]);
-        setStep(`等待质押交易确认…`);
-        await waitForTxReceipt(h2, 45_000);
+      } else {
+        setMsg(`✅ 仓位创建成功${tokenId ? `，tokenId=#${tokenId}` : ""}`);
       }
-
-      setStep("");
-      toast.success(
-        tokenId !== null
-          ? `建仓成功！NFT #${tokenId.toString()} ${
-              autoStake && selectedStaking ? "已自动质押" : "已入账"
-            }`
-          : "建仓成功！"
-      );
-
-      // 触发后端快速扫描以立即把新仓位收录进监控面板
-      fetch("/api/monitor", {
-        method: "POST",
-        headers: authHeaders({ "Content-Type": "application/json" }),
-        body: JSON.stringify({ mode: "combined" }),
-      })
-        .then(() => mutate("/api/positions"))
-        .catch(() => {});
-
-      loadParams({ silent: true, walletOverride: addr });
       onCreated?.();
     } catch (e: any) {
-      setErr(e.message || String(e));
-      toast.error(e.message || "建仓操作中断");
-      setStep("");
+      setSteps((prev) =>
+        prev.map((s) => (s.status === "loading" ? { ...s, status: "error" } : s))
+      );
+      setMsg(`❌ ${e?.message ?? e}`);
+    } finally {
+      setBusy(false);
     }
   }
 
-  // 根据 pairFlip 决定展示口径（翻转后 token1 为主币 Base，token0 为计价币 Quote）
+  /** 列举钱包当前在 NPM 上持有的全部 tokenId */
+  async function listOwnedTokenIds(
+    npm: string,
+    owner: string
+  ): Promise<Set<string>> {
+    const out = new Set<string>();
+    const p = (window as any).okxwallet || (window as any).ethereum;
+    if (!p) return out;
+    try {
+      const ownerPad = owner.toLowerCase().replace(/^0x/, "").padStart(64, "0");
+      const balHex = (await p.request({
+        method: "eth_call",
+        params: [{ to: npm, data: `0x70a08231${ownerPad}` }, "latest"],
+      })) as string;
+      const bal = Number(BigInt(balHex));
+      const limit = Math.min(bal, 50);
+      for (let i = 0; i < limit; i++) {
+        const idxHex = BigInt(i).toString(16).padStart(64, "0");
+        const idHex = (await p.request({
+          method: "eth_call",
+          params: [
+            { to: npm, data: `0x2f745c59${ownerPad}${idxHex}` },
+            "latest",
+          ],
+        })) as string;
+        out.add(BigInt(idHex).toString());
+      }
+    } catch {
+      /* ignore */
+    }
+    return out;
+  }
+
+  /** 兜底：对比 mint 前后的 tokenId 集合找出新增项 */
+  async function diffNewTokenId(
+    npm: string,
+    owner: string,
+    before: Set<string>
+  ): Promise<bigint | null> {
+    for (let i = 0; i < 5; i++) {
+      const now = await listOwnedTokenIds(npm, owner);
+      for (const id of now) {
+        if (!before.has(id)) return BigInt(id);
+      }
+      await new Promise((r) => setTimeout(r, 2000));
+    }
+    return null;
+  }
+
+  // 根据 pairFlip 处理主币/计价币展示顺序
   const isFlipped = data?.pairFlip === 1;
-  const baseSymbol = data
+  const sym0 = data?.pool?.token0Symbol || "token0";
+  const sym1 = data?.pool?.token1Symbol || "token1";
+  const displayPair = data
     ? isFlipped
-      ? data.pool.token1Symbol
-      : data.pool.token0Symbol
-    : "Token0";
-  const quoteSymbol = data
-    ? isFlipped
-      ? data.pool.token0Symbol
-      : data.pool.token1Symbol
-    : "Token1";
-
-  const rawPriceCurr = Number(data?.pool.priceCurrent ?? 0);
-  const rawPriceLow = Number(data?.range.priceLow ?? 0);
-  const rawPriceHigh = Number(data?.range.priceHigh ?? 0);
-
-  const displayPriceCurrent =
-    isFlipped && rawPriceCurr > 0 ? 1 / rawPriceCurr : rawPriceCurr;
-  const displayPriceLow =
-    isFlipped && rawPriceHigh > 0 ? 1 / rawPriceHigh : rawPriceLow;
-  const displayPriceHigh =
-    isFlipped && rawPriceLow > 0 ? 1 / rawPriceLow : rawPriceHigh;
-
-  // 下拉选项按「当前主币在前」排序，避免用户翻转后还要手动找 ETH
-  const sideOptions: Array<{
-    value: "token0" | "token1";
-    symbol: string;
-    roleLabel: string;
-  }> = data
-    ? isFlipped
-      ? [
-          { value: "token1", symbol: data.pool.token1Symbol, roleLabel: "主币" },
-          {
-            value: "token0",
-            symbol: data.pool.token0Symbol,
-            roleLabel: "计价币",
-          },
-        ]
-      : [
-          { value: "token0", symbol: data.pool.token0Symbol, roleLabel: "主币" },
-          {
-            value: "token1",
-            symbol: data.pool.token1Symbol,
-            roleLabel: "计价币",
-          },
-        ]
-    : [
-        { value: "token0", symbol: "Token0", roleLabel: "" },
-        { value: "token1", symbol: "Token1", roleLabel: "" },
-      ];
-
-  const currentSideBalance = data?.balances
-    ? side === "token0"
-      ? data.balances.token0Human
-      : data.balances.token1Human
-    : null;
-  const currentSideSymbol = data
-    ? side === "token0"
-      ? data.pool.token0Symbol
-      : data.pool.token1Symbol
+      ? `${sym1}/${sym0}`
+      : `${sym0}/${sym1}`
+    : "";
+  const displayPrice = data?.pool?.priceCurrent
+    ? fmtFull(
+        isFlipped && Number(data.pool.priceCurrent) > 0
+          ? 1 / Number(data.pool.priceCurrent)
+          : Number(data.pool.priceCurrent)
+      )
     : "";
 
   return (
-    <div className="rounded-xl border border-brand/30 bg-surface-card/95 p-3.5 space-y-3 shadow-card">
-      <div className="flex items-center justify-between gap-2 border-b border-white/[0.07] pb-2.5">
-        <div className="flex items-center gap-2 min-w-0">
-          <span className="inline-flex h-2 w-2 rounded-full bg-brand shadow-[0_0_8px_#06b6d4]" />
-          <h3 className="text-sm font-semibold text-ink truncate">
-            极速建仓 & 自动质押
-          </h3>
-          {data && (
-            <span className="tag-info font-mono text-[11px]">
-              {baseSymbol}/{quoteSymbol} · {(data.pool.fee / 10000).toFixed(2)}%
-            </span>
-          )}
-        </div>
-        <div className="flex items-center gap-1.5 shrink-0">
-          {data && (
-            <button
-              type="button"
-              onClick={handleToggleFlip}
-              className={`btn-ghost btn-xs ${
-                isFlipped
-                  ? "border-brand/40 text-brand-light bg-brand/10"
-                  : ""
-              }`}
-              title="切换主币/计价币方向（自动同步输入主币与价格展示）"
-            >
-              ⇄ 翻转计价
-            </button>
-          )}
-          {onClose && (
-            <button className="btn-ghost btn-xs" onClick={onClose}>
-              收起
-            </button>
-          )}
-        </div>
+    <div className="panel-inset border-cyan-500/30 p-4 text-xs">
+      <div className="mb-2.5 flex items-center justify-between">
+        <span className="text-sm font-semibold text-ink">
+          ➕ 创建 LP 仓位（最小区间）
+        </span>
+        {onClose && (
+          <button className="btn-ghost btn-xs" onClick={onClose}>
+            关闭
+          </button>
+        )}
       </div>
 
-      {/* 未选定池子时的轻量提示 */}
-      {!data && !loading && (
-        <div className="rounded-lg border border-dashed border-white/[0.12] bg-surface-raised/40 p-3 text-xs text-ink-soft">
-          👆 点击上方<strong>「★ 收藏池工作台」</strong>任意标签，即可一键加载该池的最小区间并在此直接建仓+质押。
-        </div>
-      )}
-
-      {/* 池子核心参数概览 */}
-      {data && (
-        <div className="space-y-3">
-          <div className="rounded-lg border border-white/[0.07] bg-surface-raised/60 p-2.5 text-xs space-y-1.5">
-            <div className="flex flex-wrap items-center justify-between gap-1">
-              <div className="flex items-center gap-1.5">
-                <span className="font-semibold text-ink">
-                  {baseSymbol} / {quoteSymbol}
-                </span>
-                <span className="text-[11px] text-ink-soft">
-                  ({data.chain.name}
-                  {data.dex ? ` · ${data.dex.name}` : ""})
-                </span>
-              </div>
-              <span className="font-mono text-[11px] text-ink-muted">
-                池 {short(data.pool.address)}
-              </span>
-            </div>
-
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5 pt-1 border-t border-white/[0.05]">
-              <div>
-                <span className="text-ink-soft">当前池价：</span>
-                <span className="font-mono font-semibold text-brand-light">
-                  1 {baseSymbol} = {fmtFull(displayPriceCurrent)} {quoteSymbol}
-                </span>
-              </div>
-              <div>
-                <span className="text-ink-soft">当前 Tick：</span>
-                <span className="font-mono text-ink">
-                  {data.pool.currentTick}
-                </span>
-                <span className="text-ink-muted ml-1">
-                  (步长 {data.pool.tickSpacing})
-                </span>
-              </div>
-            </div>
-
-            <div className="flex flex-wrap items-center justify-between gap-1 pt-1 border-t border-white/[0.05]">
-              <div>
-                <span className="text-ink-soft">建仓最小区间：</span>
-                <span className="font-mono font-semibold text-ok">
-                  [{data.range.tickLower}, {data.range.tickUpper}]
-                </span>
-              </div>
-              <div className="font-mono text-[11px] text-ink-soft">
-                {fmtFull(displayPriceLow)} ~ {fmtFull(displayPriceHigh)}{" "}
-                {quoteSymbol}
-              </div>
-            </div>
+      {/* 未选池子时提示从收藏列表选择 */}
+      {!data ? (
+        <div className="space-y-2">
+          <div className="flex items-center gap-2">
+            <span className="text-ink-soft">链</span>
+            <select
+              className="input max-w-[150px]"
+              value={chainId || ""}
+              onChange={(e) => setChainId(Number(e.target.value))}
+            >
+              <option value="">选择链</option>
+              {(chains ?? [])
+                .filter((c: any) => c.enabled)
+                .map((c: any) => (
+                  <option key={c.id} value={c.id}>
+                    {c.name}
+                  </option>
+                ))}
+            </select>
           </div>
-
-          {/* 输入币种 & 数量 + 余额快捷按钮 */}
-          <div className="rounded-lg border border-white/[0.07] bg-surface-raised/40 p-2.5 space-y-2">
-            <div className="flex items-center justify-between text-xs">
-              <span className="text-ink-soft font-medium">
-                输入单边数量（自动配平另一侧）
-              </span>
-              {currentSideBalance !== null && (
-                <span className="font-mono text-[11px] text-ink-soft">
-                  余额:{" "}
-                  <strong className="text-ink">
-                    {Number(currentSideBalance).toFixed(4)} {currentSideSymbol}
-                  </strong>
+          {initialPool ? (
+            <div className="text-ink-soft">
+              已选择池子{" "}
+              <span className="font-mono">{initialPool.slice(0, 12)}…</span>
+              {busy && <span className="ml-2 text-cyan-300">读取中…</span>}
+            </div>
+          ) : (
+            <div className="rounded-lg border border-cyan-500/30 bg-cyan-500/10 p-2.5 text-cyan-200">
+              👇 请在下方「收藏」列表点击一个交易对开始创建
+            </div>
+          )}
+          {msg && <p className="text-warn">{msg}</p>}
+        </div>
+      ) : (
+        <div className="space-y-2.5">
+          {/* 池子信息 + DEX 自动锁定 + 翻转同步 */}
+          <div className="flex flex-wrap items-center gap-2 text-ink-soft">
+            <span className="text-ink font-medium">
+              {displayPair} · fee {(data.pool.fee / 10000).toFixed(2)}% · ts{" "}
+              {data.pool.tickSpacing} · 当前 tick{" "}
+              <strong className="font-mono text-cyan-300">
+                {data.pool.currentTick}
+              </strong>
+              {displayPrice && (
+                <span className="ml-1.5 font-mono text-ink-soft">
+                  (1 {isFlipped ? sym1 : sym0} ≈ {displayPrice}{" "}
+                  {isFlipped ? sym0 : sym1})
                 </span>
               )}
-            </div>
-
-            <div className="grid grid-cols-12 gap-2">
-              <div className="col-span-5">
-                <select
-                  className="input font-medium"
-                  value={side}
-                  onChange={(e) => {
-                    const s = e.target.value as "token0" | "token1";
-                    setSide(s);
-                    loadParams({ sideOverride: s });
-                  }}
-                >
-                  {sideOptions.map((opt) => (
-                    <option key={opt.value} value={opt.value}>
-                      {opt.symbol} {opt.roleLabel ? `(${opt.roleLabel})` : ""}
-                    </option>
-                  ))}
-                </select>
-              </div>
-              <div className="col-span-7 flex gap-1.5">
-                <input
-                  className="input font-mono flex-1"
-                  value={amount}
-                  onChange={(e) => setAmount(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter") loadParams();
-                  }}
-                  placeholder="数量"
-                />
-                <button
-                  type="button"
-                  className="btn-ghost px-2.5 text-xs shrink-0"
-                  onClick={() => loadParams()}
-                  disabled={loading}
-                >
-                  {loading ? "…" : "重算"}
-                </button>
-              </div>
-            </div>
-
-            {/* 快捷百分比填入 + 滑点选择 */}
-            <div className="flex flex-wrap items-center justify-between gap-2 pt-0.5">
-              <div className="flex items-center gap-1">
-                <span className="text-[11px] text-ink-muted mr-0.5">快捷:</span>
-                {[25, 50, 75, 100].map((pct) => (
+            </span>
+            <button
+              className="btn-ghost btn-xs"
+              disabled={busy}
+              onClick={() => refreshTick(true)}
+              title="刷新最新 tick 并将区间对齐到当前最小窗口"
+            >
+              ↻ 刷新 tick
+            </button>
+            <button
+              className={`btn-ghost btn-xs ${
+                isFlipped ? "border-cyan-400/50 text-cyan-300" : ""
+              }`}
+              disabled={busy}
+              onClick={handleFlipInMint}
+              title="翻转主币/计价币方向（同步切换默认投入代币）"
+            >
+              {isFlipped ? "🔄 已翻转" : "🔄 翻转"}
+            </button>
+            {data.dex ? (
+              <span className="tag-ok">{data.dex.name}</span>
+            ) : (
+              <span className="tag-warn">未匹配 DEX</span>
+            )}
+            {data.matchedStaking?.length > 0 ? (
+              <>
+                <span className="tag-info">
+                  质押 →{" "}
+                  {data.matchedStaking[0].pair_label ||
+                    data.matchedStaking[0].platform}
+                </span>
+                {data.approvals?.nftApprovedForAll ? (
+                  <span className="inline-flex items-center gap-1 rounded bg-emerald-500/15 px-2 py-0.5 text-[11px] text-emerald-200 border border-emerald-500/30">
+                    ⚡ 已开启 NFT 免签质押
+                    <button
+                      type="button"
+                      className="ml-1 underline text-ink-muted hover:text-rose-300"
+                      disabled={togglingAllApprove}
+                      onClick={() => handleToggleApprovalForAll(false)}
+                    >
+                      撤销
+                    </button>
+                  </span>
+                ) : (
                   <button
-                    key={pct}
                     type="button"
-                    disabled={
-                      !currentSideBalance || Number(currentSideBalance) <= 0
-                    }
-                    onClick={() => fillBalancePct(pct)}
-                    className="rounded border border-white/[0.08] bg-white/[0.03] px-1.5 py-0.5 font-mono text-[10px] text-ink-soft hover:border-brand/40 hover:text-brand-light disabled:opacity-40"
+                    className="btn-secondary btn-xs"
+                    disabled={togglingAllApprove}
+                    onClick={() => handleToggleApprovalForAll(true)}
+                    title="对当前质押合约开启一次 setApprovalForAll，以后每次建仓后直接质押，省去单独授权 NFT 的钱包签名"
                   >
-                    {pct === 100 ? "MAX" : `${pct}%`}
+                    {togglingAllApprove
+                      ? "授权中…"
+                      : "⚡ 开启 NFT 免签质押 (省一步签名)"}
                   </button>
-                ))}
-              </div>
-              <div className="flex items-center gap-1 text-[11px] text-ink-soft">
-                <span>滑点:</span>
-                {[50, 100, 200].map((bps) => (
-                  <button
-                    key={bps}
-                    type="button"
-                    onClick={() => setSlippageBps(bps)}
-                    className={`rounded px-1.5 py-0.5 font-mono text-[10px] transition ${
-                      slippageBps === bps
-                        ? "bg-brand/20 text-brand-light border border-brand/40 font-semibold"
-                        : "bg-white/[0.03] text-ink-soft border border-white/[0.06]"
-                    }`}
-                  >
-                    {(bps / 100).toFixed(1)}%
-                  </button>
-                ))}
-              </div>
-            </div>
+                )}
+              </>
+            ) : (
+              <span className="text-ink-muted">（该交易对无质押平台）</span>
+            )}
           </div>
 
-          {/* 配平结果预览（按翻转后的主币优先展示） */}
+          {/* 区间 */}
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="text-ink-soft">区间</span>
+            <input
+              className="input max-w-[110px] font-mono"
+              value={tickLower}
+              onChange={(e) => setTickLower(e.target.value)}
+              placeholder="tickLower"
+            />
+            <span>~</span>
+            <input
+              className="input max-w-[110px] font-mono"
+              value={tickUpper}
+              onChange={(e) => setTickUpper(e.target.value)}
+              placeholder="tickUpper"
+            />
+            <button
+              className="btn-ghost btn-xs"
+              disabled={busy}
+              onClick={() =>
+                fetchPool({ withCompute: !!amount, withWallet: !!address })
+              }
+            >
+              应用
+            </button>
+            <span className="text-ink-soft ml-1">快捷</span>
+            <button
+              className="btn-ghost btn-xs"
+              disabled={busy}
+              onClick={() => applyPreset(0)}
+            >
+              最小窗口
+            </button>
+            <button
+              className="btn-ghost btn-xs"
+              disabled={busy}
+              onClick={() => applyPreset(1)}
+            >
+              ±1%
+            </button>
+            <button
+              className="btn-ghost btn-xs"
+              disabled={busy}
+              onClick={() => applyPreset(5)}
+            >
+              ±5%
+            </button>
+            <button
+              className="btn-ghost btn-xs"
+              disabled={busy}
+              onClick={() => applyPreset(10)}
+            >
+              ±10%
+            </button>
+          </div>
+
+          {/* 金额输入（自动计算另一侧；若已翻转则主币排第一） */}
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="text-ink-soft">投入</span>
+            <select
+              className="input max-w-[125px] font-semibold"
+              value={side}
+              onChange={(e) => setSide(e.target.value as "token0" | "token1")}
+            >
+              {isFlipped ? (
+                <>
+                  <option value="token1">{sym1} (主币)</option>
+                  <option value="token0">{sym0}</option>
+                </>
+              ) : (
+                <>
+                  <option value="token0">{sym0}</option>
+                  <option value="token1">{sym1}</option>
+                </>
+              )}
+            </select>
+            <input
+              className="input max-w-[160px] font-mono"
+              value={amount}
+              onChange={(e) => setAmount(e.target.value)}
+              placeholder="数量（自动算另一侧）"
+            />
+            {data.balances && (
+              <span className="text-ink-soft font-mono">
+                余额:{" "}
+                {isFlipped ? (
+                  <>
+                    {sym1} {Number(data.balances.token1Human).toFixed(4)} ·{" "}
+                    {sym0} {Number(data.balances.token0Human).toFixed(4)}
+                  </>
+                ) : (
+                  <>
+                    {sym0} {Number(data.balances.token0Human).toFixed(4)} ·{" "}
+                    {sym1} {Number(data.balances.token1Human).toFixed(4)}
+                  </>
+                )}
+              </span>
+            )}
+            {busy && <span className="text-cyan-300">计算中…</span>}
+          </div>
+
+          {/* 计算结果 + 授权状态（按翻转顺序展示主币在前） */}
           {data.compute && (
-            <div className="space-y-1.5">
-              <div className="grid grid-cols-2 gap-2 text-xs">
-                {(isFlipped
-                  ? [
-                      {
-                        sym: data.pool.token1Symbol,
-                        amt: data.compute.amount1Human,
-                        bal: data.balances?.token1Human,
-                        needsApprove:
-                          data.approvals && !data.approvals.token1.sufficient,
-                      },
-                      {
-                        sym: data.pool.token0Symbol,
-                        amt: data.compute.amount0Human,
-                        bal: data.balances?.token0Human,
-                        needsApprove:
-                          data.approvals && !data.approvals.token0.sufficient,
-                      },
-                    ]
-                  : [
-                      {
-                        sym: data.pool.token0Symbol,
-                        amt: data.compute.amount0Human,
-                        bal: data.balances?.token0Human,
-                        needsApprove:
-                          data.approvals && !data.approvals.token0.sufficient,
-                      },
-                      {
-                        sym: data.pool.token1Symbol,
-                        amt: data.compute.amount1Human,
-                        bal: data.balances?.token1Human,
-                        needsApprove:
-                          data.approvals && !data.approvals.token1.sufficient,
-                      },
-                    ]
-                ).map((item) => {
-                  const insufficient =
-                    item.bal !== undefined &&
-                    Number(item.amt) > Number(item.bal) * 1.0001;
-                  return (
-                    <div
-                      key={item.sym}
-                      className={`rounded-lg border p-2 ${
-                        insufficient
-                          ? "border-danger/40 bg-danger/10"
-                          : "border-white/[0.07] bg-surface-raised/60"
-                      }`}
-                    >
-                      <div className="flex items-center justify-between text-[11px] text-ink-soft">
-                        <span>需要 {item.sym}</span>
-                        {item.needsApprove && (
-                          <span className="text-[10px] text-warn">需授权</span>
-                        )}
-                      </div>
-                      <div className="mt-0.5 font-mono text-sm font-semibold text-ink truncate">
-                        {Number(item.amt).toFixed(6)}
-                      </div>
-                      {item.bal !== undefined && (
-                        <div
-                          className={`mt-0.5 font-mono text-[10px] ${
-                            insufficient
-                              ? "text-danger font-semibold"
-                              : "text-ink-muted"
-                          }`}
-                        >
-                          钱包: {Number(item.bal).toFixed(4)}{" "}
-                          {insufficient ? "(余额不足)" : ""}
-                        </div>
-                      )}
-                    </div>
-                  );
-                })}
-              </div>
+            <div className="rounded-lg border border-white/[0.1] bg-surface-card p-3 space-y-1">
+              {isFlipped ? (
+                <>
+                  <div>
+                    需要 {sym1}:{" "}
+                    <strong className="font-mono text-ink">
+                      {data.compute.amount1Human}
+                    </strong>
+                    {data.approvals?.token1?.sufficient && (
+                      <span className="ml-1.5 text-ok">
+                        （已授权，跳过 approve）
+                      </span>
+                    )}
+                  </div>
+                  <div>
+                    需要 {sym0}:{" "}
+                    <strong className="font-mono text-ink">
+                      {data.compute.amount0Human}
+                    </strong>
+                    {data.approvals?.token0?.sufficient && (
+                      <span className="ml-1.5 text-ok">
+                        （已授权，跳过 approve）
+                      </span>
+                    )}
+                  </div>
+                </>
+              ) : (
+                <>
+                  <div>
+                    需要 {sym0}:{" "}
+                    <strong className="font-mono text-ink">
+                      {data.compute.amount0Human}
+                    </strong>
+                    {data.approvals?.token0?.sufficient && (
+                      <span className="ml-1.5 text-ok">
+                        （已授权，跳过 approve）
+                      </span>
+                    )}
+                  </div>
+                  <div>
+                    需要 {sym1}:{" "}
+                    <strong className="font-mono text-ink">
+                      {data.compute.amount1Human}
+                    </strong>
+                    {data.approvals?.token1?.sufficient && (
+                      <span className="ml-1.5 text-ok">
+                        （已授权，跳过 approve）
+                      </span>
+                    )}
+                  </div>
+                </>
+              )}
 
               {data.compute.shareAfter !== undefined &&
                 data.compute.shareAfter > 0 && (
-                  <div className="flex items-center justify-between rounded-lg border border-white/[0.06] bg-surface-raised/40 px-2.5 py-1 text-[11px]">
-                    <span className="text-ink-soft">预计建仓后池内占比</span>
-                    <span className="font-mono font-bold text-brand-light">
-                      {(data.compute.shareAfter * 100).toFixed(2)}%
-                    </span>
+                  <div className="mt-1.5 border-t border-white/[0.08] pt-1.5">
+                    <div>
+                      添加后占比：
+                      <strong className="text-cyan-300 font-mono">
+                        {(data.compute.shareAfter * 100).toFixed(2)}%
+                      </strong>
+                      <span className="ml-1 text-ink-soft">
+                        （
+                        {data.compute.stakedLiquidity &&
+                        data.compute.stakedLiquidity !== "0"
+                          ? `质押池窗口 ${abbrevLiquidity(
+                              data.compute.stakedLiquidity
+                            )}`
+                          : `池子 ${abbrevLiquidity(
+                              data.compute.poolLiquidity
+                            )}`}
+                        ，你的 {abbrevLiquidity(data.compute.liquidity)}）
+                      </span>
+                    </div>
+                    {data.compute.shareInPool !== undefined &&
+                      data.compute.shareInPool > 0 &&
+                      data.compute.stakedLiquidity !== "0" && (
+                        <div className="mt-0.5 text-ink-soft">
+                          占整个池子活跃流动性{" "}
+                          {abbrevLiquidity(data.compute.poolLiquidity)} 的{" "}
+                          <strong className="text-ok font-mono">
+                            {(data.compute.shareInPool * 100).toFixed(2)}%
+                          </strong>
+                        </div>
+                      )}
                   </div>
                 )}
             </div>
           )}
 
-          {/* 质押与 ZIA DEX 免授权加速设置 */}
-          {data.matchedStaking.length > 0 && (
-            <div className="rounded-lg border border-ok/25 bg-ok/[0.06] p-2.5 text-xs space-y-2">
-              <div className="flex flex-wrap items-center justify-between gap-2">
-                <label className="flex items-center gap-1.5 font-medium text-ok cursor-pointer">
-                  <input
-                    type="checkbox"
-                    checked={autoStake}
-                    onChange={(e) => setAutoStake(e.target.checked)}
-                  />
-                  Mint 后自动质押挖矿
-                </label>
-
-                {autoStake && selectedStaking && (
-                  <div className="flex items-center gap-1.5">
-                    {data.approvals?.nftApprovedForAll ? (
-                      <>
-                        <span className="tag-ok text-[10px]">
-                          ⚡ 已开启免 NFT 授权
-                        </span>
-                        <button
-                          type="button"
-                          disabled={togglingAllApprove}
-                          onClick={() => handleToggleSetApprovalForAll(false)}
-                          className="text-[11px] text-ink-soft underline hover:text-danger"
-                          title="撤销 Staker 对 NPM 的 setApprovalForAll 授权"
-                        >
-                          撤销
-                        </button>
-                      </>
-                    ) : (
-                      <button
-                        type="button"
-                        disabled={togglingAllApprove}
-                        onClick={() => handleToggleSetApprovalForAll(true)}
-                        className="rounded border border-brand/40 bg-brand/15 px-2 py-0.5 text-[11px] font-medium text-brand-light hover:bg-brand/25 transition"
-                        title="开启后，每次建仓+质押可省去中间的 approve(tokenId) 钱包确认，且前端强制验证池子归属防错存"
-                      >
-                        {togglingAllApprove
-                          ? "处理中…"
-                          : "⚡ 开启免每次 NFT 授权"}
-                      </button>
-                    )}
-                  </div>
-                )}
-              </div>
-
-              {autoStake && (
-                <select
-                  className="input text-xs"
-                  value={selectedStaking}
-                  onChange={(e) => setSelectedStaking(e.target.value)}
-                >
-                  {data.matchedStaking.map((s) => (
-                    <option key={s.id} value={s.contract}>
-                      {s.platform} · {s.pair_label} ({short(s.contract)})
-                    </option>
-                  ))}
-                </select>
-              )}
-            </div>
-          )}
-
-          {/* 一键执行主按钮 */}
           <button
-            type="button"
-            className="btn-primary w-full py-2.5 text-sm font-semibold"
+            className="btn-primary text-xs"
+            disabled={busy || !data.compute || !data.dex}
             onClick={execute}
-            disabled={loading || !data.compute || !data.dex || !!step}
           >
-            {step
-              ? step
-              : autoStake && data.matchedStaking.length > 0
-              ? data.approvals?.nftApprovedForAll
-                ? `⚡ 极速建仓 + 质押（免 NFT 授权 · 2 步直达）`
-                : `🚀 一键建仓 + 质押（自动连签）`
-              : "🚀 一键建仓（NPM.mint）"}
+            {address
+              ? busy
+                ? "执行中…"
+                : data.matchedStaking?.length > 0
+                  ? "创建仓位并质押"
+                  : "创建仓位"
+              : "连接钱包"}
           </button>
 
-          {mintedTokenId && (
-            <div className="rounded-lg border border-ok/30 bg-ok/10 px-3 py-2 text-xs text-ok flex items-center justify-between">
-              <span>🎉 新仓位 NFT #{mintedTokenId} 已就绪</span>
-              <span className="font-mono text-[11px]">已同步至左侧监控列表</span>
-            </div>
-          )}
-
-          {txHashes.length > 0 && (
-            <div className="space-y-1 text-[11px] text-ink-soft">
-              {txHashes.map((h, i) => (
-                <div
-                  key={h}
-                  className="font-mono flex items-center justify-between"
-                >
-                  <span>交易 {i + 1}:</span>
-                  <span>{short(h)}</span>
+          {steps.length > 0 && (
+            <div className="space-y-1 pt-1">
+              {steps.map((s, i) => (
+                <div key={i} className="flex items-center gap-1.5">
+                  <span>
+                    {s.status === "done"
+                      ? "✅"
+                      : s.status === "skipped"
+                        ? "⏭️"
+                        : s.status === "loading"
+                          ? "⏳"
+                          : s.status === "error"
+                            ? "❌"
+                            : "○"}
+                  </span>
+                  <span
+                    className={
+                      s.status === "skipped"
+                        ? "text-ink-muted line-through"
+                        : "text-ink"
+                    }
+                  >
+                    {s.label}
+                  </span>
+                  {s.hash && (
+                    <span className="font-mono text-ink-soft">
+                      {s.hash.slice(0, 10)}…
+                    </span>
+                  )}
                 </div>
               ))}
             </div>
@@ -881,11 +911,37 @@ export function MintPositionPanel({
         </div>
       )}
 
-      {err && (
-        <div className="rounded-lg border border-danger/30 bg-danger/10 px-3 py-2 text-xs text-danger">
-          ❌ {err}
-        </div>
-      )}
+      {msg && <p className="mt-2 text-ink">{msg}</p>}
     </div>
   );
+}
+
+/** 把大整数 liquidity 缩写成可读形式 */
+function abbrevLiquidity(v?: string): string {
+  if (!v) return "0";
+  try {
+    const n = BigInt(v);
+    if (n === 0n) return "0";
+    const s = n.toString();
+    const units: [number, string][] = [
+      [18, "Q"],
+      [15, "P"],
+      [12, "T"],
+      [9, "B"],
+      [6, "M"],
+      [3, "K"],
+    ];
+    for (const [exp, suffix] of units) {
+      if (s.length > exp) {
+        const intPart = s.slice(0, s.length - exp);
+        const frac = s
+          .slice(s.length - exp, s.length - exp + 2)
+          .replace(/0+$/, "");
+        return `${intPart}${frac ? "." + frac : ""}${suffix}`;
+      }
+    }
+    return s;
+  } catch {
+    return v;
+  }
 }
