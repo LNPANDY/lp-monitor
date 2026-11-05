@@ -23,9 +23,9 @@ if [ ! -d node_modules ] || [ "$NEW_HASH" != "$OLD_HASH" ]; then
   if [ -z "$REGISTRY_SET" ] || [ "$REGISTRY_SET" = "undefined" ] || [ "$REGISTRY_SET" = "https://registry.npmjs.org/" ]; then
     npm config set registry https://registry.npmmirror.com
   fi
-  # 用 npm install 增量更新（不删 node_modules），比 npm ci 快得多；
-  # 静默 deprecation 警告（那些是子依赖的，无害且刷屏）。
-  npm install --no-audit --no-fund --loglevel=error 2>&1 | grep -v -E "npm warn deprecated|npm notice" || true
+  # 用 npm install --no-package-lock 增量更新，避免修改 package-lock.json 导致下次 git pull 冲突
+  npm install --no-package-lock --no-audit --no-fund --loglevel=error 2>&1 | grep -v -E "npm warn deprecated|npm notice" || true
+  git checkout -- package-lock.json 2>/dev/null || true
   echo "$NEW_HASH" > "$LOCK_HASH_FILE"
 else
   echo "==> 依赖无变化，跳过安装"
