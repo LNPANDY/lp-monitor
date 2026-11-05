@@ -196,9 +196,37 @@ export default function DashboardPage() {
         />
       )}
 
-      {/* 双栏终端主布局：左侧 7 列实时仓位监控，右侧 5 列三段式操作工作台 */}
+      {/* 双栏终端主布局：左侧 5 列三段式操作工作台，右侧 7 列实时仓位监控 */}
       <div className="grid grid-cols-1 gap-5 lg:grid-cols-12 items-start">
-        {/* ==================== 左栏（7/12）：LP 仓位监控 ==================== */}
+        {/* ==================== 左栏（5/12）：三段式联动工作台（探针 -> 建仓 -> Swap） ==================== */}
+        <div className="lg:col-span-5 space-y-4 lg:sticky lg:top-4">
+          <div ref={probeRef}>
+            <LiquidityProbe externalPool={externalPool} />
+          </div>
+
+          {/* 链上资产统计（可折叠抽屉） */}
+          <div className="card p-4">
+            <div className="flex items-center justify-between">
+              <span className="text-sm font-semibold text-ink">
+                📊 链上钱包资产统计
+              </span>
+              <button
+                type="button"
+                className="btn-ghost btn-xs"
+                onClick={() => setShowPortfolio((v) => !v)}
+              >
+                {showPortfolio ? "收起 ▲" : "展开查询 ▼"}
+              </button>
+            </div>
+            {showPortfolio && (
+              <div className="mt-3">
+                <PortfolioSection />
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* ==================== 右栏（7/12）：LP 仓位监控 ==================== */}
         <div className="lg:col-span-7 space-y-5">
           {/* 越界告警区（如有） */}
           {outOfRange.length > 0 && (
@@ -273,39 +301,11 @@ export default function DashboardPage() {
             </section>
           )}
         </div>
-
-        {/* ==================== 右栏（5/12）：三段式联动工作台（探针 -> 建仓 -> Swap） ==================== */}
-        <div className="lg:col-span-5 space-y-4 lg:sticky lg:top-4">
-          <div ref={probeRef}>
-            <LiquidityProbe externalPool={externalPool} />
-          </div>
-
-          {/* 链上资产统计（可折叠抽屉） */}
-          <div className="card p-4">
-            <div className="flex items-center justify-between">
-              <span className="text-sm font-semibold text-ink">
-                📊 链上钱包资产统计
-              </span>
-              <button
-                type="button"
-                className="btn-ghost btn-xs"
-                onClick={() => setShowPortfolio((v) => !v)}
-              >
-                {showPortfolio ? "收起 ▲" : "展开查询 ▼"}
-              </button>
-            </div>
-            {showPortfolio && (
-              <div className="mt-3">
-                <PortfolioSection />
-              </div>
-            )}
-          </div>
-        </div>
       </div>
 
       {/* 底部版本号 */}
       <div className="text-center text-xs text-ink-muted">
-        LP Monitor v{process.env.NEXT_PUBLIC_VERSION || "0.19.0"}
+        LP Monitor v{process.env.NEXT_PUBLIC_VERSION || "0.19.1"}
       </div>
     </div>
   );

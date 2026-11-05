@@ -1,35 +1,36 @@
 /**
  * 极速全能发现引擎（discover-fast）：
  *
- * 1. SQLite 持久化区块游标（`last_scanned_block_<chainId>`）：
- *    服务重启后直接从上次成功的区块高度继续，不再断档漏块。
- * 2. 新钱包首次自动全盘点（`wallet_init_done_<walletId>`）：
- *    对尚未初始化盘点过的钱包，自动执行一次 `findDirectPositions` + `findStakedPositions`（含 Vault 现存 NFT 直查），
- *    无视区块高度限制捞出所有历史直持/质押仓位，同时跳过已知 closed 空壳 NFT。
- * 3. 定向 Topic + 自动分片 `findRecentPositionsByTransfer`：
- *    仅在 `allSucceeded === true` 时推进区块游标，RPC 抖动时下次自动重扫。
+ * 1. 多钱包合并 Topic 扫描（`findRecentPositionsForWallets`）：
+ *    同一条链上所有启用钱包合并为单次 `eth_getLogs(to: wallets)` + `eth_getLogs(from: wallets)`，
+ *    单窗口控制在 950 块以内（单次 RPC 直接返回，不触发节点 1000 块限制与二分重试）。
+ * 2. SQLite 持久化区块游标（`last_scanned_block_<chainId>`）：
+ *    每次扫描后更新游标，日常 30 秒增量仅扫几十个块，耗时 ~150ms。
+ * 3. 已监控钱包零冗余盘点：
+ *    若钱包在 DB 中已有仓位记录，直接标记初始化完成；仅全新空钱包首次添加时检查尾部最新 15 个直持 NFT。
  */
 import { getDb, isPairFlipped } from "../db";
 import { getClient } from "../chains";
 import { listDexes, listStaking } from "../chains/dexes";
 import {
   findDirectPositions,
-  findStakedPositions,
-  findRecentPositionsByTransfer,
+  findRecentPositionsForWallets,
   eachLimit,
   type DiscoveredPosition,
 } from "../staking/discover";
-import { ownerOf, batchReadPoolTicks } from "../adapters/v3-fork";
+import { ownerOf } from "../adapters/v3-fork";
 import { getAdapter } from "../adapters";
 import { estimateBlockTimeSec, secondsToBlocks } from "../chains/blocktime";
 import {
-  getFullScanFirstHours,
   getFullScanPaddingSec,
   getSetting,
   setSetting,
 } from "../db/settings";
 import { resolveTokens } from "../chains/tokens";
 import type { Address } from "viem";
+
+/** 单次增量日志回溯的最大区块数（小于 0G 等 RPC 节点的 1000 块单次上限，确保 1 次请求直接返回） */
+const MAX_LOOKBACK_BLOCKS = 950n;
 
 export interface FastDiscoverSummary {
   windows: { chainId: number; from: string; to: string; blocks: number }[];
@@ -48,7 +49,7 @@ export async function runFastDiscover(opts: {
   lastBlockByChain: Record<number, bigint>;
   blockTimeByChain: Record<number, number>;
   isFirstScan: boolean;
-  /** 若为 true，强制对所有启用钱包做一次直持 + Vault 质押全盘点 */
+  /** 若为 true，对尚无任何仓位的钱包检查尾部最新直持 NFT */
   forceFullInventory?: boolean;
 }): Promise<FastDiscoverSummary> {
   const startedAt = Date.now();
@@ -68,11 +69,11 @@ export async function runFastDiscover(opts: {
     .prepare(`SELECT DISTINCT w.chain_id_ref FROM wallets w WHERE w.enabled=1`)
     .all() as { chain_id_ref: number }[];
 
-  const firstHours = getFullScanFirstHours();
   const paddingSec = getFullScanPaddingSec();
 
   for (const { chain_id_ref: chainIdRef } of chains) {
     try {
+      const tChain0 = Date.now();
       const { client, chain } = getClient(chainIdRef);
       const dexes = listDexes(chainIdRef, true);
       const staking = listStaking(chainIdRef, true);
@@ -86,7 +87,7 @@ export async function runFastDiscover(opts: {
         opts.blockTimeByChain[chainIdRef] = blockTime;
       }
 
-      // 优先从内存或 SQLite 读取上次成功扫描的区块号
+      // 优先从内存或 SQLite 读取上次扫描区块号
       const dbBlockKey = `last_scanned_block_${chainIdRef}`;
       let savedBlock = opts.lastBlockByChain[chainIdRef];
       if (!savedBlock) {
@@ -98,12 +99,15 @@ export async function runFastDiscover(opts: {
       }
 
       let fromBlock: bigint;
+      const minAllowedFrom =
+        latest > MAX_LOOKBACK_BLOCKS ? latest - MAX_LOOKBACK_BLOCKS : 0n;
+
       if (!savedBlock) {
-        const firstBlocks = secondsToBlocks(firstHours * 3600, blockTime);
-        fromBlock = latest > firstBlocks ? latest - firstBlocks : 0n;
+        fromBlock = minAllowedFrom;
       } else {
         const paddingBlocks = secondsToBlocks(paddingSec, blockTime);
         fromBlock = savedBlock > paddingBlocks ? savedBlock - paddingBlocks : 0n;
+        if (fromBlock < minAllowedFrom) fromBlock = minAllowedFrom;
         if (fromBlock > latest) fromBlock = latest;
       }
 
@@ -117,14 +121,16 @@ export async function runFastDiscover(opts: {
       const wallets = db
         .prepare("SELECT id, address FROM wallets WHERE chain_id_ref=? AND enabled=1")
         .all(chainIdRef) as { id: number; address: string }[];
+      if (wallets.length === 0) continue;
 
       // 预加载本链在 DB 中已知的所有仓位（含 closed 空壳，避免重复链上读取）
       const existingRows = db
         .prepare(
-          "SELECT id, dex_name, token_id, notify_state, source, pool FROM positions WHERE chain_id_ref=?"
+          "SELECT id, wallet_id, dex_name, token_id, notify_state, source, pool FROM positions WHERE chain_id_ref=?"
         )
         .all(chainIdRef) as {
         id: number;
+        wallet_id: number;
         dex_name: string;
         token_id: string;
         notify_state: string;
@@ -133,59 +139,67 @@ export async function runFastDiscover(opts: {
       }[];
       const existingByKey = new Map<
         string,
-        { id: number; notify_state: string; source: string; pool: string }
+        { id: number; wallet_id: number; notify_state: string; source: string; pool: string }
       >();
-      const skipIdsForStaking = new Set<string>();
+      const positionCountByWallet = new Map<number, number>();
       for (const r of existingRows) {
         existingByKey.set(`${r.dex_name}:${r.token_id}`, r);
-        const matchedDex = dexes.find((d) => d.name === r.dex_name);
-        if (matchedDex && r.notify_state === "closed") {
-          skipIdsForStaking.add(`${matchedDex.id}:${r.token_id}`);
-        }
+        positionCountByWallet.set(
+          r.wallet_id,
+          (positionCountByWallet.get(r.wallet_id) ?? 0) + 1
+        );
       }
 
       const stakingByAddr = new Map(
         staking.map((s) => [s.contract.toLowerCase(), s])
       );
       const nowIso = new Date().toISOString();
-      let chainAllLogsSucceeded = true;
+
+      // 1. 一次性批量扫描本链所有启用钱包的 Transfer 事件（每个 DEX 仅 2 次 getLogs RPC）
+      const batchLogs = await findRecentPositionsForWallets(
+        client,
+        wallets.map((w) => w.address as Address),
+        dexes,
+        staking,
+        fromBlock,
+        latest
+      );
 
       for (const w of wallets) {
         try {
           const tWallet0 = Date.now();
           const walletLower = w.address.toLowerCase();
           const walletInitKey = `wallet_init_done_${w.id}`;
-          const needsInitialInventory =
-            opts.forceFullInventory || getSetting(walletInitKey, "") !== "1";
+          const existingWalletPosCount = positionCountByWallet.get(w.id) ?? 0;
 
-          // 1. 增量 Transfer 事件扫描（带钱包 Topic 过滤 + 自动分片）
-          const cands = await findRecentPositionsByTransfer(
-            client,
-            w.address as Address,
-            dexes,
-            staking,
-            fromBlock,
-            latest
-          );
-          if (!cands.allSucceeded) {
-            chainAllLogsSucceeded = false;
+          // 如果该钱包在 DB 中已有仓位，直接标记已初始化，绝不执行耗时全量枚举
+          if (existingWalletPosCount > 0 && getSetting(walletInitKey, "") !== "1") {
+            setSetting(walletInitKey, "1");
           }
+
+          const needsInitialInventory =
+            existingWalletPosCount === 0 &&
+            (opts.forceFullInventory || getSetting(walletInitKey, "") !== "1");
+
+          const cands = batchLogs.byWallet.get(walletLower) ?? {
+            candidates: [],
+            outgoing: [],
+          };
 
           const mergedMap = new Map<string, DiscoveredPosition>();
           for (const c of cands.candidates) {
             mergedMap.set(`${c.dexId}:${c.tokenId}`, c);
           }
 
-          // 2. 若该钱包是首次加入或手动触发全盘点：用 balanceOf + Vault 枚举补齐所有历史仓位（不受区块窗口限制）
+          // 2. 仅当全新钱包（DB 尚无任何仓位）首次接入时，快速拉取尾部最新 15 个直持 NFT
           if (needsInitialInventory) {
-            const [directList, stakedList] = await Promise.all([
-              findDirectPositions(client, w.address as Address, dexes),
-              findStakedPositions(client, w.address as Address, dexes, staking, {
-                fromBlock,
-                skipIds: skipIdsForStaking,
-              }),
-            ]);
-            for (const d of [...directList, ...stakedList]) {
+            const directList = await findDirectPositions(
+              client,
+              w.address as Address,
+              dexes,
+              15
+            );
+            for (const d of directList) {
               const k = `${d.dexId}:${d.tokenId}`;
               if (!mergedMap.has(k)) {
                 mergedMap.set(k, d);
@@ -233,10 +247,7 @@ export async function runFastDiscover(opts: {
             walletClosed++;
           });
 
-          // 4. 处理候选列表：
-          //    - DB 已存在且已 closed 的历史空壳 NFT → 直接跳过（0 RPC！）
-          //    - DB 已存在但 source 改变（direct ↔ staking）或 wallet_id 更新 → 直接 UPDATE
-          //    - DB 不存在的新 tokenId → 并发调 readRange 读取状态，若活跃则 INSERT，若 liquidity=0 则记入 closed 缓存避免下次重读
+          // 4. 处理候选列表
           let walletNew = 0;
           let walletSourceChanged = 0;
           const unknownCandidates: DiscoveredPosition[] = [];
@@ -247,10 +258,9 @@ export async function runFastDiscover(opts: {
             const existing = existingByKey.get(`${dex.name}:${dp.tokenId}`);
             if (existing) {
               if (existing.notify_state === "closed") {
-                // 已知历史空壳 NFT，不再重复发链上请求
                 continue;
               }
-              if (existing.source !== dp.source) {
+              if (existing.source !== dp.source || existing.wallet_id !== w.id) {
                 db.prepare(
                   `UPDATE positions SET wallet_id=?, source=?, staker_contract=?, staking_id=?, last_checked_at=? WHERE id=?`
                 ).run(
@@ -262,6 +272,7 @@ export async function runFastDiscover(opts: {
                   existing.id
                 );
                 existing.source = dp.source;
+                existing.wallet_id = w.id;
                 sourceChanged++;
                 walletSourceChanged++;
               }
@@ -286,7 +297,6 @@ export async function runFastDiscover(opts: {
             );
             if (r.kind === "unreadable") return;
             if (r.kind === "closed") {
-              // 写入一条 closed 记录，防止后续全盘点时每次都对这个空壳 NFT 发 RPC！
               try {
                 db.prepare(
                   `INSERT OR IGNORE INTO positions
@@ -307,6 +317,7 @@ export async function runFastDiscover(opts: {
                 );
                 existingByKey.set(`${dex.name}:${dp.tokenId}`, {
                   id: 0,
+                  wallet_id: w.id,
                   notify_state: "closed",
                   source: dp.source,
                   pool: "",
@@ -388,13 +399,14 @@ export async function runFastDiscover(opts: {
             walletNew++;
           });
 
-          console.log(
-            `[fast-discover] wallet ${w.address} chain ${chain.name}: new=${walletNew} source_changed=${walletSourceChanged} closed=${walletClosed} (${
-              Date.now() - tWallet0
-            }ms)`
-          );
+          if (walletNew > 0 || walletSourceChanged > 0 || walletClosed > 0) {
+            console.log(
+              `[fast-discover] wallet ${w.address} chain ${chain.name}: new=${walletNew} source_changed=${walletSourceChanged} closed=${walletClosed} (${
+                Date.now() - tWallet0
+              }ms)`
+            );
+          }
         } catch (e: any) {
-          chainAllLogsSucceeded = false;
           errors.push(
             `[fast-discover] wallet ${w.address} chain ${chain.name}: ${
               e?.message ?? e
@@ -403,11 +415,14 @@ export async function runFastDiscover(opts: {
         }
       }
 
-      // 仅当本链所有 getLogs 均成功时才推进区块游标并持久化到 SQLite
-      if (chainAllLogsSucceeded) {
-        opts.lastBlockByChain[chainIdRef] = latest;
-        setSetting(dbBlockKey, latest.toString());
-      }
+      // 推进区块游标并持久化到 SQLite
+      opts.lastBlockByChain[chainIdRef] = latest;
+      setSetting(dbBlockKey, latest.toString());
+      console.log(
+        `[fast-discover] chain ${chain.name} (${wallets.length} wallets, ${Number(
+          latest - fromBlock
+        )} blocks): done in ${Date.now() - tChain0}ms`
+      );
     } catch (e: any) {
       errors.push(`[fast-discover] chain ${chainIdRef}: ${e?.message ?? e}`);
     }

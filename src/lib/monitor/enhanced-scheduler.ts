@@ -275,12 +275,12 @@ async function runCombinedScanWrapper(opts?: { forceFullInventory?: boolean }) {
   return summary;
 }
 
-/** 手动触发统一扫描（同时做增量日志 + 盘点校验 + 已知仓位并发刷新） */
+/** 手动触发统一扫描（多钱包批量 Transfer 增量 + 已知仓位 8 路并发刷新） */
 export async function triggerCombinedScan() {
-  return await runCombinedScanWrapper({ forceFullInventory: true });
+  return await runCombinedScanWrapper();
 }
 
-/** 向后兼容：triggerFullScan 走统一极速扫描（含全量活跃盘点） */
+/** 向后兼容：triggerFullScan 走统一极速扫描 */
 export async function triggerFullScan() {
   return await runCombinedScanWrapper({ forceFullInventory: true });
 }

@@ -285,7 +285,7 @@ export function RemovePositionButton({
           title={
             isWrongWallet
               ? `请先切换钱包至 ${ownerTag} 后再执行撤池重开`
-              : "撤出当前越界/旧仓位，并同时在右侧三段式工作台载入该池，按最新 Tick 一键重开"
+              : "撤出当前越界/旧仓位，并同时在左侧三段式工作台载入该池，按最新 Tick 一键重开"
           }
         >
           {busyMode === "reopen" ? step || "处理中…" : "🔄 撤池并重开"}

@@ -111,25 +111,48 @@ async function readPoolState(client: PublicClient, pool: `0x${string}`) {
   };
 }
 
-/** 读取 pool 的 fee / tickSpacing / token0 / token1。 */
+/** 池子静态元数据缓存（fee / tickSpacing / token0 / token1 在链上永不改变） */
+const poolInfoCache = new Map<
+  string,
+  { fee: number; tickSpacing: number; token0: `0x${string}`; token1: `0x${string}` }
+>();
+
+/** NFT 静态池子与区间缓存（token0 / token1 / fee / tickLower / tickUpper 铸造后永不改变） */
+const nftStaticCache = new Map<
+  string,
+  { poolKey: string; tickLower: number; tickUpper: number }
+>();
+
+/** 已平仓（liquidity === 0）NFT 集合缓存，避免重复链上读取 */
+const closedNftSet = new Set<string>();
+
+/** Vault 持有 tokenId 列表短期缓存（15 秒 TTL，避免连续切换探针时重复枚举） */
+const ownedTokenIdsCache = new Map<string, { ts: number; ids: bigint[] }>();
+
+/** 读取 pool 的 fee / tickSpacing / token0 / token1（带永久内存缓存）。 */
 async function readPoolInfo(client: PublicClient, pool: `0x${string}`) {
+  const k = pool.toLowerCase();
+  const cached = poolInfoCache.get(k);
+  if (cached) return cached;
   const [fee, tickSpacing, token0, token1] = await Promise.all([
     client.readContract({ address: pool, abi: POOL_EXTRA_ABI, functionName: "fee" }),
     client.readContract({ address: pool, abi: POOL_EXTRA_ABI, functionName: "tickSpacing" }),
     client.readContract({ address: pool, abi: POOL_EXTRA_ABI, functionName: "token0" }),
     client.readContract({ address: pool, abi: POOL_EXTRA_ABI, functionName: "token1" }),
   ]);
-  return {
+  const info = {
     fee: Number(fee),
     tickSpacing: Number(tickSpacing),
     token0: token0 as `0x${string}`,
     token1: token1 as `0x${string}`,
   };
+  poolInfoCache.set(k, info);
+  return info;
 }
 
 /**
  * 枚举 owner（vault 或钱包）在 NPM 上持有的全部 LP NFT tokenId。
- * 用 balanceOf + tokenOfOwnerByIndex，比扫 Transfer 事件快且完整。
+ * 用 balanceOf + tokenOfOwnerByIndex，带 15 秒短期缓存。
  */
 async function enumerateOwnedTokenIds(
   client: PublicClient,
@@ -137,14 +160,18 @@ async function enumerateOwnedTokenIds(
   owner: `0x${string}`,
   maxCount = 500
 ): Promise<bigint[]> {
+  const cacheKey = `${npm.toLowerCase()}:${owner.toLowerCase()}`;
+  const cached = ownedTokenIdsCache.get(cacheKey);
+  if (cached && Date.now() - cached.ts < 15_000) {
+    return cached.ids;
+  }
   const count = Number(
     (await client.readContract({ address: npm, abi: V3_NPM_ABI, functionName: "balanceOf", args: [owner] })) as bigint
   );
   if (count === 0) return [];
   const limit = Math.min(count, maxCount);
   const ids: bigint[] = [];
-  // 并发读取 tokenOfOwnerByIndex（分批，避免单次 RPC 太多请求）
-  const BATCH = 20;
+  const BATCH = 25;
   for (let i = 0; i < limit; i += BATCH) {
     const batch = Array.from({ length: Math.min(BATCH, limit - i) }, async (_, j) => {
       const idx = i + j;
@@ -163,7 +190,50 @@ async function enumerateOwnedTokenIds(
     const results = await Promise.all(batch);
     for (const r of results) if (r !== null) ids.push(r);
   }
+  ownedTokenIdsCache.set(cacheKey, { ts: Date.now(), ids });
   return ids;
+}
+
+/**
+ * 带静态池子/区间前置过滤的 positions(tokenId) 读取：
+ * 若已知该 NFT 属于其它池子、或 tick 区间不覆盖目标窗口、或已平仓，直接 0 RPC 跳过！
+ */
+async function readMatchingPositionLiquidity(
+  client: PublicClient,
+  npm: `0x${string}`,
+  tokenId: bigint,
+  targetPoolKey: string,
+  targetTickLower: number,
+  targetTickUpper: number
+): Promise<bigint | null> {
+  const nftKey = `${npm.toLowerCase()}:${tokenId.toString()}`;
+  if (closedNftSet.has(nftKey)) return null;
+
+  const staticMeta = nftStaticCache.get(nftKey);
+  if (staticMeta) {
+    if (staticMeta.poolKey !== targetPoolKey) return null;
+    if (staticMeta.tickLower > targetTickLower || staticMeta.tickUpper < targetTickUpper) {
+      return null;
+    }
+  }
+
+  const meta = await readPositionMeta(client, npm, tokenId);
+  if (!meta) return null;
+
+  const lpPoolKey = `${meta.token0.toLowerCase()}-${meta.token1.toLowerCase()}-${meta.fee}`;
+  nftStaticCache.set(nftKey, {
+    poolKey: lpPoolKey,
+    tickLower: meta.tickLower,
+    tickUpper: meta.tickUpper,
+  });
+
+  if (meta.liquidity === 0n) {
+    closedNftSet.add(nftKey);
+    return null;
+  }
+  if (lpPoolKey !== targetPoolKey) return null;
+  if (meta.tickLower > targetTickLower || meta.tickUpper < targetTickUpper) return null;
+  return meta.liquidity;
 }
 
 // ==================== 场景 A：直接持有 ====================
@@ -271,13 +341,16 @@ export async function analyzeStaked(
   let aggregatedLiquidity = 0n;
   let matchedCount = 0;
   await mapWithConcurrency(tokenIds, 8, async (tokenId) => {
-    const meta = await readPositionMeta(client, npm, tokenId);
-    if (!meta || meta.liquidity === 0n) return;
-    const lpPoolKey = `${meta.token0.toLowerCase()}-${meta.token1.toLowerCase()}-${meta.fee}`;
-    if (lpPoolKey !== poolKey) return;
-    // tick 区间必须完整覆盖目标窗口 [tickLower, tickUpper]，L 才在窗口内有效
-    if (meta.tickLower > tickLower || meta.tickUpper < tickUpper) return;
-    aggregatedLiquidity += meta.liquidity;
+    const liq = await readMatchingPositionLiquidity(
+      client,
+      npm,
+      tokenId,
+      poolKey,
+      tickLower,
+      tickUpper
+    );
+    if (!liq || liq === 0n) return;
+    aggregatedLiquidity += liq;
     matchedCount++;
   });
 
@@ -345,8 +418,10 @@ export async function probeMinRange(
   npm?: `0x${string}`,
   stakerAddr?: `0x${string}`
 ): Promise<MinRangeProbeResult> {
-  const { sqrtPriceX96, currentTick, liquidity: poolLiquidity } = await readPoolState(client, pool);
-  const info = await readPoolInfo(client, pool);
+  const [{ sqrtPriceX96, currentTick, liquidity: poolLiquidity }, info] = await Promise.all([
+    readPoolState(client, pool),
+    readPoolInfo(client, pool),
+  ]);
   const tickSpacing = info.tickSpacing || FEE_TO_TICK_SPACING[info.fee] || 1;
 
   // 最小区间：当前 tick 向下取整到 tickSpacing 倍数，宽 tickSpacing
@@ -357,18 +432,21 @@ export async function probeMinRange(
 
   let effectiveLiquidity = poolLiquidity;
   if (npm && stakerAddr) {
-    // vault 场景：枚举并统计该窗口内同池子 LP 流动性
+    // vault 场景：枚举并统计该窗口内同池子 LP 流动性（带静态缓存前置过滤）
     const tokenIds = await enumerateOwnedTokenIds(client, npm, stakerAddr);
     const poolKey = `${info.token0.toLowerCase()}-${info.token1.toLowerCase()}-${info.fee}`;
     let agg = 0n;
     await mapWithConcurrency(tokenIds, 8, async (tokenId) => {
-      const meta = await readPositionMeta(client, npm, tokenId);
-      if (!meta || meta.liquidity === 0n) return;
-      const lpPoolKey = `${meta.token0.toLowerCase()}-${meta.token1.toLowerCase()}-${meta.fee}`;
-      if (lpPoolKey !== poolKey) return;
-      // 只统计落在该最小窗口内的（tick 范围被当前最小窗口完全包含）
-      if (meta.tickLower <= tickLower && meta.tickUpper >= tickUpper) {
-        agg += meta.liquidity;
+      const liq = await readMatchingPositionLiquidity(
+        client,
+        npm,
+        tokenId,
+        poolKey,
+        tickLower,
+        tickUpper
+      );
+      if (liq && liq > 0n) {
+        agg += liq;
       }
     });
     if (agg > 0n) effectiveLiquidity = agg;
