@@ -652,17 +652,17 @@ export function MintPositionPanel({
           </div>
 
           {/* 区间 */}
-          <div className="flex flex-wrap items-center gap-2">
-            <span className="text-ink-soft">区间</span>
+          <div className="flex flex-wrap items-center gap-1.5">
+            <span className="text-ink-soft shrink-0">区间</span>
             <input
-              className="input max-w-[110px] font-mono"
+              className="input !w-[92px] px-2 py-1 font-mono"
               value={tickLower}
               onChange={(e) => setTickLower(e.target.value)}
               placeholder="tickLower"
             />
             <span>~</span>
             <input
-              className="input max-w-[110px] font-mono"
+              className="input !w-[92px] px-2 py-1 font-mono"
               value={tickUpper}
               onChange={(e) => setTickUpper(e.target.value)}
               placeholder="tickUpper"
@@ -709,9 +709,9 @@ export function MintPositionPanel({
 
           {/* 金额输入（自动计算另一侧；若已翻转则主币排第一） */}
           <div className="flex flex-wrap items-center gap-2">
-            <span className="text-ink-soft">投入</span>
+            <span className="text-ink-soft shrink-0">投入</span>
             <select
-              className="input max-w-[125px] font-semibold"
+              className="input !w-auto min-w-[82px] max-w-[115px] py-1 pl-2 pr-5 font-semibold"
               value={side}
               onChange={(e) => setSide(e.target.value as "token0" | "token1")}
             >
@@ -728,10 +728,10 @@ export function MintPositionPanel({
               )}
             </select>
             <input
-              className="input max-w-[160px] font-mono"
+              className="input !w-[150px] px-2 py-1 font-mono"
               value={amount}
               onChange={(e) => setAmount(e.target.value)}
-              placeholder="数量（自动算另一侧）"
+              placeholder="输入数量"
             />
             {data.balances && (
               <span className="text-ink-soft font-mono">

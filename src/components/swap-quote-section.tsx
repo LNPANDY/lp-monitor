@@ -437,9 +437,9 @@ export function SwapQuoteSection({
     : "";
 
   return (
-    <section className={embedded ? "panel-inset p-4" : "card p-4"}>
+    <section className={embedded ? "panel-inset p-3.5" : "card p-4"}>
       <div className="mb-2.5 flex flex-wrap items-center justify-between gap-2">
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-1.5">
           <h2 className="text-sm font-semibold text-ink">
             {embedded ? "③ 💱 当前池双币极速兑换 (Swap)" : "💱 代币兑换 (Swap)"}
           </h2>
@@ -450,14 +450,14 @@ export function SwapQuoteSection({
           )}
         </div>
 
-        {/* DEX 选择 */}
+        {/* DEX 选择（紧凑宽度） */}
         <div className="flex items-center gap-1.5 text-xs">
-          <span className="text-ink-soft">DEX</span>
+          <span className="text-ink-soft shrink-0">DEX</span>
           {dexOptions.length === 0 ? (
             <span className="text-warn">未配 QuoterV2</span>
           ) : (
             <select
-              className="input py-1 px-2 text-xs max-w-[175px]"
+              className="input !w-auto max-w-[145px] py-1 pl-2 pr-5 text-xs"
               value={dex?.id ?? ""}
               onChange={(e) => {
                 setDexId(e.target.value ? Number(e.target.value) : "");
@@ -478,32 +478,33 @@ export function SwapQuoteSection({
         </div>
       </div>
 
-      {/* 兑换输入区 */}
+      {/* 兑换输入区：左右严格等宽等高对齐 */}
       {dex && chainTokens.length >= 2 && (
         <div className="space-y-2.5">
-          <div className="grid grid-cols-1 gap-2 sm:grid-cols-[1fr_auto_1fr] sm:items-center">
-            {/* 输入侧 */}
-            <div className="rounded-lg border border-white/[0.08] bg-surface-base/70 p-2.5 text-xs">
-              <div className="mb-1.5 flex items-center justify-between text-ink-soft">
-                <span>卖出 (In)</span>
-                {balances && tokenInMeta && (
-                  <span className="font-mono text-[11px]">
-                    余额: {fmtBalance(balances.in, balances.decIn)}
-                  </span>
-                )}
+          <div className="grid grid-cols-1 gap-2 sm:grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] sm:items-stretch">
+            {/* 输入侧（卖出 In） */}
+            <div className="flex flex-col justify-between rounded-lg border border-white/[0.08] bg-surface-base/70 p-2.5 text-xs">
+              <div className="mb-1.5 flex h-[18px] items-center justify-between gap-1 text-ink-soft">
+                <span className="shrink-0">卖出 (In)</span>
+                <span className="truncate font-mono text-[11px]">
+                  余额:{" "}
+                  {balances && tokenInMeta
+                    ? fmtBalance(balances.in, balances.decIn)
+                    : "—"}
+                </span>
               </div>
               <div className="flex items-center gap-1.5">
                 <input
-                  className="input w-full font-mono text-xs"
+                  className="input flex-1 min-w-0 px-2 py-1.5 font-mono text-xs"
                   value={amountIn}
                   onChange={(e) => {
                     setEditingSide("in");
                     setAmountIn(e.target.value);
                   }}
-                  placeholder="0.0"
+                  placeholder="输入数量 0.0"
                 />
                 <select
-                  className="input w-[108px] shrink-0 text-xs font-semibold"
+                  className="input !w-[78px] shrink-0 py-1.5 pl-2 pr-5 text-xs font-semibold truncate"
                   value={inSym}
                   onChange={(e) => {
                     setInSym(e.target.value);
@@ -518,27 +519,26 @@ export function SwapQuoteSection({
                   ))}
                 </select>
               </div>
-              {balances && balances.in !== "0" && (
-                <div className="mt-1.5 flex items-center gap-1">
-                  {[25, 50, 100].map((pct) => (
-                    <button
-                      key={pct}
-                      type="button"
-                      onClick={() => applyBalancePct(pct)}
-                      className="rounded border border-white/[0.1] bg-white/[0.04] px-1.5 py-0.5 text-[10px] text-ink-soft hover:border-cyan-400/50 hover:text-cyan-300"
-                    >
-                      {pct === 100 ? "MAX" : `${pct}%`}
-                    </button>
-                  ))}
-                </div>
-              )}
+              <div className="mt-1.5 flex h-[22px] items-center gap-1">
+                {[25, 50, 100].map((pct) => (
+                  <button
+                    key={pct}
+                    type="button"
+                    disabled={!balances || balances.in === "0"}
+                    onClick={() => applyBalancePct(pct)}
+                    className="rounded border border-white/[0.12] bg-white/[0.05] px-1.5 py-0.5 text-[10px] text-ink-soft transition hover:border-cyan-400/50 hover:text-cyan-300 disabled:opacity-40 disabled:pointer-events-none"
+                  >
+                    {pct === 100 ? "MAX" : `${pct}%`}
+                  </button>
+                ))}
+              </div>
             </div>
 
-            {/* 交换按钮 */}
-            <div className="flex justify-center">
+            {/* 交换按钮（垂直居中对齐） */}
+            <div className="flex items-center justify-center">
               <button
                 type="button"
-                className="btn-ghost px-2.5 py-1.5 text-xs font-bold"
+                className="btn-ghost h-8 w-8 p-0 text-xs font-bold"
                 title="交换买卖方向"
                 onClick={swapSides}
               >
@@ -546,28 +546,29 @@ export function SwapQuoteSection({
               </button>
             </div>
 
-            {/* 输出侧 */}
-            <div className="rounded-lg border border-white/[0.08] bg-surface-base/70 p-2.5 text-xs">
-              <div className="mb-1.5 flex items-center justify-between text-ink-soft">
-                <span>得到 (Out)</span>
-                {balances && tokenOutMeta && (
-                  <span className="font-mono text-[11px]">
-                    余额: {fmtBalance(balances.out, balances.decOut)}
-                  </span>
-                )}
+            {/* 输出侧（得到 Out） */}
+            <div className="flex flex-col justify-between rounded-lg border border-white/[0.08] bg-surface-base/70 p-2.5 text-xs">
+              <div className="mb-1.5 flex h-[18px] items-center justify-between gap-1 text-ink-soft">
+                <span className="shrink-0">得到 (Out)</span>
+                <span className="truncate font-mono text-[11px]">
+                  余额:{" "}
+                  {balances && tokenOutMeta
+                    ? fmtBalance(balances.out, balances.decOut)
+                    : "—"}
+                </span>
               </div>
               <div className="flex items-center gap-1.5">
                 <input
-                  className="input w-full font-mono text-xs"
+                  className="input flex-1 min-w-0 px-2 py-1.5 font-mono text-xs"
                   value={amountOut}
                   onChange={(e) => {
                     setEditingSide("out");
                     setAmountOut(e.target.value);
                   }}
-                  placeholder="0.0"
+                  placeholder="预估数量 0.0"
                 />
                 <select
-                  className="input w-[108px] shrink-0 text-xs font-semibold"
+                  className="input !w-[78px] shrink-0 py-1.5 pl-2 pr-5 text-xs font-semibold truncate"
                   value={outSym}
                   onChange={(e) => {
                     setOutSym(e.target.value);
@@ -582,15 +583,24 @@ export function SwapQuoteSection({
                   ))}
                 </select>
               </div>
+              <div className="mt-1.5 flex h-[22px] items-center justify-between text-[10px] text-ink-muted">
+                {quote ? (
+                  <span className="truncate font-mono text-ink-soft">
+                    最少得: {trimNum(quote.amountOutMinHuman)} {quote.tokenOut.symbol}
+                  </span>
+                ) : (
+                  <span>输入任一侧自动寻优报价</span>
+                )}
+              </div>
             </div>
           </div>
 
-          {/* 滑点 + 费率档 + 兑换按钮 */}
-          <div className="flex flex-wrap items-center justify-between gap-2">
-            <div className="flex flex-wrap items-center gap-2 text-xs">
-              <span className="text-ink-soft">滑点</span>
+          {/* 滑点 + 费率档 + 兑换按钮（单行水平对齐） */}
+          <div className="flex flex-wrap items-center justify-between gap-2 pt-0.5">
+            <div className="flex flex-wrap items-center gap-1.5 text-xs">
+              <span className="text-ink-soft shrink-0">滑点</span>
               <select
-                className="input w-[84px] py-1 px-2 text-xs"
+                className="input !w-[68px] shrink-0 py-1 pl-2 pr-5 text-xs"
                 value={slippage}
                 onChange={(e) => setSlippage(Number(e.target.value))}
               >
@@ -622,7 +632,7 @@ export function SwapQuoteSection({
 
             <button
               type="button"
-              className="btn-primary h-[32px] px-5 text-xs"
+              className="btn-primary h-[30px] px-4 text-xs"
               disabled={swapping || quoting || !quote}
               onClick={executeSwap}
             >
