@@ -2,36 +2,36 @@
 @tailwind components;
 @tailwind utilities;
 
-/* ============ Pro DeFi Terminal Design System ============ */
+/* ============ Pro DeFi Terminal Design System (High Contrast) ============ */
 
 :root {
   color-scheme: dark;
 }
 
 body {
-  color: #e2e8f0;
+  color: #f8fafc;
   background-color: #060911;
   @apply antialiased selection:bg-cyan-500/30 selection:text-cyan-100;
   background-image:
-    radial-gradient(1100px 420px at 20% -5%, rgba(6, 182, 212, 0.07), transparent 65%),
-    radial-gradient(900px 380px at 85% -5%, rgba(16, 185, 129, 0.05), transparent 60%);
+    radial-gradient(1100px 420px at 20% -5%, rgba(6, 182, 212, 0.08), transparent 65%),
+    radial-gradient(900px 380px at 85% -5%, rgba(16, 185, 129, 0.06), transparent 60%);
   background-attachment: fixed;
 }
 
 /* ============ 卡片系统 ============ */
 .card {
-  @apply rounded-xl border border-white/[0.07] bg-[#0c121e]/90 shadow-[0_1px_0_0_rgba(255,255,255,0.04)_inset,0_10px_30px_-12px_rgba(0,0,0,0.65)];
+  @apply rounded-xl border border-white/[0.1] bg-[#0d1422]/95 text-[#f8fafc] shadow-[0_1px_0_0_rgba(255,255,255,0.06)_inset,0_10px_30px_-12px_rgba(0,0,0,0.65)];
   backdrop-filter: blur(10px);
   transition: border-color 0.18s ease, background-color 0.18s ease, box-shadow 0.18s ease;
 }
 
 .card-hover:hover {
-  @apply border-cyan-500/25 bg-[#101827]/95;
-  box-shadow: 0 1px 0 0 rgba(255, 255, 255, 0.06) inset, 0 12px 32px -12px rgba(6, 182, 212, 0.12);
+  @apply border-cyan-500/30 bg-[#131c2e]/95;
+  box-shadow: 0 1px 0 0 rgba(255, 255, 255, 0.08) inset, 0 12px 32px -12px rgba(6, 182, 212, 0.15);
 }
 
 .panel-inset {
-  @apply rounded-lg border border-white/[0.06] bg-[#080d16]/90;
+  @apply rounded-lg border border-white/[0.08] bg-[#090e18];
 }
 
 /* ============ 按钮系统 ============ */
@@ -41,75 +41,81 @@ body {
 }
 
 .btn-primary {
-  @apply btn font-semibold text-[#041016];
+  @apply btn font-bold text-[#031117];
   background: linear-gradient(135deg, #22d3ee 0%, #10b981 100%);
-  box-shadow: 0 2px 14px -3px rgba(34, 211, 238, 0.4);
+  box-shadow: 0 2px 14px -3px rgba(34, 211, 238, 0.45);
 }
 .btn-primary:hover {
   filter: brightness(1.08);
-  box-shadow: 0 4px 18px -2px rgba(34, 211, 238, 0.55);
+  box-shadow: 0 4px 18px -2px rgba(34, 211, 238, 0.6);
 }
 .btn-primary:active {
   transform: translateY(0.5px);
 }
 
 .btn-secondary {
-  @apply btn border border-cyan-500/30 bg-cyan-500/10 text-cyan-300 hover:border-cyan-400/50 hover:bg-cyan-500/20 hover:text-cyan-200;
+  @apply btn border border-cyan-400/40 bg-cyan-500/15 text-cyan-200 hover:border-cyan-400/60 hover:bg-cyan-500/25 hover:text-white;
 }
 
 .btn-ghost {
-  @apply btn border border-white/[0.08] bg-white/[0.03] text-slate-300;
-  @apply hover:border-white/[0.18] hover:bg-white/[0.07] hover:text-white;
+  @apply btn border border-white/[0.14] bg-white/[0.06] text-[#e2e8f0];
+  @apply hover:border-white/[0.28] hover:bg-white/[0.12] hover:text-white;
 }
 
 .btn-danger {
-  @apply btn border border-rose-500/35 bg-rose-500/15 text-rose-300 hover:border-rose-500/60 hover:bg-rose-500/25 hover:text-rose-200;
+  @apply btn border border-rose-500/45 bg-rose-500/20 text-rose-200 hover:border-rose-400/70 hover:bg-rose-500/30 hover:text-white;
 }
 
 .btn-xs {
-  @apply px-2 py-1 text-[11px] rounded-md;
+  @apply px-2.5 py-1 text-xs rounded-md;
 }
 
-/* ============ 输入框系统 ============ */
+/* ============ 输入框系统（高亮度纯白字色，彻底解决字体发暗） ============ */
 .input {
-  @apply w-full rounded-lg border border-white/[0.09] bg-[#070b13]/90 px-2.5 py-1.5 text-xs text-slate-100 outline-none;
-  @apply placeholder:text-slate-500 transition-colors;
-  @apply focus:border-cyan-400/60 focus:bg-[#090f1a] focus:ring-2 focus:ring-cyan-400/15;
+  @apply w-full rounded-lg border border-white/[0.15] bg-[#080d17] px-2.5 py-1.5 text-xs font-medium text-[#f8fafc] outline-none;
+  @apply placeholder:text-[#64748b] transition-colors;
+  @apply focus:border-cyan-400/70 focus:bg-[#0b1220] focus:ring-2 focus:ring-cyan-400/20;
 }
 
 select.input {
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='%2394a3b8'%3E%3Cpath d='M4.5 6.5L8 10l3.5-3.5' stroke='%2394a3b8' stroke-width='1.5' fill='none' stroke-linecap='round'/%3E%3C/svg%3E");
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='%23e2e8f0'%3E%3Cpath d='M4.5 6.5L8 10l3.5-3.5' stroke='%23e2e8f0' stroke-width='1.6' fill='none' stroke-linecap='round'/%3E%3C/svg%3E");
   background-repeat: no-repeat;
   background-position: right 8px center;
   appearance: none;
   padding-right: 26px;
+  color: #f8fafc;
+}
+
+select.input option {
+  background-color: #0d1422;
+  color: #f8fafc;
 }
 
 .label {
-  @apply mb-1 block text-[11px] font-medium uppercase tracking-wider text-slate-400;
+  @apply mb-1 block text-xs font-medium tracking-wide text-[#cbd5e1];
 }
 
 /* ============ 标签与徽章 ============ */
 .tag {
-  @apply inline-flex items-center gap-1 rounded-md px-2 py-0.5 text-[11px] font-medium leading-tight;
+  @apply inline-flex items-center gap-1 rounded-md px-2 py-0.5 text-[11px] font-semibold leading-tight;
 }
 .tag-ok {
-  @apply tag border border-emerald-500/25 bg-emerald-500/10 text-emerald-300;
+  @apply tag border border-emerald-500/35 bg-emerald-500/15 text-emerald-200;
 }
 .tag-warn {
-  @apply tag border border-amber-500/30 bg-amber-500/15 text-amber-300;
+  @apply tag border border-amber-500/40 bg-amber-500/15 text-amber-200;
 }
 .tag-danger {
-  @apply tag border border-rose-500/35 bg-rose-500/15 text-rose-300;
+  @apply tag border border-rose-500/45 bg-rose-500/20 text-rose-200;
 }
 .tag-amber {
-  @apply tag border border-amber-500/30 bg-amber-500/15 text-amber-300;
+  @apply tag border border-amber-500/40 bg-amber-500/15 text-amber-200;
 }
 .tag-muted {
-  @apply tag border border-white/[0.06] bg-white/[0.04] text-slate-400;
+  @apply tag border border-white/[0.12] bg-white/[0.07] text-[#cbd5e1];
 }
 .tag-info {
-  @apply tag border border-cyan-500/25 bg-cyan-500/10 text-cyan-300;
+  @apply tag border border-cyan-500/35 bg-cyan-500/15 text-cyan-200;
 }
 
 /* ============ 等宽数字与排版 ============ */
@@ -117,21 +123,27 @@ select.input {
   font-variant-numeric: tabular-nums;
 }
 .num {
-  @apply tabular font-mono font-medium;
+  @apply tabular font-mono font-medium text-[#f8fafc];
   letter-spacing: -0.015em;
 }
 
 .hr {
-  @apply border-white/[0.06];
+  @apply border-white/[0.08];
+}
+.text-ink {
+  color: #f8fafc;
 }
 .text-ink-soft {
-  @apply text-slate-400;
+  color: #cbd5e1;
+}
+.text-ink-muted {
+  color: #94a3b8;
 }
 
 /* ============ 顶栏毛玻璃吸附 ============ */
 .glass-header {
-  @apply border-b border-white/[0.07];
-  background: rgba(6, 9, 17, 0.82);
+  @apply border-b border-white/[0.1];
+  background: rgba(8, 13, 24, 0.88);
   backdrop-filter: blur(14px);
 }
 
@@ -144,10 +156,10 @@ select.input {
   background: transparent;
 }
 ::-webkit-scrollbar-thumb {
-  @apply rounded-full bg-white/10;
+  @apply rounded-full bg-white/15;
 }
 ::-webkit-scrollbar-thumb:hover {
-  @apply bg-white/25;
+  @apply bg-white/30;
 }
 
 /* ============ 标题强调色 ============ */

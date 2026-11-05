@@ -20,7 +20,7 @@ export default function GlobalError({
 
   if (isExtension) {
     return (
-      <div className="flex min-h-screen items-center justify-center bg-slate-50">
+      <div className="flex min-h-screen items-center justify-center bg-surface">
         <div className="card max-w-md p-6 text-center">
           <div className="mb-3 text-4xl">🔌</div>
           <h2 className="mb-2 text-lg font-semibold">浏览器扩展检测到非致命错误</h2>
@@ -48,7 +48,7 @@ export default function GlobalError({
 
   // 其他未知错误的兜底
   return (
-    <div className="flex min-h-screen items-center justify-center bg-slate-50">
+    <div className="flex min-h-screen items-center justify-center bg-surface">
       <div className="card max-w-md p-6 text-center">
         <div className="mb-3 text-4xl">💥</div>
         <h2 className="mb-2 text-lg font-semibold">页面出错了</h2>

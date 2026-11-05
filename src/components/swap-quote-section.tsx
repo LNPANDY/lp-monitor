@@ -396,7 +396,7 @@ export function SwapQuoteSection() {
           </span>
           <input
             className={`input font-mono ${
-              inputMode === "in" ? "border-brand/50" : "opacity-80"
+              inputMode === "in" ? "border-brand/60" : ""
             }`}
             value={amountIn}
             onFocus={() => setInputMode("in")}
@@ -428,7 +428,7 @@ export function SwapQuoteSection() {
           </span>
           <input
             className={`input font-mono ${
-              inputMode === "out" ? "border-brand/50" : "opacity-80"
+              inputMode === "out" ? "border-brand/60" : ""
             }`}
             value={targetOut}
             onFocus={() => setInputMode("out")}

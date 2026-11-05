@@ -8,33 +8,43 @@ const config: Config = {
     extend: {
       colors: {
         // 状态与行情语义色（高对比度金融终端标准）
-        ok: { DEFAULT: "#10b981", soft: "rgba(16, 185, 129, 0.14)" },
-        warn: { DEFAULT: "#f43f5e", soft: "rgba(244, 63, 94, 0.14)" },
-        amber: { DEFAULT: "#f59e0b", soft: "rgba(245, 158, 11, 0.14)" },
-        ink: { DEFAULT: "#f1f5f9", soft: "#94a3b8" },
+        ok: { DEFAULT: "#10b981", soft: "rgba(16, 185, 129, 0.16)" },
+        warn: { DEFAULT: "#fbbf24", soft: "rgba(251, 191, 36, 0.16)" },
+        danger: { DEFAULT: "#f43f5e", soft: "rgba(244, 63, 94, 0.16)" },
+        amber: { DEFAULT: "#fbbf24", soft: "rgba(251, 191, 36, 0.16)" },
+
+        // 文字层级（全部采用高亮度清晰字色，杜绝暗淡看不清）
+        ink: {
+          DEFAULT: "#f8fafc", // 主文字：纯亮白
+          soft: "#cbd5e1",    // 次级文字：明亮银灰 (slate-300)
+          muted: "#94a3b8",   // 辅助说明文字：清晰中灰 (slate-400)
+        },
         "ink-deep": "#060911",
-        "surface-1": "#0c121e",
-        "surface-2": "#111927",
-        "surface-3": "#172234",
-        // 品牌与交互主色（剔除陈旧紫色，改用清脆青蓝与翡翠绿）
-        primary: { DEFAULT: "#06b6d4", soft: "rgba(6, 182, 212, 0.14)" },
+
+        // 背景与容器层级
+        surface: {
+          DEFAULT: "#060911",
+          card: "#0d1422",
+          raised: "#131c2e",
+          hover: "#19253c",
+        },
+        "surface-1": "#0d1422",
+        "surface-2": "#131c2e",
+        "surface-3": "#19253c",
+
+        // 品牌与交互主色（高亮青蓝）
+        brand: {
+          DEFAULT: "#06b6d4",
+          light: "#67e8f9",
+          dark: "#0891b2",
+        },
+        primary: { DEFAULT: "#06b6d4", soft: "rgba(6, 182, 212, 0.16)" },
         "brand-cyan": "#22d3ee",
         "brand-violet": "#38bdf8",
-
-        // 兼容旧类名的深色映射
-        slate: {
-          50: "rgba(255, 255, 255, 0.03)",
-          100: "rgba(255, 255, 255, 0.05)",
-          200: "rgba(255, 255, 255, 0.09)",
-          300: "rgba(255, 255, 255, 0.15)",
-          400: "#94a3b8",
-          500: "#64748b",
-          600: "#cbd5e1",
-          700: "#e2e8f0",
-          800: "#f1f5f9",
-          900: "#f8fafc",
-          950: "#ffffff",
-        },
+      },
+      boxShadow: {
+        card: "0 1px 0 0 rgba(255, 255, 255, 0.06) inset, 0 10px 30px -12px rgba(0, 0, 0, 0.7)",
+        "glow-cyan": "0 0 16px -3px rgba(34, 211, 238, 0.35)",
       },
       fontFamily: {
         num: ["ui-monospace", "SFMono-Regular", "JetBrains Mono", "Menlo", "monospace"],
