@@ -22,6 +22,7 @@ interface Position {
   token0_symbol?: string;
   token1_symbol?: string;
   pair_flip?: number;
+  wallet_label?: string;
   wallet_address: string;
   source: string;
   staker_contract: string;
@@ -245,17 +246,27 @@ export function RemovePositionButton({
     }
   }
 
+  const ownerTag = position.wallet_label
+    ? `${position.wallet_label} (${short(position.wallet_address)})`
+    : short(position.wallet_address);
+  const isWrongWallet =
+    !!wallet.address &&
+    !!position.wallet_address &&
+    wallet.address.toLowerCase() !== position.wallet_address.toLowerCase();
+
   return (
     <div className="mt-2.5 border-t border-white/[0.08] pt-2.5 flex flex-wrap items-center gap-2">
       <button
         type="button"
         onClick={() => handleQuickRemove(false)}
-        disabled={!!busyMode}
+        disabled={!!busyMode || isWrongWallet}
         className="btn-danger text-xs"
         title={
-          isStakedPos
-            ? "自动连签：解质押 → 移除流动性 → 领取本金与手续费"
-            : "自动连签：移除流动性 → 领取本金与手续费"
+          isWrongWallet
+            ? `当前连接钱包 (${short(wallet.address!)}) 与${isStakedPos ? "质押" : "持仓"}钱包 (${ownerTag}) 不一致，请先在钱包插件中切换账户`
+            : isStakedPos
+              ? "自动连签：解质押 → 移除流动性 → 领取本金与手续费"
+              : "自动连签：移除流动性 → 领取本金与手续费"
         }
       >
         {busyMode === "remove"
@@ -269,12 +280,22 @@ export function RemovePositionButton({
         <button
           type="button"
           onClick={() => handleQuickRemove(true)}
-          disabled={!!busyMode}
+          disabled={!!busyMode || isWrongWallet}
           className="btn-secondary text-xs"
-          title="撤出当前越界/旧仓位，并同时在上方探针/建仓面板载入该池，按最新 Tick 一键重开"
+          title={
+            isWrongWallet
+              ? `请先切换钱包至 ${ownerTag} 后再执行撤池重开`
+              : "撤出当前越界/旧仓位，并同时在右侧三段式工作台载入该池，按最新 Tick 一键重开"
+          }
         >
           {busyMode === "reopen" ? step || "处理中…" : "🔄 撤池并重开"}
         </button>
+      )}
+
+      {isWrongWallet && (
+        <span className="inline-flex items-center gap-1 rounded border border-amber-500/40 bg-amber-500/15 px-2 py-0.5 text-[11px] font-medium text-amber-200">
+          ⚠️ 需切至 {ownerTag} 才可{isStakedPos ? "解押" : "移除"}
+        </span>
       )}
 
       {txHashes.length > 0 && (

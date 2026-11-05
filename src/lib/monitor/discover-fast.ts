@@ -1,55 +1,55 @@
 /**
- * 快速发现（fast discover）—— 只负责"发现新仓位 + 标 closed 转出的"。
+ * 极速全能发现引擎（discover-fast）：
  *
- * 与 known-positions-scanner 配合：
- *   1. fast discover 扫窗口内 Transfer 事件 → 调 adapter.readRange 拿完整状态 + 加 resolveTokens 拿 symbol
- *      → INSERT 完整字段（token0/token1/symbol/fee/pool/tickLower/Upper/liquidity/margin/notify_state）
- *      首次直接写入真实状态（last_margin_lower/upper 用 readRange 计算值），避免 known 下次扫到 baseline=0 触发假 tick_move 告警
- *   2. DB 已有的仓位 source 变化（direct ↔ staking）→ UPDATE source/staker_contract/staking_id
- *   3. outgoing 转出场景 → ownerOf 反查 → 标 closed
- *
- * 之后 known 扫描会扫到新 INSERT 的占位行（notify_state 已是 in_range/out_of_range 而非 unknown），
- * 但因为 prev.last_margin_lower 已经有真实值，tick_move 不会因为 0→真实值 触发假告警。
- *
- * 配合调度器维护 lastBlockByChain（窗口推进）+ blockTimeByChain（首次窗口换算）状态。
+ * 1. SQLite 持久化区块游标（`last_scanned_block_<chainId>`）：
+ *    服务重启后直接从上次成功的区块高度继续，不再断档漏块。
+ * 2. 新钱包首次自动全盘点（`wallet_init_done_<walletId>`）：
+ *    对尚未初始化盘点过的钱包，自动执行一次 `findDirectPositions` + `findStakedPositions`（含 Vault 现存 NFT 直查），
+ *    无视区块高度限制捞出所有历史直持/质押仓位，同时跳过已知 closed 空壳 NFT。
+ * 3. 定向 Topic + 自动分片 `findRecentPositionsByTransfer`：
+ *    仅在 `allSucceeded === true` 时推进区块游标，RPC 抖动时下次自动重扫。
  */
 import { getDb, isPairFlipped } from "../db";
 import { getClient } from "../chains";
-import { listDexes, listStaking, type DexRow, type StakingRow } from "../chains/dexes";
-import { findRecentPositionsByTransfer, type DiscoveredPosition } from "../staking/discover";
-import { ownerOf } from "../adapters/v3-fork";
+import { listDexes, listStaking } from "../chains/dexes";
+import {
+  findDirectPositions,
+  findStakedPositions,
+  findRecentPositionsByTransfer,
+  eachLimit,
+  type DiscoveredPosition,
+} from "../staking/discover";
+import { ownerOf, batchReadPoolTicks } from "../adapters/v3-fork";
 import { getAdapter } from "../adapters";
 import { estimateBlockTimeSec, secondsToBlocks } from "../chains/blocktime";
-import { getFullScanFirstHours, getFullScanPaddingSec } from "../db/settings";
+import {
+  getFullScanFirstHours,
+  getFullScanPaddingSec,
+  getSetting,
+  setSetting,
+} from "../db/settings";
 import { resolveTokens } from "../chains/tokens";
-import type { Address, PublicClient } from "viem";
+import type { Address } from "viem";
 
 export interface FastDiscoverSummary {
-  /** 本次窗口区块区间（按链） */
   windows: { chainId: number; from: string; to: string; blocks: number }[];
-  /** 候选列表分类计数 */
   candidatesCount: number;
   directCount: number;
   stakingCount: number;
   outgoingCount: number;
-  /** DB 新增占位行数 */
   newInserted: number;
-  /** source 变更数（direct ↔ staking）*/
   sourceChanged: number;
-  /** 标 closed 数 */
   closed: number;
   durationMs: number;
   errors: string[];
 }
 
-/**
- * 执行一次 fast discover。状态 lastBlockByChain / blockTimeByChain / isFirstScan
- * 由调用方（调度器）维护并传入；本函数会在内部直接更新这两个对象。
- */
 export async function runFastDiscover(opts: {
   lastBlockByChain: Record<number, bigint>;
   blockTimeByChain: Record<number, number>;
   isFirstScan: boolean;
+  /** 若为 true，强制对所有启用钱包做一次直持 + Vault 质押全盘点 */
+  forceFullInventory?: boolean;
 }): Promise<FastDiscoverSummary> {
   const startedAt = Date.now();
   const errors: string[] = [];
@@ -64,11 +64,8 @@ export async function runFastDiscover(opts: {
   let closedCount = 0;
   const windows: FastDiscoverSummary["windows"] = [];
 
-  // 取所有需要扫描的链（有 enabled 钱包的链）
   const chains = db
-    .prepare(
-      `SELECT DISTINCT w.chain_id_ref FROM wallets w WHERE w.enabled=1`
-    )
+    .prepare(`SELECT DISTINCT w.chain_id_ref FROM wallets w WHERE w.enabled=1`)
     .all() as { chain_id_ref: number }[];
 
   const firstHours = getFullScanFirstHours();
@@ -79,121 +76,249 @@ export async function runFastDiscover(opts: {
       const { client, chain } = getClient(chainIdRef);
       const dexes = listDexes(chainIdRef, true);
       const staking = listStaking(chainIdRef, true);
+      if (dexes.length === 0) continue;
 
-      // 取最新块
       const latest = await client.getBlockNumber();
 
-      // 出块时间缓存（首次探测）
       let blockTime = opts.blockTimeByChain[chainIdRef];
       if (!blockTime) {
         blockTime = await estimateBlockTimeSec(client);
         opts.blockTimeByChain[chainIdRef] = blockTime;
       }
 
-      // 算 fromBlock
+      // 优先从内存或 SQLite 读取上次成功扫描的区块号
+      const dbBlockKey = `last_scanned_block_${chainIdRef}`;
+      let savedBlock = opts.lastBlockByChain[chainIdRef];
+      if (!savedBlock) {
+        const rawSaved = getSetting(dbBlockKey, "");
+        if (rawSaved && /^\d+$/.test(rawSaved)) {
+          savedBlock = BigInt(rawSaved);
+          opts.lastBlockByChain[chainIdRef] = savedBlock;
+        }
+      }
+
       let fromBlock: bigint;
-      if (opts.isFirstScan) {
+      if (!savedBlock) {
         const firstBlocks = secondsToBlocks(firstHours * 3600, blockTime);
         fromBlock = latest > firstBlocks ? latest - firstBlocks : 0n;
-        const fromSec = Number(firstBlocks) * blockTime;
-        console.log(`[fast-discover] chain ${chain.name} (id=${chainIdRef}) first scan: from=${fromBlock} to=${latest} (~${firstBlocks} blocks, ~${fromSec.toFixed(0)}s = ${firstHours}h, blockTime=${blockTime.toFixed(2)}s)`);
       } else {
-        const lastBlock = opts.lastBlockByChain[chainIdRef] ?? latest;
         const paddingBlocks = secondsToBlocks(paddingSec, blockTime);
-        fromBlock = lastBlock > paddingBlocks ? lastBlock - paddingBlocks : 0n;
-        const windowBlocks = latest - fromBlock;
-        console.log(`[fast-discover] chain ${chain.name} (id=${chainIdRef}): from=${fromBlock} to=${latest} (~${windowBlocks} blocks, padding=${paddingSec}s, blockTime=${blockTime.toFixed(2)}s)`);
+        fromBlock = savedBlock > paddingBlocks ? savedBlock - paddingBlocks : 0n;
+        if (fromBlock > latest) fromBlock = latest;
       }
-      windows.push({ chainId: chainIdRef, from: fromBlock.toString(), to: latest.toString(), blocks: Number(latest - fromBlock) });
 
-      // 取该链所有钱包
+      windows.push({
+        chainId: chainIdRef,
+        from: fromBlock.toString(),
+        to: latest.toString(),
+        blocks: Number(latest - fromBlock),
+      });
+
       const wallets = db
         .prepare("SELECT id, address FROM wallets WHERE chain_id_ref=? AND enabled=1")
         .all(chainIdRef) as { id: number; address: string }[];
 
-      const stakingByAddr = new Map(staking.map((s) => [s.contract.toLowerCase(), s]));
+      // 预加载本链在 DB 中已知的所有仓位（含 closed 空壳，避免重复链上读取）
+      const existingRows = db
+        .prepare(
+          "SELECT id, dex_name, token_id, notify_state, source, pool FROM positions WHERE chain_id_ref=?"
+        )
+        .all(chainIdRef) as {
+        id: number;
+        dex_name: string;
+        token_id: string;
+        notify_state: string;
+        source: string;
+        pool: string;
+      }[];
+      const existingByKey = new Map<
+        string,
+        { id: number; notify_state: string; source: string; pool: string }
+      >();
+      const skipIdsForStaking = new Set<string>();
+      for (const r of existingRows) {
+        existingByKey.set(`${r.dex_name}:${r.token_id}`, r);
+        const matchedDex = dexes.find((d) => d.name === r.dex_name);
+        if (matchedDex && r.notify_state === "closed") {
+          skipIdsForStaking.add(`${matchedDex.id}:${r.token_id}`);
+        }
+      }
+
+      const stakingByAddr = new Map(
+        staking.map((s) => [s.contract.toLowerCase(), s])
+      );
       const nowIso = new Date().toISOString();
+      let chainAllLogsSucceeded = true;
 
       for (const w of wallets) {
         try {
           const tWallet0 = Date.now();
           const walletLower = w.address.toLowerCase();
+          const walletInitKey = `wallet_init_done_${w.id}`;
+          const needsInitialInventory =
+            opts.forceFullInventory || getSetting(walletInitKey, "") !== "1";
 
-          // 1. transfer 扫描
+          // 1. 增量 Transfer 事件扫描（带钱包 Topic 过滤 + 自动分片）
           const cands = await findRecentPositionsByTransfer(
-            client, w.address as Address, dexes, staking, fromBlock
+            client,
+            w.address as Address,
+            dexes,
+            staking,
+            fromBlock,
+            latest
           );
+          if (!cands.allSucceeded) {
+            chainAllLogsSucceeded = false;
+          }
 
-          const stakingCnt = cands.candidates.filter(c => c.source === "staking").length;
-          const dCnt = cands.candidates.length - stakingCnt;
-          candidatesCount += cands.candidates.length;
+          const mergedMap = new Map<string, DiscoveredPosition>();
+          for (const c of cands.candidates) {
+            mergedMap.set(`${c.dexId}:${c.tokenId}`, c);
+          }
+
+          // 2. 若该钱包是首次加入或手动触发全盘点：用 balanceOf + Vault 枚举补齐所有历史仓位（不受区块窗口限制）
+          if (needsInitialInventory) {
+            const [directList, stakedList] = await Promise.all([
+              findDirectPositions(client, w.address as Address, dexes),
+              findStakedPositions(client, w.address as Address, dexes, staking, {
+                fromBlock,
+                skipIds: skipIdsForStaking,
+              }),
+            ]);
+            for (const d of [...directList, ...stakedList]) {
+              const k = `${d.dexId}:${d.tokenId}`;
+              if (!mergedMap.has(k)) {
+                mergedMap.set(k, d);
+              }
+            }
+            setSetting(walletInitKey, "1");
+          }
+
+          const finalCandidates = [...mergedMap.values()];
+          const stakingCnt = finalCandidates.filter(
+            (c) => c.source === "staking"
+          ).length;
+          const dCnt = finalCandidates.length - stakingCnt;
+          candidatesCount += finalCandidates.length;
           directCount += dCnt;
           stakingCount += stakingCnt;
           outgoingCount += cands.outgoing.length;
 
-          // 2. outgoing: from=钱包 转出 → DB 已存在则 ownerOf 反查标 closed
+          // 3. outgoing: 转出到非质押合约 → 反查 ownerOf 标 closed
           let walletClosed = 0;
-          for (const out of cands.outgoing) {
+          await eachLimit(cands.outgoing, 8, async (out) => {
             const dex = dexes.find((d) => d.id === out.dexId);
-            if (!dex) continue;
-            const existing = db
-              .prepare("SELECT id, notify_state FROM positions WHERE chain_id_ref=? AND dex_name=? AND token_id=?")
-              .get(chainIdRef, dex.name, out.tokenId) as { id: number; notify_state: string } | undefined;
-            if (!existing) continue;
-            if (existing.notify_state === "closed") continue;
+            if (!dex) return;
+            const existing = existingByKey.get(`${dex.name}:${out.tokenId}`);
+            if (!existing || existing.notify_state === "closed") return;
             let currentOwner: string | null = null;
             try {
-              currentOwner = await ownerOf(client, dex.npm as Address, BigInt(out.tokenId));
+              currentOwner = await ownerOf(
+                client,
+                dex.npm as Address,
+                BigInt(out.tokenId)
+              );
             } catch {
-              continue;
+              return;
             }
-            if (!currentOwner) continue;
+            if (!currentOwner) return;
             const ownerLower = currentOwner.toLowerCase();
-            if (ownerLower === walletLower) continue;
-            if (stakingByAddr.has(ownerLower)) continue;
+            if (ownerLower === walletLower) return;
+            if (stakingByAddr.has(ownerLower)) return;
             db.prepare(
               `UPDATE positions SET notify_state='closed', last_checked_at=?, last_in_range=0 WHERE id=?`
             ).run(nowIso, existing.id);
+            existing.notify_state = "closed";
             closedCount++;
             walletClosed++;
-          }
+          });
 
-          // 3. candidates: DB 不存在的新仓位 → 调 readRange + resolveTokens 拿完整状态 → INSERT 完整字段
-          //    DB 已有但 source 变了（direct ↔ staking） → UPDATE source/staker_contract/staking_id
+          // 4. 处理候选列表：
+          //    - DB 已存在且已 closed 的历史空壳 NFT → 直接跳过（0 RPC！）
+          //    - DB 已存在但 source 改变（direct ↔ staking）或 wallet_id 更新 → 直接 UPDATE
+          //    - DB 不存在的新 tokenId → 并发调 readRange 读取状态，若活跃则 INSERT，若 liquidity=0 则记入 closed 缓存避免下次重读
           let walletNew = 0;
           let walletSourceChanged = 0;
-          for (const dp of cands.candidates) {
+          const unknownCandidates: DiscoveredPosition[] = [];
+
+          for (const dp of finalCandidates) {
             const dex = dexes.find((d) => d.id === dp.dexId);
             if (!dex) continue;
-            const existing = db
-              .prepare("SELECT id, notify_state, source FROM positions WHERE chain_id_ref=? AND dex_name=? AND token_id=?")
-              .get(chainIdRef, dex.name, dp.tokenId) as { id: number; notify_state: string; source: string } | undefined;
+            const existing = existingByKey.get(`${dex.name}:${dp.tokenId}`);
             if (existing) {
+              if (existing.notify_state === "closed") {
+                // 已知历史空壳 NFT，不再重复发链上请求
+                continue;
+              }
               if (existing.source !== dp.source) {
                 db.prepare(
-                  `UPDATE positions SET source=?, staker_contract=?, staking_id=?, last_checked_at=? WHERE id=?`
-                ).run(dp.source, dp.stakerContract ?? "", dp.stakingId ?? null, nowIso, existing.id);
+                  `UPDATE positions SET wallet_id=?, source=?, staker_contract=?, staking_id=?, last_checked_at=? WHERE id=?`
+                ).run(
+                  w.id,
+                  dp.source,
+                  dp.stakerContract ?? "",
+                  dp.stakingId ?? null,
+                  nowIso,
+                  existing.id
+                );
+                existing.source = dp.source;
                 sourceChanged++;
                 walletSourceChanged++;
               }
               continue;
             }
-            // DB 不存在 → 用 adapter.readRange 拿完整状态
+            unknownCandidates.push(dp);
+          }
+
+          // 并发读取新发现的候选 tokenId
+          await eachLimit(unknownCandidates, 8, async (dp) => {
+            const dex = dexes.find((d) => d.id === dp.dexId);
+            if (!dex) return;
             const adapter = getAdapter(dex.type);
-            const r = await adapter.readRange(client, { factory: dex.factory, npm: dex.npm, stateview: dex.stateview }, BigInt(dp.tokenId));
-            if (r.kind === "unreadable") {
-              // 只更新 last_checked_at 留给以后 readRange 成功时 INSERT；DB 没记录时不写
-              continue;
-            }
+            const r = await adapter.readRange(
+              client,
+              {
+                factory: dex.factory,
+                npm: dex.npm,
+                stateview: dex.stateview,
+              },
+              BigInt(dp.tokenId)
+            );
+            if (r.kind === "unreadable") return;
             if (r.kind === "closed") {
-              // 仓位已无流动性，不 INSERT 进 positions 表（INSERT 会在每次发现都重复，
-              // 而流动性为 0 的仓位没有监控意义）。只记录日志。
-              console.log(`[fast-discover] chain ${chain.name} ${dex.name} #${dp.tokenId}: closed (skip INSERT)`);
-              continue;
+              // 写入一条 closed 记录，防止后续全盘点时每次都对这个空壳 NFT 发 RPC！
+              try {
+                db.prepare(
+                  `INSERT OR IGNORE INTO positions
+                    (wallet_id, chain_id_ref, dex_id, dex_name, token_id, token0, token1, fee, pool,
+                     tick_lower, tick_upper, source, staker_contract, staking_id,
+                     last_current_tick, last_in_range, last_checked_at, notify_state)
+                   VALUES (?,?,?,?,?,'','',0,'',0,0,?,?,?,0,0,?,'closed')`
+                ).run(
+                  w.id,
+                  chainIdRef,
+                  dex.id,
+                  dex.name,
+                  dp.tokenId,
+                  dp.source,
+                  dp.stakerContract ?? "",
+                  dp.stakingId ?? null,
+                  nowIso
+                );
+                existingByKey.set(`${dex.name}:${dp.tokenId}`, {
+                  id: 0,
+                  notify_state: "closed",
+                  source: dp.source,
+                  pool: "",
+                });
+              } catch {}
+              return;
             }
 
-            // r.kind === "ok"，拿 symbol
-            const tokenMap = await resolveTokens(client, chainIdRef, [r.token0, r.token1]);
+            const tokenMap = await resolveTokens(client, chainIdRef, [
+              r.token0,
+              r.token1,
+            ]);
             const sym0 = tokenMap.get(r.token0.toLowerCase())?.symbol ?? "";
             const sym1 = tokenMap.get(r.token1.toLowerCase())?.symbol ?? "";
             const dec0 = tokenMap.get(r.token0.toLowerCase())?.decimals ?? 18;
@@ -203,14 +328,11 @@ export async function runFastDiscover(opts: {
             const span = Math.max(r.tickUpper - r.tickLower, 1);
             const marginLower = (r.status.currentTick - r.tickLower) / span;
             const marginUpper = (r.tickUpper - r.status.currentTick) / span;
-
-            // 把 raw price 换算成整币单位价格（与 scanner.ts 的 rawToHumanPrice 等价）
             const price0HumanStr = rawToHumanPrice(r.status.price, dec0, dec1);
+            const prevPairFlip = isPairFlipped(chainIdRef, r.token0, r.token1)
+              ? 1
+              : 0;
 
-            // 检查全局 pair_flips：该 token 对是否被用户标记过翻转（与 scanner.ts 一致）
-            const prevPairFlip = isPairFlipped(chainIdRef, r.token0, r.token1) ? 1 : 0;
-
-            // INSERT 完整字段。新仓位首次录入直接用真实 margin 作 baseline（避免 known 触发假 tick_move）
             db.prepare(
               `INSERT INTO positions
                 (wallet_id, chain_id_ref, dex_id, dex_name, token_id, token0, token1, token0_symbol, token1_symbol, fee, pool,
@@ -218,34 +340,80 @@ export async function runFastDiscover(opts: {
                  last_current_tick, last_in_range, last_price0, last_liquidity,
                  last_margin_lower, last_margin_upper, last_cex_price,
                  last_checked_at, notify_state, last_notified_at, pair_flip)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(chain_id_ref, dex_name, token_id) DO UPDATE SET
+                 wallet_id=excluded.wallet_id,
+                 source=excluded.source,
+                 staker_contract=excluded.staker_contract,
+                 staking_id=excluded.staking_id,
+                 last_current_tick=excluded.last_current_tick,
+                 last_in_range=excluded.last_in_range,
+                 last_price0=excluded.last_price0,
+                 last_liquidity=excluded.last_liquidity,
+                 last_margin_lower=excluded.last_margin_lower,
+                 last_margin_upper=excluded.last_margin_upper,
+                 last_checked_at=excluded.last_checked_at,
+                 notify_state=excluded.notify_state,
+                 pair_flip=excluded.pair_flip`
             ).run(
-              w.id, chainIdRef, dex.id, dex.name, dp.tokenId,
-              r.token0, r.token1, sym0, sym1, r.fee, r.status.pool,
-              r.tickLower, r.tickUpper, dp.source, dp.stakerContract ?? "", dp.stakingId ?? null,
-              r.status.currentTick, inRange ? 1 : 0, price0HumanStr, r.liquidity?.toString() ?? "",
-              marginLower, marginUpper, "",
-              nowIso, inRange ? "in_range" : "out_of_range", "", prevPairFlip
+              w.id,
+              chainIdRef,
+              dex.id,
+              dex.name,
+              dp.tokenId,
+              r.token0,
+              r.token1,
+              sym0,
+              sym1,
+              r.fee,
+              r.status.pool,
+              r.tickLower,
+              r.tickUpper,
+              dp.source,
+              dp.stakerContract ?? "",
+              dp.stakingId ?? null,
+              r.status.currentTick,
+              inRange ? 1 : 0,
+              price0HumanStr,
+              r.liquidity?.toString() ?? "",
+              marginLower,
+              marginUpper,
+              "",
+              nowIso,
+              inRange ? "in_range" : "out_of_range",
+              "",
+              prevPairFlip
             );
             newInserted++;
             walletNew++;
-          }
+          });
 
-          console.log(`[fast-discover] wallet ${w.address} chain ${chain.name}: new=${walletNew} source_changed=${walletSourceChanged} closed=${walletClosed} (${Date.now()-tWallet0}ms)`);
+          console.log(
+            `[fast-discover] wallet ${w.address} chain ${chain.name}: new=${walletNew} source_changed=${walletSourceChanged} closed=${walletClosed} (${
+              Date.now() - tWallet0
+            }ms)`
+          );
         } catch (e: any) {
-          errors.push(`[fast-discover] wallet ${w.address} chain ${chain.name}: ${e?.message ?? e}`);
+          chainAllLogsSucceeded = false;
+          errors.push(
+            `[fast-discover] wallet ${w.address} chain ${chain.name}: ${
+              e?.message ?? e
+            }`
+          );
         }
       }
 
-      // 更新 lastBlockByChain（本次窗口扫描已完成，下次从 latest 起）
-      opts.lastBlockByChain[chainIdRef] = latest;
+      // 仅当本链所有 getLogs 均成功时才推进区块游标并持久化到 SQLite
+      if (chainAllLogsSucceeded) {
+        opts.lastBlockByChain[chainIdRef] = latest;
+        setSetting(dbBlockKey, latest.toString());
+      }
     } catch (e: any) {
       errors.push(`[fast-discover] chain ${chainIdRef}: ${e?.message ?? e}`);
     }
   }
 
   const durationMs = Date.now() - startedAt;
-  console.log(`[fast-discover] done: candidates=${candidatesCount} (direct=${directCount}, staking=${stakingCount}), outgoing=${outgoingCount}, new=${newInserted}, source_changed=${sourceChanged}, closed=${closedCount}, ${durationMs}ms`);
   return {
     windows,
     candidatesCount,
@@ -260,10 +428,6 @@ export async function runFastDiscover(opts: {
   };
 }
 
-/**
- * raw 价（1 raw token0 = N raw token1）→ 整币单位价（1 整币 token0 = N 整币 token1）。
- * 与 scanner.ts 的 rawToHumanPrice 完全等价，复制避免跨模块依赖。
- */
 function rawToHumanPrice(rawStr: string, dec0: number, dec1: number): string {
   try {
     const raw = Number(rawStr);

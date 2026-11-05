@@ -10,6 +10,7 @@ import type { PublicClient } from "viem";
 import { resolveTokens } from "../chains/tokens";
 import { listDexes } from "../chains/dexes";
 import { getAdapter } from "../adapters";
+import { batchReadPoolTicks, primePoolAddressCache } from "../adapters/v3-fork";
 import { isCexPriceEnabled, getTickMoveThreshold, isTickMoveEnabled } from "../db/settings";
 import { notifyAll } from "../notify";
 import { shouldPush, recordPush } from "../notify/dedup";
@@ -23,6 +24,22 @@ import {
   type WalletRow,
   type CexPricePayload,
 } from "./scanner";
+
+async function eachLimit<T>(
+  items: T[],
+  limit: number,
+  worker: (item: T) => Promise<void>
+): Promise<void> {
+  if (items.length === 0) return;
+  let idx = 0;
+  const runners = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (idx < items.length) {
+      const cur = items[idx++];
+      await worker(cur);
+    }
+  });
+  await Promise.all(runners);
+}
 
 export interface KnownPositionsSummary {
   positions: number;          // 处理的仓位总数
@@ -143,19 +160,32 @@ async function processChainPositions(chain: any, positions: any[], chainIdRef: n
     // 解析代币信息
     const tokenMap = await resolveTokens(client, chainIdRef, positions.flatMap(p => [p.token0, p.token1]));
     
+    // 预热已知仓位的 Pool 地址缓存，并对同链所有已知 Pool 一次性去重读取 slot0()
+    for (const pos of positions) {
+      const dex = dexes.find(d => d.id === pos.dex_id) ?? dexes[0];
+      if (dex?.factory && pos.token0 && pos.token1 && pos.fee && pos.pool) {
+        primePoolAddressCache(dex.factory, pos.token0, pos.token1, pos.fee, pos.pool);
+      }
+    }
+    const poolTicks = await batchReadPoolTicks(
+      client,
+      positions.map(p => p.pool).filter(Boolean),
+      8
+    );
+
     // 加载本链 CEX 映射（按链隔离，防止跨链 __native__ 覆盖，且不误传 chain.key 给 skipCache）
     const chainMappings = loadAllMappings().get(chainIdRef) ?? [];
     const quotesByAddr = chainMappings.length > 0 ? await buildQuotesByAddr(chainMappings, false) : new Map<string, CexQuote>();
     
-    // 批量处理仓位
-    for (const position of positions) {
+    // 8 路并发处理仓位（每个已知 Pool 仓位只需 1 次 positions(tokenId) 调用）
+    await eachLimit(positions, 8, async (position) => {
       try {
-        await processSinglePosition(position, chain, dexes, tokenMap, quotesByAddr, client, summary, cexMutedPairs);
+        await processSinglePosition(position, chain, dexes, tokenMap, quotesByAddr, client, summary, cexMutedPairs, poolTicks);
       } catch (error) {
         console.error(`[scanner-known] 处理仓位失败:`, error);
         summary.errors.push(`处理仓位 ${position.id} 失败: ${error instanceof Error ? error.message : String(error)}`);
       }
-    }
+    });
     
   } catch (error) {
     console.error(`[scanner-known] 处理链 ${chain.key} 失败:`, error);
@@ -174,14 +204,15 @@ async function processSinglePosition(
   quotesByAddr: Map<string, CexQuote>,
   client: PublicClient,
   summary: KnownPositionsSummary,
-  cexMutedPairs: Set<string>
+  cexMutedPairs: Set<string>,
+  poolTicks: Map<string, number>
 ) {
   const db = getDb();
   const now = new Date().toISOString();
   const effectiveFlip = position.pair_flip === 1 || isPairFlipped(position.chain_id_ref, position.token0, position.token1) ? 1 : 0;
 
   // 1. 获取仓位当前状态（包含 CEX 价差、margin）
-  const status = await getPositionStatus(position, chain, dexes, tokenMap, quotesByAddr, client);
+  const status = await getPositionStatus(position, chain, dexes, tokenMap, quotesByAddr, client, poolTicks);
 
   // 2. 检查仓位是否已关闭
   if (status.isClosed) {
@@ -228,7 +259,7 @@ async function processSinglePosition(
     }
   }
 
-  // 4. 更新仓位状态（含 margin、CEX 数据、检查时间、pair_flip）
+  // 4. 更新仓位状态（含 margin、CEX 数据、检查时间、pair_flip、pool 补全）
   const cexJson = status.cexPriceInfo ? JSON.stringify(status.cexPriceInfo.payload) : "";
   db.prepare(`
     UPDATE positions
@@ -241,7 +272,8 @@ async function processSinglePosition(
         last_margin_upper = ?,
         last_cex_price = ?,
         notify_state = ?,
-        pair_flip = ?
+        pair_flip = ?,
+        pool = CASE WHEN pool IS NULL OR pool = '' THEN ? ELSE pool END
     WHERE id = ?
   `).run(
     status.currentTick,
@@ -254,6 +286,7 @@ async function processSinglePosition(
     cexJson,
     status.inRange ? "in_range" : "out_of_range",
     effectiveFlip,
+    status.pool || position.pool || "",
     position.id
   );
 
@@ -362,7 +395,8 @@ async function getPositionStatus(
   dexes: any[],
   tokenMap: Map<string, any>,
   quotesByAddr: Map<string, CexQuote>,
-  client: PublicClient
+  client: PublicClient,
+  poolTicks: Map<string, number>
 ) {
   // 按仓位实际的 dex_id 精确匹配 DEX
   const dex = dexes.find(d => d.id === position.dex_id) ?? dexes[0];
@@ -370,10 +404,15 @@ async function getPositionStatus(
   const adapter = getAdapter(dex.type || 'v3-fork');
   if (!adapter) throw new Error(`无法获取适配器: ${dex.type}`);
 
+  const knownPool = position.pool ? (position.pool as `0x${string}`) : undefined;
+  const knownTick = knownPool ? poolTicks.get(knownPool.toLowerCase()) : undefined;
+
   const posData = await adapter.readRange(client, {
     factory: dex.factory || "",
     npm: dex.npm || "",
-    stateview: dex.stateview || ""
+    stateview: dex.stateview || "",
+    knownPool,
+    knownTick,
   }, BigInt(position.token_id));
 
   // 获取 decimals
@@ -395,6 +434,7 @@ async function getPositionStatus(
       marginLower: 0,
       marginUpper: 0,
       cexPriceInfo: null,
+      pool: knownPool || "",
     };
   }
 
@@ -425,6 +465,7 @@ async function getPositionStatus(
     marginLower: posData.status.marginLower,
     marginUpper: posData.status.marginUpper,
     cexPriceInfo,  // 完整的 CEX 价差对比结果（与全量扫描一致）
+    pool: posData.status.pool || knownPool || "",
   };
 }
 

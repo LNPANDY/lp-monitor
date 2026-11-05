@@ -1,5 +1,5 @@
 "use client";
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import useSWR from "swr";
 import { fetcher, authHeaders, short } from "./util";
 import { useWallet, waitForTxReceipt } from "@/lib/wallet/use-wallet";
@@ -20,6 +20,18 @@ interface DexWithQuoter {
   quoter: string;
   router02: string;
   swaprouter: string;
+}
+
+export interface ExternalSwapPair {
+  chainId: number;
+  pool?: string;
+  fee?: number;
+  token0: string;
+  token1: string;
+  token0Symbol: string;
+  token1Symbol: string;
+  pairFlip?: number;
+  ts?: number;
 }
 
 interface QuoteResult {
@@ -55,32 +67,76 @@ interface QuoteResult {
 
 /**
  * 代币兑换（QuoterV2 报价 + SwapRouter 执行）。
+ * 支持通过 externalPair 与上方探针/建仓选中的池子自动联动双币。
  */
-export function SwapQuoteSection() {
+export function SwapQuoteSection({
+  externalPair,
+  embedded = false,
+}: {
+  externalPair?: ExternalSwapPair | null;
+  embedded?: boolean;
+}) {
   const { data: chains } = useSWR<any[]>("/api/chains", fetcher);
   const { data: allDexes } = useSWR<DexWithQuoter[]>("/api/dexes", fetcher);
   const { data: allMappings } = useSWR<CexToken[]>("/api/cex-mapping", fetcher);
   const { address, sendTx, switchChain, connect } = useWallet();
 
   // 可用 DEX：配了 quoter 的（显示 链-DEX）
-  const dexOptions = (allDexes ?? []).filter((d) => d.quoter);
+  const dexOptions = useMemo(
+    () => (allDexes ?? []).filter((d) => d.quoter),
+    [allDexes]
+  );
   const [dexId, setDexId] = useState<number | "">("");
   const dex = dexOptions.find((d) => d.id === dexId) ?? dexOptions[0] ?? null;
 
-  // 该链的 CEX 代币列表
-  const chainTokens = (allMappings ?? []).filter(
-    (m) => dex && m.chain_id_ref === dex.chain_id_ref
-  );
+  // 合并当前探针池的双币 + 该链 CEX 映射代币列表（确保探针池的任意两个代币都可直接 Swap）
+  const chainTokens = useMemo(() => {
+    const list: CexToken[] = [];
+    const seenSym = new Set<string>();
+    const seenAddr = new Set<string>();
+
+    const targetChainId = dex?.chain_id_ref ?? externalPair?.chainId;
+    if (
+      externalPair &&
+      targetChainId === externalPair.chainId &&
+      externalPair.token0 &&
+      externalPair.token1
+    ) {
+      const sym0 = externalPair.token0Symbol || short(externalPair.token0);
+      const sym1 = externalPair.token1Symbol || short(externalPair.token1);
+      const p0: CexToken = {
+        token_symbol: sym0,
+        token_addr: externalPair.token0,
+        chain_id_ref: externalPair.chainId,
+      };
+      const p1: CexToken = {
+        token_symbol: sym1,
+        token_addr: externalPair.token1,
+        chain_id_ref: externalPair.chainId,
+      };
+      // 若翻转（token1 为主币），把主币排前
+      const ordered = externalPair.pairFlip === 1 ? [p1, p0] : [p0, p1];
+      for (const item of ordered) {
+        list.push(item);
+        seenSym.add(item.token_symbol);
+        seenAddr.add(item.token_addr.toLowerCase());
+      }
+    }
+
+    for (const m of allMappings ?? []) {
+      if (!dex || m.chain_id_ref !== dex.chain_id_ref) continue;
+      const addrLower = (m.token_addr || "").toLowerCase();
+      if (seenSym.has(m.token_symbol)) continue;
+      if (addrLower !== "__native__" && seenAddr.has(addrLower)) continue;
+      list.push(m);
+      seenSym.add(m.token_symbol);
+      if (addrLower !== "__native__") seenAddr.add(addrLower);
+    }
+    return list;
+  }, [dex, allMappings, externalPair]);
+
   const [inSym, setInSym] = useState("");
   const [outSym, setOutSym] = useState("");
-  useEffect(() => {
-    if (dex && chainTokens.length >= 2 && !inSym && !outSym) {
-      setInSym(chainTokens[0].token_symbol);
-      setOutSym(chainTokens[1].token_symbol);
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [dex?.id, chainTokens.length]);
-
   const [amountIn, setAmountIn] = useState("");
   const [amountOut, setAmountOut] = useState("");
   const [editingSide, setEditingSide] = useState<"in" | "out">("in");
@@ -97,6 +153,47 @@ export function SwapQuoteSection() {
     decIn: number;
     decOut: number;
   } | null>(null);
+
+  // 当外部探针选中池子时，自动切换 DEX 并锁定该池的两个代币
+  const lastExternalKeyRef = useRef<string>("");
+  useEffect(() => {
+    if (!externalPair || !externalPair.token0 || !externalPair.token1) return;
+    const key = `${externalPair.chainId}:${externalPair.token0.toLowerCase()}:${externalPair.token1.toLowerCase()}:${externalPair.pairFlip ?? 0}:${externalPair.ts ?? 0}`;
+    if (lastExternalKeyRef.current === key) return;
+    lastExternalKeyRef.current = key;
+
+    const matchedDex = dexOptions.find(
+      (d) => d.chain_id_ref === externalPair.chainId
+    );
+    if (matchedDex) {
+      setDexId(matchedDex.id);
+    }
+    const sym0 = externalPair.token0Symbol || short(externalPair.token0);
+    const sym1 = externalPair.token1Symbol || short(externalPair.token1);
+    // 默认把主币放卖出或按翻转方向设置，点击 ⇄ 可一键互换
+    if (externalPair.pairFlip === 1) {
+      setInSym(sym1);
+      setOutSym(sym0);
+    } else {
+      setInSym(sym0);
+      setOutSym(sym1);
+    }
+    if (externalPair.fee) {
+      setFeeOverride(externalPair.fee);
+    } else {
+      setFeeOverride(undefined);
+    }
+    setQuote(null);
+    setErr("");
+  }, [externalPair, dexOptions]);
+
+  // 默认初始化两个代币
+  useEffect(() => {
+    if (dex && chainTokens.length >= 2 && (!inSym || !outSym)) {
+      setInSym(chainTokens[0].token_symbol);
+      setOutSym(chainTokens[1].token_symbol);
+    }
+  }, [dex, chainTokens, inSym, outSym]);
 
   const tokenInMeta = chainTokens.find((t) => t.token_symbol === inSym);
   const tokenOutMeta = chainTokens.find((t) => t.token_symbol === outSym);
@@ -189,7 +286,6 @@ export function SwapQuoteSection() {
       } finally {
         setQuoting(false);
       }
-      // eslint-disable-next-line react-hooks/exhaustive-deps
     },
     [dex, tokenInMeta, tokenOutMeta, slippage, feeOverride, address]
   );
@@ -207,8 +303,7 @@ export function SwapQuoteSection() {
     return () => {
       if (debounceRef.current) clearTimeout(debounceRef.current);
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [amountIn, amountOut, editingSide, inSym, outSym, slippage, feeOverride]);
+  }, [amountIn, amountOut, editingSide, inSym, outSym, slippage, feeOverride, doQuote]);
 
   const initialLoadedRef = useRef("");
   useEffect(() => {
@@ -218,8 +313,7 @@ export function SwapQuoteSection() {
     if (initialLoadedRef.current === key) return;
     initialLoadedRef.current = key;
     fetchBalances();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [dex?.id, inSym, outSym, address]);
+  }, [dex, inSym, outSym, address, tokenInMeta, tokenOutMeta, fetchBalances]);
 
   /** 执行兑换（若 ERC20 授权不足会自动发起 approve 再执行 swap） */
   async function executeSwap() {
@@ -322,138 +416,181 @@ export function SwapQuoteSection() {
     setQuote(null);
   }
 
-  return (
-    <section className="card p-5">
-      <h2 className="mb-1 text-base font-semibold">💱 代币兑换</h2>
-      <p className="mb-3 text-xs text-ink-soft">
-        QuoterV2 精确报价 + SwapRouter 链上执行。需在配置页给 DEX 填写 QuoterV2 和 SwapRouter 地址。
-      </p>
+  /** 按钱包余额比例快捷填入卖出数量 */
+  function applyBalancePct(pct: number) {
+    if (!balances || balances.in === "0") return;
+    try {
+      const raw = BigInt(balances.in);
+      const part = (raw * BigInt(pct)) / 100n;
+      const human = fmtBalanceFull(part.toString(), balances.decIn);
+      setEditingSide("in");
+      setAmountIn(human);
+    } catch {
+      /* ignore */
+    }
+  }
 
-      {/* DEX 选择 */}
-      <div className="mb-3">
-        <span className="label">DEX</span>
-        {dexOptions.length === 0 ? (
-          <p className="text-xs text-warn">
-            暂无可用 DEX（请先在配置页给 DEX 填写 QuoterV2 地址）
-          </p>
-        ) : (
-          <select
-            className="input max-w-[240px]"
-            value={dex?.id ?? ""}
-            onChange={(e) => {
-              setDexId(e.target.value ? Number(e.target.value) : "");
-              setInSym("");
-              setOutSym("");
-              setQuote(null);
-            }}
-          >
-            {dexOptions.map((d) => (
-              <option key={d.id} value={d.id}>
-                {(chains ?? []).find((c: any) => c.id === d.chain_id_ref)
-                  ?.name ?? d.chain_id_ref}
-                -{d.name}
-              </option>
-            ))}
-          </select>
-        )}
+  const linkedPairLabel = externalPair
+    ? externalPair.pairFlip === 1
+      ? `${externalPair.token1Symbol}/${externalPair.token0Symbol}`
+      : `${externalPair.token0Symbol}/${externalPair.token1Symbol}`
+    : "";
+
+  return (
+    <section className={embedded ? "panel-inset p-4" : "card p-4"}>
+      <div className="mb-2.5 flex flex-wrap items-center justify-between gap-2">
+        <div className="flex items-center gap-2">
+          <h2 className="text-sm font-semibold text-ink">
+            {embedded ? "③ 💱 当前池双币极速兑换 (Swap)" : "💱 代币兑换 (Swap)"}
+          </h2>
+          {linkedPairLabel && (
+            <span className="tag-info" title="已自动同步上方探针选中的交易对双币">
+              🔗 已同步 {linkedPairLabel}
+            </span>
+          )}
+        </div>
+
+        {/* DEX 选择 */}
+        <div className="flex items-center gap-1.5 text-xs">
+          <span className="text-ink-soft">DEX</span>
+          {dexOptions.length === 0 ? (
+            <span className="text-warn">未配 QuoterV2</span>
+          ) : (
+            <select
+              className="input py-1 px-2 text-xs max-w-[175px]"
+              value={dex?.id ?? ""}
+              onChange={(e) => {
+                setDexId(e.target.value ? Number(e.target.value) : "");
+                setInSym("");
+                setOutSym("");
+                setQuote(null);
+              }}
+            >
+              {dexOptions.map((d) => (
+                <option key={d.id} value={d.id}>
+                  {(chains ?? []).find((c: any) => c.id === d.chain_id_ref)
+                    ?.name ?? d.chain_id_ref}
+                  -{d.name}
+                </option>
+              ))}
+            </select>
+          )}
+        </div>
       </div>
 
-      {/* 兑换输入区：宽屏四列横排 */}
+      {/* 兑换输入区 */}
       {dex && chainTokens.length >= 2 && (
-        <div className="mb-3 grid grid-cols-1 items-start gap-2 md:grid-cols-[auto_auto_auto_auto] md:items-start md:gap-x-1.5">
-          {/* 输入侧 */}
-          <label className="text-xs">
-            <div className="mb-1 text-ink-soft">卖出</div>
-            <div className="flex items-center gap-1">
-              <input
-                className="input w-[135px] font-mono"
-                value={amountIn}
-                onChange={(e) => {
-                  setEditingSide("in");
-                  setAmountIn(e.target.value);
-                }}
-                placeholder="0.0"
-              />
-              <select
-                className="input w-[115px]"
-                value={inSym}
-                onChange={(e) => {
-                  setInSym(e.target.value);
-                  setQuote(null);
-                  setBalances(null);
-                }}
-              >
-                {chainTokens.map((t) => (
-                  <option key={t.token_symbol} value={t.token_symbol}>
-                    {t.token_symbol}
-                  </option>
-                ))}
-              </select>
+        <div className="space-y-2.5">
+          <div className="grid grid-cols-1 gap-2 sm:grid-cols-[1fr_auto_1fr] sm:items-center">
+            {/* 输入侧 */}
+            <div className="rounded-lg border border-white/[0.08] bg-surface-base/70 p-2.5 text-xs">
+              <div className="mb-1.5 flex items-center justify-between text-ink-soft">
+                <span>卖出 (In)</span>
+                {balances && tokenInMeta && (
+                  <span className="font-mono text-[11px]">
+                    余额: {fmtBalance(balances.in, balances.decIn)}
+                  </span>
+                )}
+              </div>
+              <div className="flex items-center gap-1.5">
+                <input
+                  className="input w-full font-mono text-xs"
+                  value={amountIn}
+                  onChange={(e) => {
+                    setEditingSide("in");
+                    setAmountIn(e.target.value);
+                  }}
+                  placeholder="0.0"
+                />
+                <select
+                  className="input w-[108px] shrink-0 text-xs font-semibold"
+                  value={inSym}
+                  onChange={(e) => {
+                    setInSym(e.target.value);
+                    setQuote(null);
+                    setBalances(null);
+                  }}
+                >
+                  {chainTokens.map((t) => (
+                    <option key={t.token_symbol} value={t.token_symbol}>
+                      {t.token_symbol}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              {balances && balances.in !== "0" && (
+                <div className="mt-1.5 flex items-center gap-1">
+                  {[25, 50, 100].map((pct) => (
+                    <button
+                      key={pct}
+                      type="button"
+                      onClick={() => applyBalancePct(pct)}
+                      className="rounded border border-white/[0.1] bg-white/[0.04] px-1.5 py-0.5 text-[10px] text-ink-soft hover:border-cyan-400/50 hover:text-cyan-300"
+                    >
+                      {pct === 100 ? "MAX" : `${pct}%`}
+                    </button>
+                  ))}
+                </div>
+              )}
             </div>
-            <div className="mt-1 h-[16px] text-[11px] text-ink-soft font-mono">
-              {balances &&
-                tokenInMeta &&
-                (balances.in !== "0"
-                  ? `余额：${fmtBalance(balances.in, balances.decIn)}`
-                  : "余额：…")}
-            </div>
-          </label>
 
-          {/* 交换按钮 */}
-          <div className="pt-[24px]">
-            <button
-              className="btn-ghost px-2 py-1.5 text-xs"
-              title="交换方向"
-              onClick={swapSides}
-            >
-              ⇄
-            </button>
+            {/* 交换按钮 */}
+            <div className="flex justify-center">
+              <button
+                type="button"
+                className="btn-ghost px-2.5 py-1.5 text-xs font-bold"
+                title="交换买卖方向"
+                onClick={swapSides}
+              >
+                ⇄
+              </button>
+            </div>
+
+            {/* 输出侧 */}
+            <div className="rounded-lg border border-white/[0.08] bg-surface-base/70 p-2.5 text-xs">
+              <div className="mb-1.5 flex items-center justify-between text-ink-soft">
+                <span>得到 (Out)</span>
+                {balances && tokenOutMeta && (
+                  <span className="font-mono text-[11px]">
+                    余额: {fmtBalance(balances.out, balances.decOut)}
+                  </span>
+                )}
+              </div>
+              <div className="flex items-center gap-1.5">
+                <input
+                  className="input w-full font-mono text-xs"
+                  value={amountOut}
+                  onChange={(e) => {
+                    setEditingSide("out");
+                    setAmountOut(e.target.value);
+                  }}
+                  placeholder="0.0"
+                />
+                <select
+                  className="input w-[108px] shrink-0 text-xs font-semibold"
+                  value={outSym}
+                  onChange={(e) => {
+                    setOutSym(e.target.value);
+                    setQuote(null);
+                    setBalances(null);
+                  }}
+                >
+                  {chainTokens.map((t) => (
+                    <option key={t.token_symbol} value={t.token_symbol}>
+                      {t.token_symbol}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            </div>
           </div>
 
-          {/* 输出侧 */}
-          <label className="text-xs">
-            <div className="mb-1 text-ink-soft">得到（自动算）</div>
-            <div className="flex items-center gap-1">
-              <input
-                className="input w-[135px] font-mono"
-                value={amountOut}
-                onChange={(e) => {
-                  setEditingSide("out");
-                  setAmountOut(e.target.value);
-                }}
-                placeholder="0.0"
-              />
+          {/* 滑点 + 费率档 + 兑换按钮 */}
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex flex-wrap items-center gap-2 text-xs">
+              <span className="text-ink-soft">滑点</span>
               <select
-                className="input w-[115px]"
-                value={outSym}
-                onChange={(e) => {
-                  setOutSym(e.target.value);
-                  setQuote(null);
-                  setBalances(null);
-                }}
-              >
-                {chainTokens.map((t) => (
-                  <option key={t.token_symbol} value={t.token_symbol}>
-                    {t.token_symbol}
-                  </option>
-                ))}
-              </select>
-            </div>
-            <div className="mt-1 h-[16px] text-[11px] text-ink-soft font-mono">
-              {balances &&
-                tokenOutMeta &&
-                (balances.out !== "0"
-                  ? `余额：${fmtBalance(balances.out, balances.decOut)}`
-                  : "余额：…")}
-            </div>
-          </label>
-
-          {/* 滑点 + 兑换按钮 */}
-          <div className="flex items-end gap-2 md:pl-2">
-            <label className="text-xs">
-              <div className="mb-1 text-ink-soft">滑点</div>
-              <select
-                className="input w-[92px]"
+                className="input w-[84px] py-1 px-2 text-xs"
                 value={slippage}
                 onChange={(e) => setSlippage(Number(e.target.value))}
               >
@@ -462,60 +599,65 @@ export function SwapQuoteSection() {
                 <option value={1}>1%</option>
                 <option value={3}>3%</option>
               </select>
-            </label>
+
+              {quote && quote.availableFees.length > 1 && (
+                <div className="flex flex-wrap items-center gap-1">
+                  {quote.availableFees.map((f) => (
+                    <button
+                      key={f.fee}
+                      type="button"
+                      className={`rounded px-2 py-0.5 text-[11px] transition ${
+                        f.fee === quote.fee
+                          ? "bg-cyan-500/20 text-cyan-200 border border-cyan-400/50"
+                          : "border border-white/15 bg-white/[0.05] text-ink-soft hover:bg-white/[0.1] hover:text-white"
+                      }`}
+                      onClick={() => setFeeOverride(f.fee)}
+                    >
+                      {f.fee / 10000}% ({abbrev(f.liquidity)})
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+
             <button
-              className="btn-primary h-[32px] px-5"
+              type="button"
+              className="btn-primary h-[32px] px-5 text-xs"
               disabled={swapping || quoting || !quote}
               onClick={executeSwap}
             >
-              {swapping ? "执行中…" : quoting ? "报价中…" : "兑换"}
+              {swapping
+                ? "兑换执行中…"
+                : quoting
+                  ? "报价中…"
+                  : `⚡ 立即兑换 ${inSym} → ${outSym}`}
             </button>
           </div>
         </div>
       )}
 
-      {/* fee 档位切换 */}
-      {quote && quote.availableFees.length > 1 && (
-        <div className="mb-3 flex flex-wrap items-center gap-1.5 text-xs">
-          <span className="text-ink-soft">费率档：</span>
-          {quote.availableFees.map((f) => (
-            <button
-              key={f.fee}
-              className={`rounded-lg px-2 py-0.5 text-xs transition ${
-                f.fee === quote.fee
-                  ? "bg-cyan-500/20 text-cyan-200 border border-cyan-400/50"
-                  : "border border-white/15 bg-white/[0.05] text-ink-soft hover:bg-white/[0.1] hover:text-white"
-              }`}
-              onClick={() => setFeeOverride(f.fee)}
-            >
-              {f.fee / 10000}%（流动性 {abbrev(f.liquidity)}）
-            </button>
-          ))}
-        </div>
-      )}
-
       {quoting && (
-        <p className="text-sm text-ink-soft">
-          报价中…（自动找池子 + Quoter 调用）
+        <p className="mt-2 text-xs text-ink-soft">
+          报价中…（自动寻优池子 + Quoter 调用）
         </p>
       )}
-      {err && <p className="text-sm text-warn">{err}</p>}
+      {err && <p className="mt-2 text-xs text-warn">❌ {err}</p>}
       {txHash && (
-        <p className="text-sm text-ok">
+        <p className="mt-2 text-xs text-ok">
           ✅ 兑换交易已提交：<span className="font-mono">{short(txHash)}</span>
         </p>
       )}
 
       {/* 报价结果 */}
       {quote && !quoting && (
-        <div className="panel-inset p-3.5 text-sm">
-          <div className="flex items-center justify-between py-1">
+        <div className="mt-2.5 rounded-lg border border-white/[0.08] bg-surface-base/80 p-3 text-xs space-y-1">
+          <div className="flex items-center justify-between">
             <span className="text-ink-soft">预计获得</span>
             <span className="font-semibold font-mono text-ink">
               {quote.amountOutHuman} {quote.tokenOut.symbol}
             </span>
           </div>
-          <div className="flex items-center justify-between border-t border-white/[0.08] py-1">
+          <div className="flex items-center justify-between border-t border-white/[0.06] pt-1">
             <span className="text-ink-soft">
               滑点 {quote.slippagePct}% 后最少
             </span>
@@ -523,7 +665,7 @@ export function SwapQuoteSection() {
               {quote.amountOutMinHuman} {quote.tokenOut.symbol}
             </span>
           </div>
-          <div className="flex items-center justify-between border-t border-white/[0.08] py-1">
+          <div className="flex items-center justify-between border-t border-white/[0.06] pt-1">
             <span className="text-ink-soft">成交价</span>
             {quote.cexCompare ? (
               <span className="font-mono text-ink">
@@ -540,7 +682,7 @@ export function SwapQuoteSection() {
           </div>
           {quote.priceImpactPct !== null &&
             quote.priceImpactPct !== undefined && (
-              <div className="flex items-center justify-between border-t border-white/[0.08] py-1">
+              <div className="flex items-center justify-between border-t border-white/[0.06] pt-1">
                 <span className="text-ink-soft">价格影响</span>
                 <span
                   className={
@@ -555,13 +697,10 @@ export function SwapQuoteSection() {
               </div>
             )}
           {quote.cexCompare && (
-            <div className="flex items-center justify-between border-t border-white/[0.08] py-1">
-              <span
-                className="text-ink-soft"
-                title="稳定币走 CEX 报价口径对比：DEX 成交价 vs CEX 价"
-              >
-                CEX 对比（{quote.cexCompare.otherSymbol}→
-                {quote.cexCompare.stableSymbol}）
+            <div className="flex items-center justify-between border-t border-white/[0.06] pt-1">
+              <span className="text-ink-soft">
+                CEX 对比 ({quote.cexCompare.otherSymbol}→
+                {quote.cexCompare.stableSymbol})
               </span>
               <span
                 className={
@@ -570,8 +709,7 @@ export function SwapQuoteSection() {
                     : "font-mono text-ink"
                 }
               >
-                CEX {quote.cexCompare.cexPrice.toPrecision(6)} · DEX{" "}
-                {quote.cexCompare.executionPriceInStable.toPrecision(6)}{" "}
+                CEX {quote.cexCompare.cexPrice.toPrecision(6)} ·{" "}
                 <span
                   className={
                     quote.cexCompare.diffPct >= 0 ? "text-ok" : "text-warn"
@@ -583,19 +721,12 @@ export function SwapQuoteSection() {
               </span>
             </div>
           )}
-          <div className="flex items-center justify-between border-t border-white/[0.08] py-1">
-            <span className="text-ink-soft">池子</span>
-            <span className="font-mono text-xs text-ink">
+          <div className="flex items-center justify-between border-t border-white/[0.06] pt-1">
+            <span className="text-ink-soft">路由池</span>
+            <span className="font-mono text-[11px] text-ink">
               {short(quote.pool)} · fee {quote.fee / 10000}% · {quote.dexName}
-              {quote.tokenIn.isNative &&
-                ` · ${quote.tokenIn.symbol}(native→wrapped)`}
             </span>
           </div>
-          {!quote.router && (
-            <p className="mt-1 text-xs text-warn">
-              ⚠️ 该 DEX 未配置 SwapRouter 地址，只能报价不能执行兑换
-            </p>
-          )}
         </div>
       )}
     </section>
@@ -651,7 +782,24 @@ function fmtBalance(raw: string, decimals?: number): string {
     const frac = (n % base)
       .toString()
       .padStart(Number(d), "0")
-      .slice(0, 6)
+      .slice(0, 4)
+      .replace(/0+$/, "");
+    return frac ? `${intPart}.${frac}` : `${intPart}`;
+  } catch {
+    return "0";
+  }
+}
+
+function fmtBalanceFull(raw: string, decimals?: number): string {
+  try {
+    const n = BigInt(raw);
+    const d = BigInt(decimals ?? 18);
+    const base = 10n ** d;
+    const intPart = n / base;
+    const frac = (n % base)
+      .toString()
+      .padStart(Number(d), "0")
+      .slice(0, 8)
       .replace(/0+$/, "");
     return frac ? `${intPart}.${frac}` : `${intPart}`;
   } catch {

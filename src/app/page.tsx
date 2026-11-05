@@ -99,8 +99,10 @@ export default function DashboardPage() {
     (p) => p.notify_state === "closed"
   );
   const [showClosed, setShowClosed] = useState(false);
+  const [showScanSettings, setShowScanSettings] = useState(false);
+  const [showPortfolio, setShowPortfolio] = useState(false);
 
-  // 从仓位卡片触发「撤池并重开」时，同步传给探针内的创建仓位面板并滚动过去
+  // 从仓位卡片触发「撤池并重开」时，同步传给右侧三段式工作台并滚动过去
   const [externalPool, setExternalPool] = useState<{
     chainId: number;
     pool: string;
@@ -113,31 +115,7 @@ export default function DashboardPage() {
     probeRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
   }
 
-  async function triggerScanDeep() {
-    const r = await fetch("/api/monitor", {
-      method: "POST",
-      headers: authHeaders({ "Content-Type": "application/json" }),
-      body: JSON.stringify({ mode: "deep" }),
-    });
-    const j = await r.json();
-    if (!j.ok) alert(j.error);
-    reloadPos();
-    reloadMon();
-    setTimeout(() => {
-      reloadPos();
-      reloadMon();
-    }, 8_000);
-    setTimeout(() => {
-      reloadPos();
-      reloadMon();
-    }, 30_000);
-    setTimeout(() => {
-      reloadPos();
-      reloadMon();
-    }, 90_000);
-  }
-
-  async function triggerScanCombined() {
+  async function triggerUnifiedScan() {
     const r = await fetch("/api/monitor", {
       method: "POST",
       headers: authHeaders({ "Content-Type": "application/json" }),
@@ -150,144 +128,184 @@ export default function DashboardPage() {
     setTimeout(() => {
       reloadPos();
       reloadMon();
-    }, 5_000);
+    }, 3_000);
     setTimeout(() => {
       reloadPos();
       reloadMon();
-    }, 15_000);
+    }, 8_000);
   }
 
+  const isScanning = !!(mon?.combinedRunning || mon?.fullRunning);
+  const lastScanDuration = mon?.lastCombined?.durationMs
+    ? ` (${(mon.lastCombined.durationMs / 1000).toFixed(1)}s)`
+    : "";
+
   return (
-    <div className="space-y-5">
-      {/* 顶部状态条 */}
-      <div className="card flex flex-wrap items-center justify-between gap-3 p-4">
-        <div className="flex items-center gap-5">
+    <div className="space-y-4">
+      {/* 顶部极速状态控制条（单一极速扫描模式） */}
+      <div className="card flex flex-wrap items-center justify-between gap-3 px-4 py-3">
+        <div className="flex flex-wrap items-center gap-5">
           <Stat label="监控仓位" value={list.length} />
           <Stat
             label="越界"
             value={outOfRange.length}
             danger={outOfRange.length > 0}
           />
-          <div className="text-sm text-ink-soft space-y-0.5">
-            <div>
-              合并：
-              <span className="text-ink font-medium">
-                {mon?.combinedCron ? cronToLabel(mon.combinedCron) : "—"}
-              </span>
-              {mon?.combinedRunning
-                ? " (扫描中)"
-                : ` · 上次 ${timeAgo(mon?.lastCombined?.startedAt)}`}
-            </div>
-            <div>
-              深度：
-              {mon?.fullRunning
-                ? "扫描中…"
-                : `上次 ${timeAgo(mon?.lastFull?.at)}`}
-            </div>
-          </div>
-        </div>
-        <div className="flex items-center gap-2">
-          <button className="btn-primary" onClick={triggerScanCombined}>
-            立即扫描
-          </button>
-          <button className="btn-secondary" onClick={triggerScanDeep}>
-            完整扫描
-          </button>
-        </div>
-      </div>
-
-      {/* 扫描频率和告警阈值设置 */}
-      <ScanIntervalAndAlerts
-        combinedCron={mon?.combinedCron ?? ""}
-        onChanged={() => reloadMon()}
-      />
-
-      {/* 链上资产统计 */}
-      <PortfolioSection />
-
-      {/* 代币兑换报价（QuoterV2） */}
-      <SwapQuoteSection />
-
-      {/* 最小区间流动性探针 + 收藏 + 创建仓位 */}
-      <div ref={probeRef}>
-        <LiquidityProbe externalPool={externalPool} />
-      </div>
-
-      {/* 越界告警区（如有） */}
-      {outOfRange.length > 0 && (
-        <section>
-          <h2 className="mb-2.5 flex items-center gap-2 text-base font-semibold text-warn">
-            ⚠️ 越界仓位（{outOfRange.length}）
-          </h2>
-          <div className="grid grid-cols-1 gap-3.5 md:grid-cols-2 lg:grid-cols-3">
-            {outOfRange.map((p) => (
-              <PositionCard
-                key={p.id}
-                p={p}
-                highlight
-                onFlipped={reloadPos}
-                onReopenPool={handleReopenPool}
-              />
-            ))}
-          </div>
-        </section>
-      )}
-
-      {/* 全部仓位 */}
-      <section>
-        <h2 className="mb-2.5 text-base font-semibold">
-          全部仓位（{list.length}）
-        </h2>
-        {list.length === 0 ? (
-          <EmptyHint />
-        ) : (
-          <div className="grid grid-cols-1 gap-3.5 md:grid-cols-2 lg:grid-cols-3">
-            {list.map((p) => (
-              <PositionCard
-                key={p.id}
-                p={p}
-                onFlipped={reloadPos}
-                onReopenPool={handleReopenPool}
-              />
-            ))}
-          </div>
-        )}
-      </section>
-
-      {/* 已平仓仓位（折叠） */}
-      {closed.length > 0 && (
-        <section>
-          <button
-            className="mb-2 flex items-center gap-2 text-sm font-medium text-ink-soft hover:text-ink"
-            onClick={() => setShowClosed(!showClosed)}
-          >
-            <span
-              className={`transition-transform ${
-                showClosed ? "rotate-90" : ""
-              }`}
-            >
-              ▶
+          <div className="text-xs sm:text-sm text-ink-soft">
+            <span>极速扫描：</span>
+            <span className="text-ink font-medium">
+              {mon?.combinedCron ? cronToLabel(mon.combinedCron) : "—"}
             </span>
-            已平仓仓位（{closed.length}）
+            {isScanning ? (
+              <span className="ml-2 text-cyan-300 font-medium">⚡ 扫描中…</span>
+            ) : (
+              <span className="ml-1">
+                · 上次 {timeAgo(mon?.lastCombined?.startedAt)}
+                <span className="font-mono text-ink-muted">
+                  {lastScanDuration}
+                </span>
+              </span>
+            )}
+          </div>
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            className="btn-ghost text-xs"
+            onClick={() => setShowScanSettings((v) => !v)}
+          >
+            ⚙️ {showScanSettings ? "收起设置 ▲" : "频率与告警设置"}
           </button>
-          {showClosed && (
-            <div className="grid grid-cols-1 gap-3.5 md:grid-cols-2 lg:grid-cols-3 opacity-70">
-              {closed.map((p) => (
-                <PositionCard
-                  key={p.id}
-                  p={p}
-                  closed
-                  onFlipped={reloadPos}
-                />
-              ))}
-            </div>
-          )}
-        </section>
+          <button
+            type="button"
+            className="btn-primary text-xs px-4"
+            disabled={isScanning}
+            onClick={triggerUnifiedScan}
+            title="增量区块游标 + 质押合约活跃枚举 + 8 路并发读取，单次 2~4 秒完成全量同步"
+          >
+            {isScanning ? "⚡ 扫描中…" : "⚡ 立即扫描"}
+          </button>
+        </div>
+      </div>
+
+      {/* 扫描频率和告警阈值设置（按需展开，保持首屏紧凑） */}
+      {showScanSettings && (
+        <ScanIntervalAndAlerts
+          combinedCron={mon?.combinedCron ?? ""}
+          onChanged={() => reloadMon()}
+        />
       )}
+
+      {/* 双栏终端主布局：左侧 7 列实时仓位监控，右侧 5 列三段式操作工作台 */}
+      <div className="grid grid-cols-1 gap-5 lg:grid-cols-12 items-start">
+        {/* ==================== 左栏（7/12）：LP 仓位监控 ==================== */}
+        <div className="lg:col-span-7 space-y-5">
+          {/* 越界告警区（如有） */}
+          {outOfRange.length > 0 && (
+            <section>
+              <h2 className="mb-2.5 flex items-center gap-2 text-base font-semibold text-warn">
+                ⚠️ 越界仓位（{outOfRange.length}）
+              </h2>
+              <div className="grid grid-cols-1 gap-3.5 xl:grid-cols-2">
+                {outOfRange.map((p) => (
+                  <PositionCard
+                    key={p.id}
+                    p={p}
+                    highlight
+                    onFlipped={reloadPos}
+                    onReopenPool={handleReopenPool}
+                  />
+                ))}
+              </div>
+            </section>
+          )}
+
+          {/* 全部仓位 */}
+          <section>
+            <h2 className="mb-2.5 text-base font-semibold text-ink">
+              全部监控仓位（{list.length}）
+            </h2>
+            {list.length === 0 ? (
+              <EmptyHint />
+            ) : (
+              <div className="grid grid-cols-1 gap-3.5 xl:grid-cols-2">
+                {list.map((p) => (
+                  <PositionCard
+                    key={p.id}
+                    p={p}
+                    onFlipped={reloadPos}
+                    onReopenPool={handleReopenPool}
+                  />
+                ))}
+              </div>
+            )}
+          </section>
+
+          {/* 已平仓仓位（折叠） */}
+          {closed.length > 0 && (
+            <section>
+              <button
+                type="button"
+                className="mb-2 flex items-center gap-2 text-sm font-medium text-ink-soft hover:text-ink"
+                onClick={() => setShowClosed(!showClosed)}
+              >
+                <span
+                  className={`transition-transform ${
+                    showClosed ? "rotate-90" : ""
+                  }`}
+                >
+                  ▶
+                </span>
+                已平仓归档仓位（{closed.length}）
+              </button>
+              {showClosed && (
+                <div className="grid grid-cols-1 gap-3.5 xl:grid-cols-2 opacity-75">
+                  {closed.map((p) => (
+                    <PositionCard
+                      key={p.id}
+                      p={p}
+                      closed
+                      onFlipped={reloadPos}
+                    />
+                  ))}
+                </div>
+              )}
+            </section>
+          )}
+        </div>
+
+        {/* ==================== 右栏（5/12）：三段式联动工作台（探针 -> 建仓 -> Swap） ==================== */}
+        <div className="lg:col-span-5 space-y-4 lg:sticky lg:top-4">
+          <div ref={probeRef}>
+            <LiquidityProbe externalPool={externalPool} />
+          </div>
+
+          {/* 链上资产统计（可折叠抽屉） */}
+          <div className="card p-4">
+            <div className="flex items-center justify-between">
+              <span className="text-sm font-semibold text-ink">
+                📊 链上钱包资产统计
+              </span>
+              <button
+                type="button"
+                className="btn-ghost btn-xs"
+                onClick={() => setShowPortfolio((v) => !v)}
+              >
+                {showPortfolio ? "收起 ▲" : "展开查询 ▼"}
+              </button>
+            </div>
+            {showPortfolio && (
+              <div className="mt-3">
+                <PortfolioSection />
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
 
       {/* 底部版本号 */}
       <div className="text-center text-xs text-ink-muted">
-        LP Monitor v{process.env.NEXT_PUBLIC_VERSION || "0.18.2"}
+        LP Monitor v{process.env.NEXT_PUBLIC_VERSION || "0.19.0"}
       </div>
     </div>
   );
@@ -1066,6 +1084,7 @@ function PositionCard({
   onFlipped?: () => void;
   onReopenPool?: (chainId: number, pool: string) => void;
 }) {
+  const { address: connectedWallet } = useWallet();
   const inRange = p.last_in_range === 1;
   const explorer = p.explorer_url?.replace(/\/$/, "");
   const dexLabel = p.dex_display_name || p.dex_name;
@@ -1082,6 +1101,18 @@ function PositionCard({
   const pair = p.pair_flip ? `${sym1}/${sym0}` : `${sym0}/${sym1}`;
   const cexInfo = parseCexPrice(p.last_cex_price);
   const cexWarnThresh = 0.01;
+
+  const walletDisplay = p.wallet_label
+    ? `${p.wallet_label} (${short(p.wallet_address)})`
+    : short(p.wallet_address);
+  const isWalletMatched =
+    !!connectedWallet &&
+    !!p.wallet_address &&
+    connectedWallet.toLowerCase() === p.wallet_address.toLowerCase();
+  const isWalletMismatched =
+    !!connectedWallet &&
+    !!p.wallet_address &&
+    connectedWallet.toLowerCase() !== p.wallet_address.toLowerCase();
 
   const flip = p.pair_flip === 1;
   const displaySym0 = flip ? sym1 : sym0;
@@ -1233,7 +1264,27 @@ function PositionCard({
           </div>
         </div>
 
-        <Row label="钱包">{p.wallet_label || short(p.wallet_address)}</Row>
+        <Row label={p.source === "staking" ? "质押钱包" : "持仓钱包"}>
+          <span
+            className="inline-flex flex-wrap items-center justify-end gap-1.5 font-mono text-xs"
+            title={p.wallet_address}
+          >
+            <span>{walletDisplay}</span>
+            {!closed && isWalletMatched && (
+              <span className="rounded bg-emerald-500/20 px-1.5 py-0.5 text-[10px] font-sans font-medium text-emerald-300 border border-emerald-500/35">
+                ✓ 当前钱包
+              </span>
+            )}
+            {!closed && isWalletMismatched && (
+              <span
+                className="rounded bg-amber-500/20 px-1.5 py-0.5 text-[10px] font-sans font-medium text-amber-200 border border-amber-500/40"
+                title={`当前连接钱包为 ${short(connectedWallet!)}，与该仓位${p.source === "staking" ? "质押" : "持仓"}钱包不一致，无法直接解押`}
+              >
+                ⚠️ 非当前钱包
+              </span>
+            )}
+          </span>
+        </Row>
         <Row label="检查时间">{timeAgo(p.last_checked_at)}</Row>
         {p.source === "staking" && (
           <Row label="质押合约">

@@ -548,44 +548,27 @@ export function MintPositionPanel({
     <div className="panel-inset border-cyan-500/30 p-4 text-xs">
       <div className="mb-2.5 flex items-center justify-between">
         <span className="text-sm font-semibold text-ink">
-          ➕ 创建 LP 仓位（最小区间）
+          ② ➕ 极速建仓 & 自动质押（最小区间）
         </span>
         {onClose && (
           <button className="btn-ghost btn-xs" onClick={onClose}>
-            关闭
+            收起
           </button>
         )}
       </div>
 
-      {/* 未选池子时提示从收藏列表选择 */}
+      {/* 未选池子时提示从上方收藏列表选择 */}
       {!data ? (
         <div className="space-y-2">
-          <div className="flex items-center gap-2">
-            <span className="text-ink-soft">链</span>
-            <select
-              className="input max-w-[150px]"
-              value={chainId || ""}
-              onChange={(e) => setChainId(Number(e.target.value))}
-            >
-              <option value="">选择链</option>
-              {(chains ?? [])
-                .filter((c: any) => c.enabled)
-                .map((c: any) => (
-                  <option key={c.id} value={c.id}>
-                    {c.name}
-                  </option>
-                ))}
-            </select>
-          </div>
           {initialPool ? (
             <div className="text-ink-soft">
               已选择池子{" "}
               <span className="font-mono">{initialPool.slice(0, 12)}…</span>
-              {busy && <span className="ml-2 text-cyan-300">读取中…</span>}
+              {busy && <span className="ml-2 text-cyan-300">读取链上池子状态中…</span>}
             </div>
           ) : (
             <div className="rounded-lg border border-cyan-500/30 bg-cyan-500/10 p-2.5 text-cyan-200">
-              👇 请在下方「收藏」列表点击一个交易对开始创建
+              👆 请在上方「收藏」列表点击一个交易对，将自动完成探针检测并载入建仓面板
             </div>
           )}
           {msg && <p className="text-warn">{msg}</p>}

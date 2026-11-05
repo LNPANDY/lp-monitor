@@ -16,7 +16,7 @@
  */
 import cron from "node-cron";
 import { scanKnownPositions, type KnownPositionsSummary } from "./known-positions-scanner";
-import { runScan, type ScanSummary } from "./scanner";
+import { type ScanSummary } from "./scanner";
 import { runFastDiscover, type FastDiscoverSummary } from "./discover-fast";
 import { scanFavoritePools, type FavPoolScanSummary } from "./fav-pool-scanner";
 import { getScanCron } from "../db/settings";
@@ -195,16 +195,19 @@ export function lastFullScanSummary() {
 }
 
 /**
- * 合并扫描 wrapper：先 fast discover 再 known 扫描。
- * combinedRunning 作为互斥标志（fast 与 known 顺序不可倒置）。
+ * 统一极速扫描 wrapper：
+ *   1. runFastDiscover（带 SQLite 持久化区块游标 + 新钱包/强制盘点时的 Vault 活跃枚举 + closed 空壳过滤）
+ *   2. scanFavoritePools（收藏池 CEX 价差监控）
+ *   3. scanKnownPositions（Pool 地址缓存 + 批量去重 slot0 + 8 路并发更新已有仓位）
  */
-async function runCombinedScanWrapper() {
+async function runCombinedScanWrapper(opts?: { forceFullInventory?: boolean }) {
   const s = getState();
   if (s.combinedRunning || s.fullRunning) {
-    console.log(`[scheduler-enhanced] combined scan skipped: ${s.combinedRunning ? "combined" : "full"} running`);
+    console.log(`[scheduler-enhanced] unified scan skipped: scan already running`);
     return { skipped: true, reason: "another scan already running" };
   }
   s.combinedRunning = true;
+  if (opts?.forceFullInventory) s.fullRunning = true;
   const startedAt = Date.now();
 
   let fastSummary: FastDiscoverSummary | null = null;
@@ -213,15 +216,16 @@ async function runCombinedScanWrapper() {
   let combinedError: string | undefined;
 
   try {
-    // ===== Step 1: fast discover =====
+    // ===== Step 1: fast discover (增量日志 + 首次/手动全量活跃枚举) =====
     const tFast0 = Date.now();
     fastSummary = await runFastDiscover({
       lastBlockByChain: s.lastFastScanBlockByChain,
       blockTimeByChain: s.blockTimeByChain,
       isFirstScan: !s.hasFastScanFirstDone,
+      forceFullInventory: opts?.forceFullInventory,
     });
     s.hasFastScanFirstDone = true;
-    console.log(`[scheduler-enhanced] fast discover done: new=${fastSummary.newInserted} source_changed=${fastSummary.sourceChanged} closed=${fastSummary.closed} (${Date.now()-tFast0}ms)`);
+    console.log(`[scheduler-enhanced] discover done: new=${fastSummary.newInserted} source_changed=${fastSummary.sourceChanged} closed=${fastSummary.closed} (${Date.now()-tFast0}ms)`);
 
     // ===== Step 1.5: 收藏池监控（CEX 价差告警，独立 try/catch 失败不影响后续步骤）=====
     const tFav0 = Date.now();
@@ -232,15 +236,16 @@ async function runCombinedScanWrapper() {
       console.error("[scheduler-enhanced] fav pools scan failed:", e);
     }
 
-    // ===== Step 2: known scan =====
+    // ===== Step 2: known scan (批量 slot0 + 8 路并发) =====
     const tKnown0 = Date.now();
     knownSummary = await scanKnownPositions();
     console.log(`[scheduler-enhanced] known scan done: ${knownSummary.positions} positions, ${knownSummary.active} active, ${knownSummary.alertsSent} alerts, (${Date.now()-tKnown0}ms)`);
   } catch (e: any) {
     combinedError = e?.message ?? String(e);
-    console.error("[scheduler-enhanced] combined scan failed:", e);
+    console.error("[scheduler-enhanced] unified scan failed:", e);
   } finally {
     s.combinedRunning = false;
+    s.fullRunning = false;
   }
 
   const summary: CombinedScanSummary = {
@@ -252,55 +257,40 @@ async function runCombinedScanWrapper() {
     error: combinedError,
   };
   s.lastCombined = summary;
-  console.log(`[scheduler-enhanced] combined done: total ${summary.durationMs}ms${summary.error ? ` error=${summary.error}` : ""}`);
+  s.lastFull = {
+    wallets: fastSummary?.windows.length ?? 0,
+    positions: knownSummary?.active ?? 0,
+    discovered: knownSummary?.positions ?? 0,
+    new: fastSummary?.newInserted ?? 0,
+    closed: (fastSummary?.closed ?? 0) + (knownSummary?.closed ?? 0),
+    outOfRange: Math.max(0, (knownSummary?.positions ?? 0) - (knownSummary?.active ?? 0) - (knownSummary?.closed ?? 0)),
+    alertsSent: knownSummary?.alertsSent ?? 0,
+    errors: [...(fastSummary?.errors ?? []), ...(knownSummary?.errors ?? [])],
+    startedAt: summary.startedAt,
+    durationMs: summary.durationMs,
+    at: new Date().toISOString(),
+    error: combinedError,
+  };
+  console.log(`[scheduler-enhanced] unified scan done: total ${summary.durationMs}ms${summary.error ? ` error=${summary.error}` : ""}`);
   return summary;
 }
 
-/**
- * wrapper for 深度扫描（手动按钮触发，与原 runScan 一致；完全独立于合并扫描）。
- */
-async function runFullScanWrapper() {
-  const s = getState();
-  if (s.fullRunning || s.combinedRunning) {
-    console.log(`[scheduler-enhanced] full scan skipped: ${s.fullRunning ? "full" : "combined"} running`);
-    return { skipped: true, reason: "another scan already running" };
-  }
-  s.fullRunning = true;
-  try {
-    const summary = await runScan();
-    s.lastFull = { ...summary, at: new Date().toISOString() };
-    console.log(`[scheduler-enhanced] deep scan done: ${summary.positions} positions, ${summary.outOfRange} out of range, ${summary.alertsSent} alerts, ${summary.durationMs}ms`);
-    return summary;
-  } catch (e: any) {
-    console.error("[scheduler-enhanced] deep scan failed:", e);
-    s.lastFull = {
-      wallets: 0, positions: 0, discovered: 0, outOfRange: 0, alertsSent: 0, errors: [],
-      startedAt: new Date().toISOString(), durationMs: 0,
-      error: e?.message ?? String(e),
-      at: new Date().toISOString()
-    };
-    throw e;
-  } finally {
-    s.fullRunning = false;
-  }
-}
-
-/** 手动触发合并扫描（fast + known 串行一次） */
+/** 手动触发统一扫描（同时做增量日志 + 盘点校验 + 已知仓位并发刷新） */
 export async function triggerCombinedScan() {
-  return await runCombinedScanWrapper();
+  return await runCombinedScanWrapper({ forceFullInventory: true });
 }
 
-/** 向后兼容：triggerFullScan 仍出发深度扫描（保留原行为，与手动"完整扫描"按钮对应） */
+/** 向后兼容：triggerFullScan 走统一极速扫描（含全量活跃盘点） */
 export async function triggerFullScan() {
-  return await runFullScanWrapper();
+  return await runCombinedScanWrapper({ forceFullInventory: true });
 }
 
-/** 向后兼容：旧名保留为合并扫描的别名 */
+/** 向后兼容：旧名保留为统一扫描的别名 */
 export async function triggerKnownPositionsScan() {
   return await runCombinedScanWrapper();
 }
 
-/** 向后兼容：旧名 runFastScanWrapper 已被合并 wrapper 取代 */
+/** 向后兼容：旧名保留为统一扫描的别名 */
 export async function triggerFastScan() {
   return await runCombinedScanWrapper();
 }

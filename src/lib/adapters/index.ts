@@ -4,11 +4,13 @@ import { v4Adapter } from "./v4";
 
 export type { V3RangeStatus };
 
-/** 适配器调用上下文。v3 用 factory/npm；v4 额外用 stateview（StateView lens 地址）。 */
+/** 适配器调用上下文。v3 用 factory/npm；可选传入 knownPool / knownTick 省去重复 RPC。 */
 export interface AdapterCtx {
   factory: string;
   npm: string;
   stateview?: string;
+  knownPool?: string;
+  knownTick?: number;
 }
 
 /** 仓位读取结果的三态：closed=已平仓 / unreadable=读不到（保留旧状态）/ ok=正常。 */
@@ -26,7 +28,7 @@ export type RangeReadResult =
       liquidity: bigint;
     };
 
-/** 适配器统一接口。实现新类型（如 v4）后在 registry 注册即可。 */
+/** 适配器统一接口。 */
 export interface PositionAdapter {
   type: string;
   readRange(
@@ -43,9 +45,13 @@ const v3ForkAdapter: PositionAdapter = {
       client,
       ctx.factory as `0x${string}`,
       ctx.npm as `0x${string}`,
-      tokenId
+      tokenId,
+      {
+        knownPool: ctx.knownPool as `0x${string}` | undefined,
+        knownTick: ctx.knownTick,
+      }
     );
-    if (r.kind !== "ok") return r; // closed / unreadable 原样透传
+    if (r.kind !== "ok") return r;
     return {
       kind: "ok",
       status: r.status,

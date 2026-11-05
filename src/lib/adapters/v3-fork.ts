@@ -1,12 +1,11 @@
 /**
  * V3-fork 适配器 —— 覆盖所有兼容 Uniswap V3 NonfungiblePositionManager 的 DEX：
- * Uniswap V3 / PancakeSwap V3 / QuickSwap V3 / Aerodrome Slipstream / Camelot V3 / BaseSwap 等。
+ * Uniswap V3 / PancakeSwap V3 / QuickSwap V3 / Aerodrome Slipstream / Camelot V3 / ZIA 等。
  *
- * 区间判断原理：
- *   1. positions(tokenId) → token0, token1, fee, tickLower, tickUpper, liquidity, ...
- *   2. factory.getPool(token0, token1, fee) → pool 地址
- *   3. pool.slot0().tick → 当前 tick
- *   4. inRange = tickLower <= currentTick < tickUpper
+ * 性能优化：
+ *   1. Pool 地址内存永久缓存（(factory, token0, token1, fee) -> pool 链上不可变），彻底省去重复 factory.getPool RPC
+ *   2. 支持传入已批量读取的 knownPool / knownTick，将单仓位状态检查从 3 次串行 RPC 压缩为仅 1 次 positions(tokenId)
+ *   3. 提供 batchReadPoolTicks 对同链所有活跃池一次性去重并发读取 slot0()
  */
 import type { PublicClient } from "viem";
 
@@ -120,8 +119,40 @@ export interface V3RangeStatus {
   /** token1 / token0 的价格（每 1 token0 = ? token1），由当前 tick 推算 */
   price: string;
   /** 距离区间边界的相对距离：>0 在区间内，<0 越界，单位“比例” */
-  marginLower: number; // (currentTick - tickLower) / tickSpacing-ish，归一为相对百分比
+  marginLower: number;
   marginUpper: number;
+}
+
+const ZERO_POOL = "0x0000000000000000000000000000000000000000";
+
+/** 不可变 Pool 地址缓存：`${factory}:${token0}:${token1}:${fee}` -> poolAddr */
+const poolAddressCache = new Map<string, `0x${string}`>();
+
+function makePoolCacheKey(
+  factory: string,
+  token0: string,
+  token1: string,
+  fee: number
+): string {
+  const a = token0.toLowerCase();
+  const b = token1.toLowerCase();
+  const [t0, t1] = a < b ? [a, b] : [b, a];
+  return `${factory.toLowerCase()}:${t0}:${t1}:${fee}`;
+}
+
+/** 用已知的 DB 记录预热 Pool 地址缓存，避免发起 factory.getPool 请求 */
+export function primePoolAddressCache(
+  factory: string,
+  token0: string,
+  token1: string,
+  fee: number,
+  pool: string
+): void {
+  if (!factory || !token0 || !token1 || !fee || !pool || pool === ZERO_POOL) return;
+  poolAddressCache.set(
+    makePoolCacheKey(factory, token0, token1, fee),
+    pool as `0x${string}`
+  );
 }
 
 /** 读取一个 NFT 仓位的元数据（不包含当前 tick）。 */
@@ -148,11 +179,11 @@ export async function readPositionMeta(
       liquidity: res[7],
     };
   } catch {
-    return null; // tokenId 不存在或已销毁
+    return null;
   }
 }
 
-/** 由 factory 派生 pool 地址。 */
+/** 由 factory 派生 pool 地址（带永久内存缓存）。 */
 export async function getPoolAddress(
   client: PublicClient,
   factory: `0x${string}`,
@@ -160,12 +191,19 @@ export async function getPoolAddress(
   token1: `0x${string}`,
   fee: number
 ): Promise<`0x${string}`> {
+  const key = makePoolCacheKey(factory, token0, token1, fee);
+  const cached = poolAddressCache.get(key);
+  if (cached) return cached;
+
   const pool = (await client.readContract({
     address: factory,
     abi: V3_FACTORY_ABI,
     functionName: "getPool",
     args: [token0, token1, fee],
   })) as `0x${string}`;
+  if (pool && pool !== ZERO_POOL) {
+    poolAddressCache.set(key, pool);
+  }
   return pool;
 }
 
@@ -174,7 +212,7 @@ export async function readPoolTick(
   client: PublicClient,
   pool: `0x${string}`
 ): Promise<number | null> {
-  if (pool === "0x0000000000000000000000000000000000000000") return null;
+  if (!pool || pool === ZERO_POOL) return null;
   try {
     const slot0 = (await client.readContract({
       address: pool,
@@ -188,36 +226,89 @@ export async function readPoolTick(
 }
 
 /**
+ * 批量去重并发读取多个 Pool 的当前 tick（slot0）。
+ * 同一条链上有 10 个仓位属于 3 个池子时，只需读 3 次 slot0。
+ */
+export async function batchReadPoolTicks(
+  client: PublicClient,
+  pools: string[],
+  concurrency = 8
+): Promise<Map<string, number>> {
+  const uniquePools = Array.from(
+    new Set(
+      pools
+        .map((p) => (p || "").trim().toLowerCase())
+        .filter((p) => /^0x[a-f0-9]{40}$/.test(p) && p !== ZERO_POOL)
+    )
+  );
+  const out = new Map<string, number>();
+  if (uniquePools.length === 0) return out;
+
+  let cursor = 0;
+  const workers = Array.from(
+    { length: Math.min(concurrency, uniquePools.length) },
+    async () => {
+      while (cursor < uniquePools.length) {
+        const poolAddr = uniquePools[cursor++];
+        const tick = await readPoolTick(client, poolAddr as `0x${string}`);
+        if (tick !== null) {
+          out.set(poolAddr, tick);
+        }
+      }
+    }
+  );
+  await Promise.all(workers);
+  return out;
+}
+
+export interface ReadRangeOptions {
+  meta?: V3PositionMeta;
+  knownPool?: `0x${string}`;
+  knownTick?: number;
+}
+
+/**
  * 综合：给定 npm + tokenId，返回完整区间状态。
- * meta 可选传入以避免重复读取。
- *
- * 返回值区分三种情况（调用方据此决定标 closed 还是保留旧状态）：
- *   - { kind: 'closed' }          : meta 读到且 liquidity=0，确认仓位已平仓
- *   - { kind: 'unreadable' }      : RPC 读不到 meta / 读不到 pool tick，不确定，应保留旧状态
- *   - { kind: 'ok', meta, status }: 正常，返回完整区间状态
+ * 支持传入已知的 pool 地址与已批量读取的 currentTick，省去重复 getPool 和 slot0 请求。
  */
 export async function readRangeStatus(
   client: PublicClient,
   factory: `0x${string}`,
   npm: `0x${string}`,
   tokenId: bigint,
-  meta?: V3PositionMeta
+  metaOrOpts?: V3PositionMeta | ReadRangeOptions
 ): Promise<
   | { kind: "closed" }
   | { kind: "unreadable" }
   | { kind: "ok"; meta: V3PositionMeta; status: V3RangeStatus }
 > {
-  const m = meta ?? (await readPositionMeta(client, npm, tokenId));
-  if (!m) return { kind: "unreadable" }; // NFT 不存在或 RPC 失败 → 不确定，保留旧状态
-  if (m.liquidity === 0n) return { kind: "closed" }; // 确认平仓
+  const isOpts =
+    metaOrOpts &&
+    ("meta" in metaOrOpts || "knownPool" in metaOrOpts || "knownTick" in metaOrOpts);
+  const opts: ReadRangeOptions = isOpts
+    ? (metaOrOpts as ReadRangeOptions)
+    : { meta: metaOrOpts as V3PositionMeta | undefined };
 
-  const pool = await getPoolAddress(client, factory, m.token0, m.token1, m.fee);
-  const currentTick = await readPoolTick(client, pool);
-  if (currentTick === null) return { kind: "unreadable" }; // pool/tick 读不到 → 不确定，保留旧状态
+  const m = opts.meta ?? (await readPositionMeta(client, npm, tokenId));
+  if (!m) return { kind: "unreadable" };
+  if (m.liquidity === 0n) return { kind: "closed" };
+
+  let pool: `0x${string}`;
+  if (opts.knownPool && opts.knownPool !== ZERO_POOL) {
+    pool = opts.knownPool;
+    primePoolAddressCache(factory, m.token0, m.token1, m.fee, pool);
+  } else {
+    pool = await getPoolAddress(client, factory, m.token0, m.token1, m.fee);
+  }
+
+  const currentTick =
+    opts.knownTick !== undefined
+      ? opts.knownTick
+      : await readPoolTick(client, pool);
+  if (currentTick === null) return { kind: "unreadable" };
 
   const inRange = currentTick >= m.tickLower && currentTick < m.tickUpper;
   const price = tickToPrice(currentTick);
-  // 用 tick 跨度的相对距离粗略表示接近边界程度
   const span = Math.max(m.tickUpper - m.tickLower, 1);
   const marginLower = (currentTick - m.tickLower) / span;
   const marginUpper = (m.tickUpper - currentTick) / span;
@@ -225,7 +316,16 @@ export async function readRangeStatus(
   return {
     kind: "ok",
     meta: m,
-    status: { inRange, currentTick, tickLower: m.tickLower, tickUpper: m.tickUpper, pool, price, marginLower, marginUpper },
+    status: {
+      inRange,
+      currentTick,
+      tickLower: m.tickLower,
+      tickUpper: m.tickUpper,
+      pool,
+      price,
+      marginLower,
+      marginUpper,
+    },
   };
 }
 
