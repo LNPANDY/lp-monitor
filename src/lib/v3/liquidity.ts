@@ -129,26 +129,66 @@ function getPoolStaticCache(): Map<string, PoolStaticMeta> {
   return g.__lpMonitorPoolStaticCache__;
 }
 
-const poolInfoCache = new Map<
+function getPoolInfoCache(): Map<
   string,
   { fee: number; tickSpacing: number; token0: `0x${string}`; token1: `0x${string}`; factory: string }
->();
+> {
+  const g = globalThis as any;
+  if (!g.__lpMonitorPoolInfoCache__) {
+    g.__lpMonitorPoolInfoCache__ = new Map();
+  }
+  return g.__lpMonitorPoolInfoCache__;
+}
 
-/** NFT 静态池子与区间缓存（token0 / token1 / fee / tickLower / tickUpper 铸造后永不改变） */
-const nftStaticCache = new Map<
+/** NFT 静态池子与区间缓存（token0 / token1 / fee / tickLower / tickUpper 铸造后永不改变，挂载到 globalThis 跨请求持久复用） */
+function getNftStaticCache(): Map<
   string,
   { poolKey: string; tickLower: number; tickUpper: number }
->();
+> {
+  const g = globalThis as any;
+  if (!g.__lpMonitorNftStaticCache__) {
+    g.__lpMonitorNftStaticCache__ = new Map();
+  }
+  return g.__lpMonitorNftStaticCache__;
+}
 
-/** 已平仓（liquidity === 0）NFT 集合缓存，避免重复链上读取 */
-const closedNftSet = new Set<string>();
+/** 已平仓（liquidity === 0）NFT 集合缓存，挂载到 globalThis 避免重复链上读取 */
+function getClosedNftSet(): Set<string> {
+  const g = globalThis as any;
+  if (!g.__lpMonitorClosedNftSet__) {
+    g.__lpMonitorClosedNftSet__ = new Set<string>();
+  }
+  return g.__lpMonitorClosedNftSet__;
+}
 
-/** Vault 持有 tokenId 列表短期缓存（15 秒 TTL，避免连续切换探针时重复枚举） */
-const ownedTokenIdsCache = new Map<string, { ts: number; ids: bigint[] }>();
+/** Vault 持有 tokenId 列表缓存（挂载到 globalThis，支持尾元素快速校验复用） */
+function getOwnedTokenIdsCache(): Map<
+  string,
+  { ts: number; count: number; ids: bigint[] }
+> {
+  const g = globalThis as any;
+  if (!g.__lpMonitorOwnedTokenIdsCache__) {
+    g.__lpMonitorOwnedTokenIdsCache__ = new Map();
+  }
+  return g.__lpMonitorOwnedTokenIdsCache__;
+}
+
+/** 质押窗口聚合流动性短期缓存（15 秒 TTL，让探针与随后的建仓占比估算 0 RPC 直接复用） */
+function getStakedWindowCache(): Map<
+  string,
+  { ts: number; stakedLiquidityRaw: bigint; matchedCount: number }
+> {
+  const g = globalThis as any;
+  if (!g.__lpMonitorStakedWindowCache__) {
+    g.__lpMonitorStakedWindowCache__ = new Map();
+  }
+  return g.__lpMonitorStakedWindowCache__;
+}
 
 /** 读取 pool 的 fee / tickSpacing / token0 / token1 / factory（带永久内存缓存）。 */
 async function readPoolInfo(client: PublicClient, pool: `0x${string}`) {
   const k = pool.toLowerCase();
+  const poolInfoCache = getPoolInfoCache();
   const cached = poolInfoCache.get(k);
   if (cached) return cached;
   const [fee, tickSpacing, token0, token1, factory] = await Promise.all([
@@ -200,26 +240,60 @@ export async function getPoolStaticMeta(
 
 /**
  * 枚举 owner（vault 或钱包）在 NPM 上持有的全部 LP NFT tokenId。
- * 用 balanceOf + tokenOfOwnerByIndex，带 15 秒短期缓存。
+ * 优化：
+ *   1. 30 秒内直接命中内存缓存（0 RPC）。
+ *   2. 超过 30 秒但在 5 分钟内时，先读 `balanceOf(owner)` + 末尾 `tokenOfOwnerByIndex(owner, count-1)`：
+ *      若数量与末尾 tokenId 均未变化，说明 Vault 未发生进出，直接复用缓存列表（仅 1~2 次 RPC，省去数百次枚举）。
  */
 async function enumerateOwnedTokenIds(
   client: PublicClient,
   npm: `0x${string}`,
   owner: `0x${string}`,
-  maxCount = 500
+  maxCount = 500,
+  force = false
 ): Promise<bigint[]> {
   const cacheKey = `${npm.toLowerCase()}:${owner.toLowerCase()}`;
+  const ownedTokenIdsCache = getOwnedTokenIdsCache();
   const cached = ownedTokenIdsCache.get(cacheKey);
-  if (cached && Date.now() - cached.ts < 15_000) {
+  const now = Date.now();
+  if (!force && cached && now - cached.ts < 30_000) {
     return cached.ids;
   }
   const count = Number(
     (await client.readContract({ address: npm, abi: V3_NPM_ABI, functionName: "balanceOf", args: [owner] })) as bigint
   );
-  if (count === 0) return [];
+  if (count === 0) {
+    ownedTokenIdsCache.set(cacheKey, { ts: now, count: 0, ids: [] });
+    return [];
+  }
   const limit = Math.min(count, maxCount);
+
+  // 快速校验：若 Vault 的 NFT 总数未变且缓存未超 5 分钟，校验最后一个索引是否一致
+  if (
+    !force &&
+    cached &&
+    cached.count === count &&
+    cached.ids.length === limit &&
+    now - cached.ts < 300_000
+  ) {
+    try {
+      const lastId = (await client.readContract({
+        address: npm,
+        abi: V3_NPM_ABI,
+        functionName: "tokenOfOwnerByIndex",
+        args: [owner, BigInt(limit - 1)],
+      })) as bigint;
+      if (lastId === cached.ids[limit - 1]) {
+        cached.ts = now;
+        return cached.ids;
+      }
+    } catch {
+      // fallback to full enumeration
+    }
+  }
+
   const ids: bigint[] = [];
-  const BATCH = 25;
+  const BATCH = 40;
   for (let i = 0; i < limit; i += BATCH) {
     const batch = Array.from({ length: Math.min(BATCH, limit - i) }, async (_, j) => {
       const idx = i + j;
@@ -238,50 +312,87 @@ async function enumerateOwnedTokenIds(
     const results = await Promise.all(batch);
     for (const r of results) if (r !== null) ids.push(r);
   }
-  ownedTokenIdsCache.set(cacheKey, { ts: Date.now(), ids });
+  ownedTokenIdsCache.set(cacheKey, { ts: now, count, ids });
   return ids;
 }
 
 /**
- * 带静态池子/区间前置过滤的 positions(tokenId) 读取：
- * 若已知该 NFT 属于其它池子、或 tick 区间不覆盖目标窗口、或已平仓，直接 0 RPC 跳过！
+ * 聚合质押合约（vault）在指定池子与目标区间 [tickLower, tickUpper] 内的活跃质押流动性。
+ *
+ * 极速原理：
+ *   1. 先在内存里用 `closedNftSet` 和 `nftStaticCache` 过滤掉 95%+ 的其它池子/其它区间/已平仓 NFT（0 RPC）。
+ *   2. 仅对「属于当前池子且覆盖目标窗口」或「首次见到的新 NFT」发起链上 `positions(tokenId)` 读取。
  */
-async function readMatchingPositionLiquidity(
+export async function sumStakedWindowLiquidity(
   client: PublicClient,
   npm: `0x${string}`,
-  tokenId: bigint,
-  targetPoolKey: string,
-  targetTickLower: number,
-  targetTickUpper: number
-): Promise<bigint | null> {
-  const nftKey = `${npm.toLowerCase()}:${tokenId.toString()}`;
-  if (closedNftSet.has(nftKey)) return null;
-
-  const staticMeta = nftStaticCache.get(nftKey);
-  if (staticMeta) {
-    if (staticMeta.poolKey !== targetPoolKey) return null;
-    if (staticMeta.tickLower > targetTickLower || staticMeta.tickUpper < targetTickUpper) {
-      return null;
+  vault: `0x${string}`,
+  pool: `0x${string}`,
+  tickLower: number,
+  tickUpper: number,
+  force = false
+): Promise<{ stakedLiquidityRaw: bigint; matchedCount: number }> {
+  const winKey = `${npm.toLowerCase()}:${vault.toLowerCase()}:${pool.toLowerCase()}:${tickLower}:${tickUpper}`;
+  const winCache = getStakedWindowCache();
+  const now = Date.now();
+  if (!force) {
+    const hit = winCache.get(winKey);
+    if (hit && now - hit.ts < 15_000) {
+      return { stakedLiquidityRaw: hit.stakedLiquidityRaw, matchedCount: hit.matchedCount };
     }
   }
 
-  const meta = await readPositionMeta(client, npm, tokenId);
-  if (!meta) return null;
+  const [tokenIds, poolInfo] = await Promise.all([
+    enumerateOwnedTokenIds(client, npm, vault, 500, force),
+    readPoolInfo(client, pool),
+  ]);
+  const targetPoolKey = `${poolInfo.token0.toLowerCase()}-${poolInfo.token1.toLowerCase()}-${poolInfo.fee}`;
 
-  const lpPoolKey = `${meta.token0.toLowerCase()}-${meta.token1.toLowerCase()}-${meta.fee}`;
-  nftStaticCache.set(nftKey, {
-    poolKey: lpPoolKey,
-    tickLower: meta.tickLower,
-    tickUpper: meta.tickUpper,
+  const closedNftSet = getClosedNftSet();
+  const nftStaticCache = getNftStaticCache();
+  const npmLower = npm.toLowerCase();
+
+  // 第一步：纯内存预筛（0 RPC 淘汰不匹配的 NFT）
+  const candidateTokenIds: bigint[] = [];
+  for (const tokenId of tokenIds) {
+    const nftKey = `${npmLower}:${tokenId.toString()}`;
+    if (closedNftSet.has(nftKey)) continue;
+    const staticMeta = nftStaticCache.get(nftKey);
+    if (staticMeta) {
+      if (staticMeta.poolKey !== targetPoolKey) continue;
+      if (staticMeta.tickLower > tickLower || staticMeta.tickUpper < tickUpper) continue;
+    }
+    candidateTokenIds.push(tokenId);
+  }
+
+  // 第二步：仅对候选 NFT 并发读取链上 positions(tokenId)
+  let stakedLiquidityRaw = 0n;
+  let matchedCount = 0;
+  await mapWithConcurrency(candidateTokenIds, 16, async (tokenId) => {
+    const nftKey = `${npmLower}:${tokenId.toString()}`;
+    const meta = await readPositionMeta(client, npm, tokenId);
+    if (!meta) return;
+
+    const lpPoolKey = `${meta.token0.toLowerCase()}-${meta.token1.toLowerCase()}-${meta.fee}`;
+    nftStaticCache.set(nftKey, {
+      poolKey: lpPoolKey,
+      tickLower: meta.tickLower,
+      tickUpper: meta.tickUpper,
+    });
+
+    if (meta.liquidity === 0n) {
+      closedNftSet.add(nftKey);
+      return;
+    }
+    if (lpPoolKey !== targetPoolKey) return;
+    if (meta.tickLower > tickLower || meta.tickUpper < tickUpper) return;
+
+    stakedLiquidityRaw += meta.liquidity;
+    matchedCount++;
   });
 
-  if (meta.liquidity === 0n) {
-    closedNftSet.add(nftKey);
-    return null;
-  }
-  if (lpPoolKey !== targetPoolKey) return null;
-  if (meta.tickLower > targetTickLower || meta.tickUpper < targetTickUpper) return null;
-  return meta.liquidity;
+  winCache.set(winKey, { ts: Date.now(), stakedLiquidityRaw, matchedCount });
+  return { stakedLiquidityRaw, matchedCount };
 }
 
 // ==================== 场景 A：直接持有 ====================
@@ -366,41 +477,13 @@ export async function analyzeStaked(
   symbol1: string,
   myLiquidity: bigint = 0n
 ): Promise<LiquidityResult> {
-  const { sqrtPriceX96, currentTick } = await readPoolState(client, pool);
+  const [{ sqrtPriceX96, currentTick }, { stakedLiquidityRaw: aggregatedLiquidity, matchedCount }] =
+    await Promise.all([
+      readPoolState(client, pool),
+      sumStakedWindowLiquidity(client, npm, vault, pool, tickLower, tickUpper),
+    ]);
   const sqrtA = tickToSqrtPriceX96(tickLower);
   const sqrtB = tickToSqrtPriceX96(tickUpper);
-
-  // 枚举 vault 持有的全部 LP NFT
-  const tokenIds = await enumerateOwnedTokenIds(client, npm, vault);
-
-  // 读 pool 的 token0/token1/fee，用于判定同池子
-  const poolInfo = await readPoolInfo(client, pool);
-  const poolKey = `${poolInfo.token0.toLowerCase()}-${poolInfo.token1.toLowerCase()}-${poolInfo.fee}`;
-
-  // 逐个读 positions，筛同池子 + tick 区间覆盖目标窗口，再累加 liquidity。
-  // 注意1：不能 Promise.all 全部并发——viem multicall 会把它们合并成一个巨型 eth_call
-  //        超出节点上限而挂起。用 mapWithConcurrency 控制同时进行的 RPC 数。
-  // 注意2：必须同时按 tick 区间过滤。LP 的 liquidity L 是针对「其自身的 tick 区间」定义的，
-  //        不同区间的 L 不可直接相加。例如同一池子里 tick 相距甚远的宽区间 LP，其 L 可能
-  //        高达 1e33，但它在你目标窗口内的活跃流动性近乎 0；若不过滤就会把这种巨型 L
-  //        累加进来，导致 total 被 ~1e14 放大、share 归零（精度完全失真）。
-  //        正确语义：只累加 tick 区间「覆盖目标窗口」的 LP（与 POOL.liquidity() 语义一致，
-  //        即活跃流动性贯穿你所在区间），与场景C probeMinRange 的判定保持统一。
-  let aggregatedLiquidity = 0n;
-  let matchedCount = 0;
-  await mapWithConcurrency(tokenIds, 8, async (tokenId) => {
-    const liq = await readMatchingPositionLiquidity(
-      client,
-      npm,
-      tokenId,
-      poolKey,
-      tickLower,
-      tickUpper
-    );
-    if (!liq || liq === 0n) return;
-    aggregatedLiquidity += liq;
-    matchedCount++;
-  });
 
   const total = getAmountsForLiquidity(sqrtPriceX96, sqrtA, sqrtB, aggregatedLiquidity, decimals0, decimals1);
   const mine = getAmountsForLiquidity(sqrtPriceX96, sqrtA, sqrtB, myLiquidity, decimals0, decimals1);
@@ -435,10 +518,18 @@ export interface MinRangeProbeResult {
   currentTick: number;
   /** 当前 sqrtPriceX96 字符串（供建仓面板直接复用） */
   sqrtPriceX96?: string;
-  /** 原始活跃流动性字符串（供建仓面板直接复用） */
+  /** 全池原始活跃流动性字符串（Pool.liquidity()，含质押 + 未质押） */
   rawLiquidity?: string;
-  /** 该最小窗口内的流动性（token0/token1） */
+  /** 全池该最小窗口内的总流动性（含质押 + 未质押，token0/token1） */
   liquidity: LiquidityBreakdown;
+  /** 质押合约在该最小窗口内的流动性（仅已质押 LP，token0/token1） */
+  stakedLiquidity?: LiquidityBreakdown;
+  /** 质押合约在该最小窗口内的原始流动性字符串 */
+  stakedRawLiquidity?: string;
+  /** 质押合约中覆盖该最小窗口的活跃质押仓位数量 */
+  stakedPositionCount?: number;
+  /** 质押流动性占全池窗口流动性的比例（0~1） */
+  stakedShareOfPool?: number;
   /** 价格区间 [low, high] */
   priceLow: string;
   priceHigh: string;
@@ -454,8 +545,9 @@ export interface MinRangeProbeResult {
 /**
  * 场景C：给定池子地址，算 fee 对应 tickSpacing 的最小窗口流动性 + 价格区间。
  *
- * 最小区间 = [当前 tick 向下取整到 tickSpacing 的倍数, +tickSpacing]
- * 直接使用 V3 Pool.liquidity()（当前 tick 活跃净流动性，含直持与质押在 Vault 中的所有 LP，仅需 1 次 RPC）。
+ * 同时返回：
+ *   1. `liquidity`：全池最小窗口流动性（`Pool.liquidity()`，含已质押 + 未质押 LP）
+ *   2. `stakedLiquidity`：当提供 `npm` 与 `stakerAddr` 时，额外计算质押合约在该最小窗口内的流动性与质押仓位数
  */
 export async function probeMinRange(
   client: PublicClient,
@@ -464,8 +556,9 @@ export async function probeMinRange(
   decimals1: number,
   symbol0: string,
   symbol1: string,
-  _npm?: `0x${string}`,
-  _stakerAddr?: `0x${string}`
+  npm?: `0x${string}`,
+  stakerAddr?: `0x${string}`,
+  force = false
 ): Promise<MinRangeProbeResult> {
   const [{ sqrtPriceX96, currentTick, liquidity: poolLiquidity }, info] = await Promise.all([
     readPoolState(client, pool),
@@ -479,6 +572,7 @@ export async function probeMinRange(
   const sqrtA = tickToSqrtPriceX96(tickLower);
   const sqrtB = tickToSqrtPriceX96(tickUpper);
 
+  // 1. 全池窗口总流动性（含未质押 LP）
   const liquidity = getAmountsForLiquidity(
     sqrtPriceX96,
     sqrtA,
@@ -488,6 +582,42 @@ export async function probeMinRange(
     decimals1
   );
 
+  // 2. 质押窗口流动性（若匹配到质押合约）
+  let stakedLiquidity: LiquidityBreakdown | undefined = undefined;
+  let stakedRawLiquidity: string | undefined = undefined;
+  let stakedPositionCount: number | undefined = undefined;
+  let stakedShareOfPool: number | undefined = undefined;
+
+  if (npm && stakerAddr && /^0x[a-fA-F0-9]{40}$/.test(npm) && /^0x[a-fA-F0-9]{40}$/.test(stakerAddr)) {
+    try {
+      const { stakedLiquidityRaw, matchedCount } = await sumStakedWindowLiquidity(
+        client,
+        npm,
+        stakerAddr,
+        pool,
+        tickLower,
+        tickUpper,
+        force
+      );
+      stakedLiquidity = getAmountsForLiquidity(
+        sqrtPriceX96,
+        sqrtA,
+        sqrtB,
+        stakedLiquidityRaw,
+        decimals0,
+        decimals1
+      );
+      stakedRawLiquidity = stakedLiquidityRaw.toString();
+      stakedPositionCount = matchedCount;
+      stakedShareOfPool =
+        poolLiquidity > 0n
+          ? Math.min(1, Number((stakedLiquidityRaw * 10000n) / poolLiquidity) / 10000)
+          : 0;
+    } catch (e) {
+      console.warn("[probeMinRange] sumStakedWindowLiquidity failed:", (e as Error).message);
+    }
+  }
+
   return {
     tickSpacing,
     tickLower,
@@ -496,6 +626,10 @@ export async function probeMinRange(
     sqrtPriceX96: sqrtPriceX96.toString(),
     rawLiquidity: poolLiquidity.toString(),
     liquidity,
+    stakedLiquidity,
+    stakedRawLiquidity,
+    stakedPositionCount,
+    stakedShareOfPool,
     priceLow: tickToPriceDisplay(tickLower, decimals0, decimals1),
     priceHigh: tickToPriceDisplay(tickUpper, decimals0, decimals1),
     priceCurrent: sqrtPriceX96ToHumanPrice(sqrtPriceX96, decimals0, decimals1),

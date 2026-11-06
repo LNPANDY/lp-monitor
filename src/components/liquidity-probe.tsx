@@ -16,6 +16,11 @@ interface ProbeResult {
   tickUpper: number;
   currentTick: number;
   liquidity: { amount0: string; amount1: string };
+  stakedLiquidity?: { amount0: string; amount1: string };
+  stakedRawLiquidity?: string;
+  stakedPositionCount?: number;
+  stakedShareOfPool?: number;
+  stakedPlatform?: string;
   priceLow: string;
   priceHigh: string;
   priceCurrent: string;
@@ -425,6 +430,16 @@ export function LiquidityProbe({
       ? result.liquidity.amount0
       : result.liquidity.amount1
     : "";
+  const displayStakedAmount0 = result?.stakedLiquidity
+    ? flip
+      ? result.stakedLiquidity.amount1
+      : result.stakedLiquidity.amount0
+    : "";
+  const displayStakedAmount1 = result?.stakedLiquidity
+    ? flip
+      ? result.stakedLiquidity.amount0
+      : result.stakedLiquidity.amount1
+    : "";
   // 翻转后价格区间取倒数并交换 low/high
   const displayPriceLow = result?.priceLow
     ? fmtFull(flip ? 1 / Number(result.priceHigh) : Number(result.priceLow))
@@ -680,7 +695,28 @@ export function LiquidityProbe({
                 {result.currentTick} [{result.tickLower}, {result.tickUpper}]
               </span>
             </PRow>
-            <PRow label="窗口流动性">
+            {result.stakedLiquidity && (
+              <PRow label="质押流动性">
+                <span className="font-mono font-medium text-cyan-300">
+                  {displayStakedAmount0} {displaySym0} / {displayStakedAmount1}{" "}
+                  {displaySym1}
+                  <span className="ml-1.5 font-sans text-[11px] font-normal text-ink-soft">
+                    ({result.stakedPositionCount ?? 0} 仓
+                    {result.stakedShareOfPool !== undefined
+                      ? ` · 占窗口 ${(result.stakedShareOfPool * 100).toFixed(1)}%`
+                      : ""}
+                    )
+                  </span>
+                </span>
+              </PRow>
+            )}
+            <PRow
+              label={
+                result.stakedLiquidity
+                  ? "窗口流动性 (含未质押)"
+                  : "窗口流动性"
+              }
+            >
               <span className="font-mono font-medium">
                 {displayAmount0} {displaySym0} / {displayAmount1} {displaySym1}
               </span>

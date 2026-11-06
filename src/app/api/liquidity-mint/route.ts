@@ -15,7 +15,11 @@ import {
   computeLiquidityFromAmount,
 } from "@/lib/wallet/build-mint";
 import { sqrtPriceX96ToHumanPrice, tickToPriceDisplay } from "@/lib/v3/math";
-import { getPoolStaticMeta, readPoolState } from "@/lib/v3/liquidity";
+import {
+  getPoolStaticMeta,
+  readPoolState,
+  sumStakedWindowLiquidity,
+} from "@/lib/v3/liquidity";
 
 export const dynamic = "force-dynamic";
 
@@ -187,7 +191,7 @@ export async function POST(req: Request) {
       tickUpper = tickLower + spacing;
     }
 
-    // 5. 单侧金额反算（直接使用 Pool.liquidity()，0 额外 RPC！）
+    // 5. 单侧金额反算 + 质押仓位占比 & 全池窗口占比估算（优先命中 15s 质押窗口缓存与 NFT 静态缓存）
     let compute: {
       liquidity: string;
       amount0: string;
@@ -195,9 +199,12 @@ export async function POST(req: Request) {
       amount0Human: string;
       amount1Human: string;
       shareAfter?: number;
+      stakedShareAfter?: number;
+      shareInPool?: number;
       poolLiquidity?: string;
       stakedLiquidity?: string;
-      shareInPool?: number;
+      stakedPositionCount?: number;
+      hasStaking?: boolean;
     } | null = null;
 
     if (b.input_side && b.input_amount) {
@@ -215,10 +222,44 @@ export async function POST(req: Request) {
         );
 
         const mine = r.liquidity;
-        const shareAfter =
+        const hasStaking = Boolean(
+          npmAddr &&
+            stakerContract &&
+            /^0x[a-fA-F0-9]{40}$/.test(npmAddr) &&
+            /^0x[a-fA-F0-9]{40}$/.test(stakerContract)
+        );
+
+        let stakedLiquidityRaw = 0n;
+        let stakedPositionCount = 0;
+        if (hasStaking && npmAddr && stakerContract) {
+          try {
+            const stakedInfo = await sumStakedWindowLiquidity(
+              client,
+              npmAddr,
+              stakerContract,
+              pool,
+              tickLower,
+              tickUpper
+            );
+            stakedLiquidityRaw = stakedInfo.stakedLiquidityRaw;
+            stakedPositionCount = stakedInfo.matchedCount;
+          } catch (e) {
+            console.warn("[liquidity-mint] sumStakedWindowLiquidity failed:", (e as Error).message);
+          }
+        }
+
+        const shareInPool =
           mine > 0n && poolLiquidity + mine > 0n
             ? Number(mine) / Number(poolLiquidity + mine)
             : 0;
+
+        const stakedShareAfter =
+          hasStaking && mine > 0n && stakedLiquidityRaw + mine > 0n
+            ? Number(mine) / Number(stakedLiquidityRaw + mine)
+            : undefined;
+
+        const shareAfter =
+          stakedShareAfter !== undefined ? stakedShareAfter : shareInPool;
 
         compute = {
           liquidity: r.liquidity.toString(),
@@ -227,9 +268,12 @@ export async function POST(req: Request) {
           amount0Human: formatRaw(r.amount0, dec0),
           amount1Human: formatRaw(r.amount1, dec1),
           shareAfter,
+          stakedShareAfter,
+          shareInPool,
           poolLiquidity: poolLiquidity.toString(),
-          stakedLiquidity: "0",
-          shareInPool: shareAfter,
+          stakedLiquidity: stakedLiquidityRaw.toString(),
+          stakedPositionCount,
+          hasStaking,
         };
       }
     }

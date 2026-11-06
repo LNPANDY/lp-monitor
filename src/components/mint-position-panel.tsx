@@ -851,40 +851,45 @@ export function MintPositionPanel({
                 </>
               )}
 
-              {data.compute.shareAfter !== undefined &&
-                data.compute.shareAfter > 0 && (
-                  <div className="mt-1.5 border-t border-white/[0.08] pt-1.5">
+              {(data.compute.stakedShareAfter !== undefined ||
+                data.compute.shareInPool !== undefined ||
+                data.compute.shareAfter !== undefined) && (
+                <div className="mt-1.5 border-t border-white/[0.08] pt-1.5 space-y-1">
+                  {data.compute.stakedShareAfter !== undefined && (
                     <div>
-                      添加后占比：
+                      质押仓位占比：
                       <strong className="text-cyan-300 font-mono">
-                        {(data.compute.shareAfter * 100).toFixed(2)}%
+                        {(data.compute.stakedShareAfter * 100).toFixed(2)}%
                       </strong>
                       <span className="ml-1 text-ink-soft">
-                        （
-                        {data.compute.stakedLiquidity &&
-                        data.compute.stakedLiquidity !== "0"
-                          ? `质押池窗口 ${abbrevLiquidity(
-                              data.compute.stakedLiquidity
-                            )}`
-                          : `池子 ${abbrevLiquidity(
-                              data.compute.poolLiquidity
-                            )}`}
+                        （当前窗口质押{" "}
+                        {abbrevLiquidity(data.compute.stakedLiquidity)}
+                        {data.compute.stakedPositionCount !== undefined
+                          ? ` · ${data.compute.stakedPositionCount} 仓`
+                          : ""}
                         ，你的 {abbrevLiquidity(data.compute.liquidity)}）
                       </span>
                     </div>
-                    {data.compute.shareInPool !== undefined &&
-                      data.compute.shareInPool > 0 &&
-                      data.compute.stakedLiquidity !== "0" && (
-                        <div className="mt-0.5 text-ink-soft">
-                          占整个池子活跃流动性{" "}
-                          {abbrevLiquidity(data.compute.poolLiquidity)} 的{" "}
-                          <strong className="text-ok font-mono">
-                            {(data.compute.shareInPool * 100).toFixed(2)}%
-                          </strong>
-                        </div>
-                      )}
-                  </div>
-                )}
+                  )}
+                  {data.compute.shareInPool !== undefined && (
+                    <div>
+                      窗口流动性占比
+                      {data.compute.stakedShareAfter !== undefined
+                        ? "（含未质押）"
+                        : ""}
+                      ：
+                      <strong className="text-ok font-mono">
+                        {(data.compute.shareInPool * 100).toFixed(2)}%
+                      </strong>
+                      <span className="ml-1 text-ink-soft">
+                        （全池窗口{" "}
+                        {abbrevLiquidity(data.compute.poolLiquidity)}，你的{" "}
+                        {abbrevLiquidity(data.compute.liquidity)}）
+                      </span>
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
           )}
 

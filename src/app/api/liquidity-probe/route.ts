@@ -104,11 +104,21 @@ export async function POST(req: Request) {
     const chainMappings = cexMappingsByChain.get(b.chainId) ?? [];
     const hasWallet = !!(b.wallet && /^0x[a-fA-F0-9]{40}$/.test(b.wallet));
     const walletAddr = hasWallet ? (b.wallet as `0x${string}`) : undefined;
-    const npmAddr = (matchedDex?.npm || b.npm || "") as `0x${string}`;
-    const stakerAddr = matchedStaking[0]?.contract as `0x${string}` | undefined;
+    const npmAddr = ((b.npm || "").trim() || matchedDex?.npm || "") as `0x${string}`;
+    const stakerAddr = ((b.staker || "").trim() || matchedStaking[0]?.contract || "") as `0x${string}`;
 
     const [result, quoteByAddr, walletState] = await Promise.all([
-      probeMinRange(client, poolAddr, dec0, dec1, sym0, sym1),
+      probeMinRange(
+        client,
+        poolAddr,
+        dec0,
+        dec1,
+        sym0,
+        sym1,
+        npmAddr || undefined,
+        stakerAddr || undefined,
+        !!b.force
+      ),
       chainMappings.length > 0
         ? buildQuotesByAddr(chainMappings)
         : Promise.resolve(new Map()),
@@ -297,6 +307,10 @@ export async function POST(req: Request) {
       token0Decimals: dec0,
       token1Decimals: dec1,
       pairFlip,
+      stakedPlatform:
+        matchedStaking[0]?.pair_label ||
+        matchedStaking[0]?.platform ||
+        (stakerAddr ? "质押合约" : ""),
       cex: cexPayload,
       mintInit,
       cached: false,
