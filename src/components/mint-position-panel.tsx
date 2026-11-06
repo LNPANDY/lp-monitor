@@ -14,6 +14,7 @@ import {
   useWallet,
   verifyNftPoolMatch,
   extractMintedTokenIdFromReceipt,
+  waitForTxReceipt,
 } from "@/lib/wallet/use-wallet";
 import {
   buildApproveCalldata,
@@ -409,14 +410,14 @@ export function MintPositionPanel({
       );
 
     const sendWithRetry = async (
-      tx: { to: string; data: string },
+      tx: { to: string; data: string; gas?: bigint },
       label: string
     ): Promise<string> => {
       for (let attempt = 1; attempt <= 3; attempt++) {
         try {
           return await sendTx(tx);
         } catch (e: any) {
-          if (attempt === 3) throw e;
+          if (attempt === 3 || e?.message?.includes("拒绝")) throw e;
           const shouldRetry = confirm(
             `${label} 失败：${e?.message ?? e}\n\n是否重试（第 ${attempt + 1}/3 次）？`
           );
@@ -427,29 +428,36 @@ export function MintPositionPanel({
     };
 
     try {
-      await switchChain(data.chain.chain_id);
+      // 仅当当前链不一致时才调用 switchChain，省去一次钱包扩展 IPC 往返
+      if (walletChainId !== data.chain.chain_id) {
+        await switchChain(data.chain.chain_id);
+      }
 
-      const beforeIds = await listOwnedTokenIds(npm, address);
-
-      // Step 1: approve token0
+      // Step 1: approve token0（预设 gas 加速弹窗，并用快速回执轮询替代固定死等）
       if (!skip0) {
         setStep(0, { status: "loading" });
         const a0 = buildApproveCalldata(data.pool.token0, npm, MAX_UINT256);
-        const h0 = await sendWithRetry(a0, `授权 ${data.pool.token0Symbol}`);
+        const h0 = await sendWithRetry(
+          { ...a0, gas: 80000n },
+          `授权 ${data.pool.token0Symbol}`
+        );
+        await waitForTxReceipt(h0, 15000);
         setStep(0, { status: "done", hash: h0 });
-        await new Promise((r) => setTimeout(r, 1200));
       }
 
       // Step 2: approve token1
       if (!skip1) {
         setStep(1, { status: "loading" });
         const a1 = buildApproveCalldata(data.pool.token1, npm, MAX_UINT256);
-        const h1 = await sendWithRetry(a1, `授权 ${data.pool.token1Symbol}`);
+        const h1 = await sendWithRetry(
+          { ...a1, gas: 80000n },
+          `授权 ${data.pool.token1Symbol}`
+        );
+        await waitForTxReceipt(h1, 15000);
         setStep(1, { status: "done", hash: h1 });
-        await new Promise((r) => setTimeout(r, 1200));
       }
 
-      // Step 3: mint
+      // Step 3: mint（零前置 RPC 阻塞，点击后立即弹出钱包确认窗！）
       setStep(2, { status: "loading" });
       const mint = buildMintCalldata(npm, {
         token0: data.pool.token0,
@@ -463,9 +471,15 @@ export function MintPositionPanel({
         slippagePct: 0.5,
       });
       const hm = await sendWithRetry(mint, "创建仓位");
+
+      // 优先直接从 mint 交易回执日志解析新铸造的 tokenId（仅 1 次 receipt 读取）
+      const receiptTokenId = await extractMintedTokenIdFromReceipt(
+        hm,
+        address,
+        npm
+      );
       const tokenIdBig =
-        (await extractMintedTokenIdFromReceipt(hm, address, npm)) ??
-        (await diffNewTokenId(npm, address, beforeIds));
+        receiptTokenId ?? (await fetchLatestOwnedTokenId(npm, address));
       const tokenId = tokenIdBig ? tokenIdBig.toString() : null;
       setStep(2, { status: "done", hash: hm });
 
@@ -477,28 +491,37 @@ export function MintPositionPanel({
         } else {
           setStep(3, { status: "loading" });
           try {
-            // 安全护栏：质押前链上读取 positions(tokenId)，确认 token0/token1/fee 与当前池一致
-            const check = await verifyNftPoolMatch(
-              npm,
-              tokenIdBig,
-              data.pool.token0,
-              data.pool.token1,
-              data.pool.fee
-            );
-            if (!check.valid) {
-              throw new Error(
-                check.reason || `NFT #${tokenId} 与当前池币种不匹配，已拦截质押`
+            // 仅当 tokenId 来自兜底查询（而非刚才这笔 mint 交易自身的 Receipt）时，才需额外链上校验币种
+            if (!receiptTokenId) {
+              const check = await verifyNftPoolMatch(
+                npm,
+                tokenIdBig,
+                data.pool.token0,
+                data.pool.token1,
+                data.pool.fee
               );
+              if (!check.valid) {
+                throw new Error(
+                  check.reason || `NFT #${tokenId} 与当前池币种不匹配，已拦截质押`
+                );
+              }
             }
 
             // 如果尚未开启 setApprovalForAll，才需要单次 approve(staker, tokenId)
             if (!nftApprovedAll) {
               const approveNft = buildNftApproveCalldata(npm, staker, tokenIdBig);
-              await sendWithRetry(approveNft, "授权 NFT 给质押合约");
-              await new Promise((r) => setTimeout(r, 1500));
+              const ha = await sendWithRetry(
+                { ...approveNft, gas: 100000n },
+                "授权 NFT 给质押合约"
+              );
+              await waitForTxReceipt(ha, 15000);
             }
             const dep = buildStakeDepositCalldata(staker, tokenIdBig);
-            const hd = await sendWithRetry(dep, "质押");
+            // 预设 gas limit，避免钱包节点尚未同步最新区块时 estimateGas 卡顿
+            const hd = await sendWithRetry(
+              { ...dep, gas: 350000n },
+              "质押"
+            );
             setStep(3, { status: "done", hash: hd });
             setMsg(`✅ 创建并质押成功！tokenId=#${tokenId}`);
           } catch (e: any) {
@@ -522,14 +545,16 @@ export function MintPositionPanel({
     }
   }
 
-  /** 列举钱包当前在 NPM 上持有的全部 tokenId */
-  async function listOwnedTokenIds(
+  /**
+   * 极速兜底：仅当交易 Receipt 未能解析出 Transfer 日志时，
+   * 直接读取钱包在 NPM 上的最后一个索引 `tokenOfOwnerByIndex(owner, balanceOf - 1)`（仅 2 次 eth_call，无需遍历历史 NFT）。
+   */
+  async function fetchLatestOwnedTokenId(
     npm: string,
     owner: string
-  ): Promise<Set<string>> {
-    const out = new Set<string>();
+  ): Promise<bigint | null> {
     const p = (window as any).okxwallet || (window as any).ethereum;
-    if (!p) return out;
+    if (!p) return null;
     try {
       const ownerPad = owner.toLowerCase().replace(/^0x/, "").padStart(64, "0");
       const balHex = (await p.request({
@@ -537,38 +562,19 @@ export function MintPositionPanel({
         params: [{ to: npm, data: `0x70a08231${ownerPad}` }, "latest"],
       })) as string;
       const bal = Number(BigInt(balHex));
-      const limit = Math.min(bal, 50);
-      for (let i = 0; i < limit; i++) {
-        const idxHex = BigInt(i).toString(16).padStart(64, "0");
-        const idHex = (await p.request({
-          method: "eth_call",
-          params: [
-            { to: npm, data: `0x2f745c59${ownerPad}${idxHex}` },
-            "latest",
-          ],
-        })) as string;
-        out.add(BigInt(idHex).toString());
-      }
+      if (bal <= 0) return null;
+      const lastIdxHex = BigInt(bal - 1).toString(16).padStart(64, "0");
+      const idHex = (await p.request({
+        method: "eth_call",
+        params: [
+          { to: npm, data: `0x2f745c59${ownerPad}${lastIdxHex}` },
+          "latest",
+        ],
+      })) as string;
+      return BigInt(idHex);
     } catch {
-      /* ignore */
+      return null;
     }
-    return out;
-  }
-
-  /** 兜底：对比 mint 前后的 tokenId 集合找出新增项 */
-  async function diffNewTokenId(
-    npm: string,
-    owner: string,
-    before: Set<string>
-  ): Promise<bigint | null> {
-    for (let i = 0; i < 5; i++) {
-      const now = await listOwnedTokenIds(npm, owner);
-      for (const id of now) {
-        if (!before.has(id)) return BigInt(id);
-      }
-      await new Promise((r) => setTimeout(r, 2000));
-    }
-    return null;
   }
 
   // 根据 pairFlip 处理主币/计价币展示顺序
