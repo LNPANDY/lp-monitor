@@ -80,7 +80,45 @@ const POOL_SLOT0_ABI = [
   ] },
 ] as const;
 
+const ERC20_READ_ABI = [
+  { name: "balanceOf", type: "function", stateMutability: "view", inputs: [{ name: "owner", type: "address" }], outputs: [{ name: "", type: "uint256" }] },
+  { name: "allowance", type: "function", stateMutability: "view", inputs: [{ name: "owner", type: "address" }, { name: "spender", type: "address" }], outputs: [{ name: "", type: "uint256" }] },
+] as const;
+
 const ZERO_ADDR = "0x0000000000000000000000000000000000000000";
+
+interface PoolCandidate {
+  fee: number;
+  pool: string;
+  liquidity: bigint;
+}
+
+/** 永久缓存 factory + 双币 + fee 对应的 Pool 地址（包括 ZERO_ADDR，因为通常不会临时新建档位） */
+function getSwapPoolAddrCache(): Map<string, { ts: number; pool: string }> {
+  const g = globalThis as any;
+  if (!g.__lpMonitorSwapPoolAddrCache__) {
+    g.__lpMonitorSwapPoolAddrCache__ = new Map();
+  }
+  return g.__lpMonitorSwapPoolAddrCache__;
+}
+
+/** 短期缓存（30s）某交易对 4 个费率档的可用池及流动性排序，避免连续输入金额时每次重查 4 档池子 */
+function getPairPoolsCache(): Map<string, { ts: number; sorted: PoolCandidate[] }> {
+  const g = globalThis as any;
+  if (!g.__lpMonitorPairPoolsCache__) {
+    g.__lpMonitorPairPoolsCache__ = new Map();
+  }
+  return g.__lpMonitorPairPoolsCache__;
+}
+
+/** 永久缓存 Quoter 合约支持的 ABI 版本（v2 或 v1），避免 V1 Quoter 每次先调 V2 revert 浪费 1 个 RTT */
+function getQuoterVersionCache(): Map<string, "v2" | "v1"> {
+  const g = globalThis as any;
+  if (!g.__lpMonitorQuoterVersionCache__) {
+    g.__lpMonitorQuoterVersionCache__ = new Map();
+  }
+  return g.__lpMonitorQuoterVersionCache__;
+}
 
 export async function POST(req: Request) {
   const b = await getBody<{
@@ -92,14 +130,14 @@ export async function POST(req: Request) {
     target_out?: string;
     slippage_pct?: number;
     fee?: number;
-    /** 钱包地址：传了就返回两个 token 的余额（兑换面板显示用） */
+    pool?: string;
+    /** 钱包地址：传了就返回两个 token 的余额与授权状态（兑换面板显示与免预检用） */
     wallet?: string;
   }>(req);
 
   if (!b.chain_id || !b.token_in_addr || !b.token_out_addr) {
     return fail("chain_id/token_in_addr/token_out_addr 必填");
   }
-  // 金额二选一：正向填 amount_in，反向填 target_out（想要得到的 tokenOut 数量）
   if (!b.amount_in && !b.target_out) {
     return fail("amount_in 与 target_out 须填其一");
   }
@@ -119,8 +157,7 @@ export async function POST(req: Request) {
           "SELECT token_symbol FROM token_symbols WHERE chain_id_ref=? AND token_addr='__native__' AND enabled=1"
         ).all(b.chain_id) as { token_symbol: string }[];
         const nativeSym = natives[0]?.token_symbol ?? chain.symbol;
-        const base = nativeSym.toLowerCase(); // 如 '0g'
-        // wrapped 匹配：symbol 去 W 前缀后等于原生名（W0G→0G），或包含原生名
+        const base = nativeSym.toLowerCase();
         const candidates = db.prepare(
           "SELECT token_addr, token_symbol FROM token_symbols WHERE chain_id_ref=? AND enabled=1 AND token_addr!='__native__'"
         ).all(b.chain_id) as { token_addr: string; token_symbol: string }[];
@@ -149,84 +186,131 @@ export async function POST(req: Request) {
       return fail("该链没有配置 Quoter 地址的 DEX（请在配置页 DEX 设置里填写 QuoterV2 地址）", 400);
     }
 
-    // 3. 自动找池子：4 档并发 getPool，非零池并发 liquidity，选流动性最大
+    // 3. 自动找池子（带 30s 费率档列表缓存 + 永久 Pool 地址缓存）与 token 元数据并行读取
     const factory = dexRow.factory as `0x${string}`;
-    const poolCandidates: (PoolCandidate | null)[] = await Promise.all(
-      FEE_TIERS.map(async (feeTier) => {
-        try {
-          const pool = await getPoolAddress(client, factory, inMeta.addr as `0x${string}`, outMeta.addr as `0x${string}`, feeTier);
-          if (!pool || pool === ZERO_ADDR) return null;
-          let liquidity = 0n;
+    const [tA, tB] =
+      inMeta.addr.toLowerCase() < outMeta.addr.toLowerCase()
+        ? [inMeta.addr.toLowerCase(), outMeta.addr.toLowerCase()]
+        : [outMeta.addr.toLowerCase(), inMeta.addr.toLowerCase()];
+    const pairKey = `${b.chain_id}:${factory.toLowerCase()}:${tA}:${tB}`;
+    const pairPoolsCache = getPairPoolsCache();
+    const poolAddrCache = getSwapPoolAddrCache();
+    const now = Date.now();
+
+    const discoverPools = async (): Promise<PoolCandidate[]> => {
+      const cachedPair = pairPoolsCache.get(pairKey);
+      if (cachedPair && now - cachedPair.ts < 30_000) {
+        return cachedPair.sorted;
+      }
+      const candidates: (PoolCandidate | null)[] = await Promise.all(
+        FEE_TIERS.map(async (feeTier) => {
           try {
-            liquidity = await client.readContract({ address: pool, abi: POOL_LIQUIDITY_ABI, functionName: "liquidity" }) as bigint;
-          } catch { /* ignore */ }
-          return { fee: feeTier, pool, liquidity };
-        } catch {
-          return null;
-        }
-      })
-    );
-    interface PoolCandidate { fee: number; pool: string; liquidity: bigint }
-    const validPools = poolCandidates.filter((p): p is PoolCandidate => p !== null);
-    if (validPools.length === 0) {
+            const addrKey = `${pairKey}:${feeTier}`;
+            const cachedAddr = poolAddrCache.get(addrKey);
+            let pool: string | null = null;
+            if (cachedAddr && (cachedAddr.pool !== ZERO_ADDR || now - cachedAddr.ts < 300_000)) {
+              pool = cachedAddr.pool;
+            } else {
+              pool = await getPoolAddress(
+                client,
+                factory,
+                inMeta.addr as `0x${string}`,
+                outMeta.addr as `0x${string}`,
+                feeTier
+              );
+              if (pool) {
+                poolAddrCache.set(addrKey, { ts: now, pool });
+              }
+            }
+            if (!pool || pool === ZERO_ADDR) return null;
+            let liquidity = 0n;
+            try {
+              liquidity = (await client.readContract({
+                address: pool as `0x${string}`,
+                abi: POOL_LIQUIDITY_ABI,
+                functionName: "liquidity",
+              })) as bigint;
+            } catch {
+              /* ignore */
+            }
+            return { fee: feeTier, pool, liquidity };
+          } catch {
+            return null;
+          }
+        })
+      );
+      const valid = candidates.filter((p): p is PoolCandidate => p !== null);
+      const sortedList = valid.slice().sort((x, y) => (y.liquidity > x.liquidity ? 1 : y.liquidity < x.liquidity ? -1 : 0));
+      if (sortedList.length > 0) {
+        pairPoolsCache.set(pairKey, { ts: Date.now(), sorted: sortedList });
+      }
+      return sortedList;
+    };
+
+    const [sorted, tokenMap] = await Promise.all([
+      discoverPools(),
+      resolveTokens(client, b.chain_id, [inMeta.addr, outMeta.addr]),
+    ]);
+
+    if (sorted.length === 0) {
       return fail("未找到这两个代币的池子（4 个标准费率档都没有部署）", 404);
     }
-    const sorted = validPools.slice().sort((x, y) => Number(y.liquidity - x.liquidity));
-    const selected: { fee: number; pool: string; liquidity: bigint } = (b.fee ? sorted.find((p) => p.fee === b.fee) : undefined) ?? sorted[0];
+    const selected: PoolCandidate =
+      (b.fee ? sorted.find((p) => p.fee === b.fee) : undefined) ?? sorted[0];
     const pool = selected.pool;
     const fee = selected.fee;
 
-    // 4. token 元数据与金额
-    const tokenMap = await resolveTokens(client, b.chain_id, [inMeta.addr, outMeta.addr]);
+    // 4. token 元数据与金额（V3 池的 token0 恒为地址按字典序较小者，无需额外 RPC 读 pool.token0()！）
     const mIn = tokenMap.get(inMeta.addr.toLowerCase());
     const mOut = tokenMap.get(outMeta.addr.toLowerCase());
     const decIn = mIn?.decimals ?? 18;
     const decOut = mOut?.decimals ?? 18;
     const symIn = inMeta.isNative ? chain.symbol : (mIn?.symbol ?? "tokenIn");
     const symOut = outMeta.isNative ? chain.symbol : (mOut?.symbol ?? "tokenOut");
+    const poolToken0 = tA;
+    const dec0 = poolToken0 === inMeta.addr.toLowerCase() ? decIn : decOut;
+    const dec1 = poolToken0 === inMeta.addr.toLowerCase() ? decOut : decIn;
 
-    // 金额确定：
-    //   正向（amount_in）直接用；反向（target_out）用 spot 价估初始值，
-    //   报价后按实际 amountOut/目标 比例迭代修正一次（Quoter 是线性的近似，两次足够精确）
     let targetOutRaw = 0n;
     let amountIn = 0n;
+    let preFetchedSlot0: readonly [bigint, number, number, number] | null = null;
     if (b.target_out) {
       targetOutRaw = parseHumanAmount(b.target_out, decOut);
       if (targetOutRaw <= 0n) return fail("target_out 须为正数");
-      const slot00 = await client.readContract({ address: pool as `0x${string}`, abi: POOL_SLOT0_ABI, functionName: "slot0" }) as readonly [bigint, number, number, number];
-      const spot = Number(slot00[0]) ** 2 / Number(1n << 96n) ** 2 * Math.pow(10, decIn - decOut);
-      if (spot <= 0) return fail("读取池子价格失败");
-      // 初始估计：targetOut / spot
-      amountIn = parseHumanAmount((Number(targetOutRaw) / Number(10n ** BigInt(decOut)) / spot).toPrecision(15), decIn);
+      preFetchedSlot0 = (await client.readContract({
+        address: pool as `0x${string}`,
+        abi: POOL_SLOT0_ABI,
+        functionName: "slot0",
+      })) as readonly [bigint, number, number, number];
+      const poolSortedSpot =
+        (Number(preFetchedSlot0[0]) ** 2 / Number(1n << 96n) ** 2) *
+        Math.pow(10, dec0 - dec1);
+      const inIsToken0 = inMeta.addr.toLowerCase() === poolToken0;
+      const spot = inIsToken0 ? poolSortedSpot : 1 / poolSortedSpot;
+      if (spot <= 0 || !Number.isFinite(spot)) return fail("读取池子价格失败");
+      amountIn = parseHumanAmount(
+        (Number(targetOutRaw) / Number(10n ** BigInt(decOut)) / spot).toPrecision(15),
+        decIn
+      );
     } else {
       amountIn = parseHumanAmount(b.amount_in ?? "0", decIn);
     }
     if (amountIn <= 0n) return fail("金额须为正数");
 
-    // 5. QuoterV2 报价（revert 回退 V1）
+    // 5. 单次并行 RTT：Quoter 报价 + Pool slot0 +（可选）钱包余额与 Router 授权额度
     const quoter = dexRow.quoter as `0x${string}`;
-    let amountOut = 0n;
-    let sqrtPriceAfter = 0n;
-    let gasEstimate = 0n;
-    try {
-      const result = await client.readContract({
-        address: quoter,
-        abi: QUOTER_V2_ABI,
-        functionName: "quoteExactInputSingle",
-        args: [{
-          tokenIn: inMeta.addr as `0x${string}`,
-          tokenOut: outMeta.addr as `0x${string}`,
-          amountIn,
-          fee,
-          sqrtPriceLimitX96: 0n,
-        }],
-      }) as readonly [bigint, bigint, number, bigint];
-      amountOut = result[0];
-      sqrtPriceAfter = result[1];
-      gasEstimate = result[3];
-    } catch (v2Err: any) {
-      try {
-        const r1 = await client.readContract({
+    const quoterKey = `${b.chain_id}:${quoter.toLowerCase()}`;
+    const quoterVerCache = getQuoterVersionCache();
+    const knownVer = quoterVerCache.get(quoterKey);
+    const routerAddr = dexRow.router02 || dexRow.swaprouter || "";
+    const hasWallet = !!(b.wallet && /^0x[a-fA-F0-9]{40}$/.test(b.wallet));
+    const walletAddr = hasWallet ? (b.wallet as `0x${string}`) : undefined;
+    const inIsNativeToken = b.token_in_addr?.toLowerCase() === "__native__";
+    const outIsNativeToken = b.token_out_addr?.toLowerCase() === "__native__";
+
+    const runQuoter = async (): Promise<{ amountOut: bigint; gasEstimate: bigint }> => {
+      if (knownVer === "v1") {
+        const r1 = (await client.readContract({
           address: quoter,
           abi: QUOTER_V1_ABI,
           functionName: "quoteExactInputSingle",
@@ -237,74 +321,122 @@ export async function POST(req: Request) {
             fee,
             0n,
           ],
-        }) as bigint;
-        amountOut = r1;
-      } catch (v1Err: any) {
-        return fail(`报价失败：QuoterV2 与 V1 签名均不匹配——${String(v1Err?.message ?? v1Err).slice(0, 120)}`, 502);
+        })) as bigint;
+        return { amountOut: r1, gasEstimate: 0n };
       }
-    }
+      try {
+        const result = (await client.readContract({
+          address: quoter,
+          abi: QUOTER_V2_ABI,
+          functionName: "quoteExactInputSingle",
+          args: [
+            {
+              tokenIn: inMeta.addr as `0x${string}`,
+              tokenOut: outMeta.addr as `0x${string}`,
+              amountIn,
+              fee,
+              sqrtPriceLimitX96: 0n,
+            },
+          ],
+        })) as readonly [bigint, bigint, number, bigint];
+        quoterVerCache.set(quoterKey, "v2");
+        return { amountOut: result[0], gasEstimate: result[3] };
+      } catch {
+        try {
+          const r1 = (await client.readContract({
+            address: quoter,
+            abi: QUOTER_V1_ABI,
+            functionName: "quoteExactInputSingle",
+            args: [
+              inMeta.addr as `0x${string}`,
+              outMeta.addr as `0x${string}`,
+              amountIn,
+              fee,
+              0n,
+            ],
+          })) as bigint;
+          quoterVerCache.set(quoterKey, "v1");
+          return { amountOut: r1, gasEstimate: 0n };
+        } catch (v1Err: any) {
+          throw new Error(
+            `报价失败：QuoterV2 与 V1 签名均不匹配——${String(v1Err?.message ?? v1Err).slice(0, 120)}`
+          );
+        }
+      }
+    };
+
+    const readBal = async (tokenAddr: string, isNative: boolean): Promise<bigint> => {
+      if (!walletAddr) return 0n;
+      try {
+        if (isNative) return await client.getBalance({ address: walletAddr });
+        return (await client.readContract({
+          address: tokenAddr as `0x${string}`,
+          abi: ERC20_READ_ABI,
+          functionName: "balanceOf",
+          args: [walletAddr],
+        })) as bigint;
+      } catch {
+        return 0n;
+      }
+    };
+
+    const [quoteRes, slot0Res, walletState] = await Promise.all([
+      runQuoter(),
+      preFetchedSlot0
+        ? Promise.resolve(preFetchedSlot0)
+        : (client
+            .readContract({
+              address: pool as `0x${string}`,
+              abi: POOL_SLOT0_ABI,
+              functionName: "slot0",
+            })
+            .catch(() => null) as Promise<readonly [bigint, number, number, number] | null>),
+      walletAddr
+        ? Promise.all([
+            readBal(inMeta.addr, inIsNativeToken),
+            readBal(outMeta.addr, outIsNativeToken),
+            !inIsNativeToken && routerAddr
+              ? (client
+                  .readContract({
+                    address: inMeta.addr as `0x${string}`,
+                    abi: ERC20_READ_ABI,
+                    functionName: "allowance",
+                    args: [walletAddr, routerAddr as `0x${string}`],
+                  })
+                  .catch(() => 0n) as Promise<bigint>)
+              : Promise.resolve(1n << 255n),
+          ])
+        : Promise.resolve(null),
+    ]);
+
+    const { amountOut, gasEstimate } = quoteRes;
     if (amountOut <= 0n) {
       return fail("报价结果为 0：池子流动性可能不足以完成这笔兑换", 422);
     }
 
-    // 反向模式：spot 价粗算的 amountIn 一次报价即可，不做迭代修正。
-    // 精度由两道防线兜底：① 交易 amountOutMinimum 链上强制（达不到 revert）
-    // ② 钱包签名时用户复核实际输入/输出，不合适直接拒绝。
-
     // 6. 价格影响：spot 价 vs 成交价
-    // 读池子实际排序（token0/token1 是地址序，与用户的 in/out 方向无关）
-    let poolToken0 = "";
-    let dec0 = decIn;
-    let dec1 = decOut;
-    try {
-      poolToken0 = await client.readContract({
-        address: pool as `0x${string}`,
-        abi: [{ name: "token0", type: "function", stateMutability: "view", inputs: [], outputs: [{ name: "", type: "address" }] }] as const,
-        functionName: "token0",
-      }) as string;
-      poolToken0 = poolToken0.toLowerCase();
-      // 池子另一侧的 decimals
-      const poolToken1 = poolToken0 === inMeta.addr.toLowerCase() ? outMeta.addr : inMeta.addr;
-      const m0 = tokenMap.get(poolToken0);
-      const m1 = tokenMap.get(poolToken1.toLowerCase());
-      dec0 = m0?.decimals ?? 18;
-      dec1 = m1?.decimals ?? 18;
-    } catch { /* 读取失败用 decIn/decOut 兜底（方向可能不准） */ }
-
     let priceImpactPct: number | null = null;
-    // 成交价（human 口径）：1 tokenIn = ? tokenOut（整币）
-    // 注意不能用 amountOut/amountIn（raw 比），LINK(18)/USDC(6) 会差 10^12 倍
-    const executionPrice = Number(formatRaw(amountOut, decOut)) / Number(formatRaw(amountIn, decIn));
-    try {
-      const slot0 = await client.readContract({ address: pool as `0x${string}`, abi: POOL_SLOT0_ABI, functionName: "slot0" }) as readonly [bigint, number, number, number];
-      const sqrtP = slot0[0];
-      // 池子排序价：1 token0 = ? token1（整币）
-      // rawPriceX = sqrtP²/2^192 是 token0 raw / token1 raw，乘 10^(dec0-dec1) 换整币
-      const poolSortedPrice = Number(sqrtP) ** 2 / Number(1n << 96n) ** 2 * Math.pow(10, dec0 - dec1);
-      // 用户方向：
-      //   tokenIn=token0, tokenOut=token1 → spot = poolSortedPrice
-      //   tokenIn=token1, tokenOut=token0 → spot = 1 / poolSortedPrice
-      const inIsToken0 = poolToken0 ? inMeta.addr.toLowerCase() === poolToken0 : true;
+    const executionPrice =
+      Number(formatRaw(amountOut, decOut)) / Number(formatRaw(amountIn, decIn));
+    if (slot0Res) {
+      const sqrtP = slot0Res[0];
+      const poolSortedPrice =
+        (Number(sqrtP) ** 2 / Number(1n << 96n) ** 2) * Math.pow(10, dec0 - dec1);
+      const inIsToken0 = inMeta.addr.toLowerCase() === poolToken0;
       const spotPrice = inIsToken0 ? poolSortedPrice : 1 / poolSortedPrice;
       if (spotPrice > 0 && Number.isFinite(spotPrice)) {
-        priceImpactPct = Math.abs(spotPrice - executionPrice) / spotPrice * 100;
+        priceImpactPct = (Math.abs(spotPrice - executionPrice) / spotPrice) * 100;
       }
-    } catch { /* ignore */ }
+    }
 
-    // 6.5 稳定币 CEX 对比：
-    //   tokenIn/tokenOut 任一是标记为 is_stable 的代币时，
-    //   用另一方的 CEX 报价（is_stable 或任意有 CEX 映射的）换算出
-    //   「CEX 口径的 tokenIn→tokenOut 价格」，与 executionPrice 求偏差。
-    //   典型场景：LINK→USDC.e，USDC.e 是稳定币（固定价 1 USDC），
-    //   LINK 有 CEX 映射（LINKUSDC），可算出 CEX 认为的 LINK→USDC.e 价格。
+    // 6.5 稳定币 CEX 对比
     let cexCompare: {
       stableSymbol: string;
       otherSymbol: string;
-      cexPrice: number;   // CEX 口径：1 other = ? stable
-      executionPriceInStable: number; // DEX 成交价换算到同一口径
-      diffPct: number;    // (exec - cex) / cex × 100
+      cexPrice: number;
+      executionPriceInStable: number;
+      diffPct: number;
       cexSymbolLabel: string;
-      /** 统一展示口径：1 otherSymbol = ? stableSymbol（供成交价行用，不管交易方向） */
       displayPrice: number;
     } | null = null;
     try {
@@ -313,19 +445,16 @@ export async function POST(req: Request) {
          FROM token_symbols ts WHERE ts.chain_id_ref=? AND ts.enabled=1 AND ts.is_stable=1`
       ).all(b.chain_id) as { token_addr: string; token_symbol: string; cex_symbol: string; fixed_price: number | null; quote: string; inverted: number }[];
       if (stableMappings.length > 0) {
-        // 找出 in/out 中哪一侧是稳定币
         const inIsStable = stableMappings.find((m) => m.token_addr.toLowerCase() === inMeta.addr.toLowerCase());
         const outIsStable = stableMappings.find((m) => m.token_addr.toLowerCase() === outMeta.addr.toLowerCase());
         const stableSide = inIsStable ? "in" : outIsStable ? "out" : null;
         if (stableSide) {
           const stableMap = (inIsStable ?? outIsStable)!;
           const otherAddr = stableSide === "in" ? outMeta.addr : inMeta.addr;
-          // 另一侧的 CEX 报价（任意映射，不限 is_stable）
           const otherMap = db.prepare(
             "SELECT token_addr, cex_symbol, fixed_price, quote, inverted FROM token_symbols WHERE chain_id_ref=? AND enabled=1 AND LOWER(token_addr)=LOWER(?)"
           ).get(b.chain_id, otherAddr) as { cex_symbol: string; fixed_price: number | null; quote: string; inverted: number } | undefined;
           if (otherMap) {
-            // 用 buildQuotesByAddr 拿另一侧报价（含固定价/inverted 处理）
             const mappingsForQuote = [{
               chainIdRef: b.chain_id,
               tokenAddr: otherAddr.toLowerCase(),
@@ -337,23 +466,11 @@ export async function POST(req: Request) {
             const quotes = await buildQuotesByAddr(mappingsForQuote);
             const otherQuote = quotes.get(otherAddr.toLowerCase());
             if (otherQuote && otherQuote.price > 0) {
-              // CEX 口径：1 other = otherQuote.price stable
-              // 执行价换算：executionPrice 是 1 tokenIn = ? tokenOut（整币）
-              //   若 stable 是 out：execInStable = executionPrice（1 in = X stable）；
-              //     cexPrice = otherQuote.price（1 other = X stable）→ 同口径
-              //   若 stable 是 in：execInStable = 1 / executionPrice（1 out = ? in）；
-              //     cexPrice = 1 / otherQuote.price（1 stable = ? other → 取倒数同口径）
               const stableSymbol = stableMap.token_symbol || "stable";
               const otherSymbol = stableSide === "in" ? symOut : symIn;
-              // 统一口径："1 otherSymbol = ? stableSymbol"（与交易方向无关）
-              //   stable 在 out 侧：exec 就是该口径
-              //   stable 在 in 侧：exec 是 1 stable = ? other，取倒数
-              const displayPrice = stableSide === "out"
-                ? executionPrice
-                : 1 / executionPrice;
-              // CEX 同口径价：otherQuote.price 本身就是 1 other = ? stable
+              const displayPrice = stableSide === "out" ? executionPrice : 1 / executionPrice;
               const cexPrice = otherQuote.price;
-              const diffPct = (displayPrice - cexPrice) / cexPrice * 100;
+              const diffPct = ((displayPrice - cexPrice) / cexPrice) * 100;
               cexCompare = {
                 stableSymbol,
                 otherSymbol,
@@ -367,7 +484,6 @@ export async function POST(req: Request) {
           }
         }
       }
-      // 兜底：若两侧均非 is_stable，但两侧均在 token_symbols 配置了 CEX 映射，按 1 tokenIn = ? tokenOut 口径对比
       if (!cexCompare && executionPrice > 0) {
         const pairRows = db.prepare(
           `SELECT token_addr, cex_symbol, fixed_price, quote, inverted
@@ -408,44 +524,23 @@ export async function POST(req: Request) {
           }
         }
       }
-    } catch { /* CEX 对比失败不影响主报价 */ }
+    } catch {
+      /* CEX 对比失败不影响主报价 */
+    }
 
     // 7. 滑点后最小获得
     const slippagePct = Number(b.slippage_pct ?? 0.1);
     const slip = BigInt(Math.max(0, Math.min(95, Math.round((slippagePct || 0.1) * 100))));
     const amountOutMin = (amountOut * (10000n - slip)) / 10000n;
 
-    // router：优先 router02（struct 签名），回退 swaprouter
-    const routerAddr = dexRow.router02 || dexRow.swaprouter || "";
-
-    // 余额查询（wallet 传入时）：native 用 getBalance，ERC20 用 balanceOf
-    let balances: { in: string; out: string } | null = null;
-    if (b.wallet && /^0x[a-fA-F0-9]{40}$/.test(b.wallet)) {
-      try {
-        const readBal = async (tokenAddr: string, isNative: boolean): Promise<bigint> => {
-          try {
-            if (isNative) {
-              return await client.getBalance({ address: b.wallet as `0x${string}` });
-            }
-            return await client.readContract({
-              address: tokenAddr as `0x${string}`,
-              abi: [{ name: "balanceOf", type: "function", stateMutability: "view", inputs: [{ name: "owner", type: "address" }], outputs: [{ name: "", type: "uint256" }] }] as const,
-              functionName: "balanceOf",
-              args: [b.wallet as `0x${string}`],
-            }) as bigint;
-          } catch { return 0n; }
-        };
-        // 注意：__native__ 显示原生余额，wrapped 侧读合约余额（用户实际持有的可能两者都有，
-        // 这里按面板口径：选了原生币显示原生余额，选了 wrapped 显示 wrapped 余额）
-        const inIsNativeToken = b.token_in_addr?.toLowerCase() === "__native__";
-        const outIsNativeToken = b.token_out_addr?.toLowerCase() === "__native__";
-        const [bin, bout] = await Promise.all([
-          readBal(inMeta.addr, inIsNativeToken),
-          readBal(outMeta.addr, outIsNativeToken),
-        ]);
-        balances = { in: bin.toString(), out: bout.toString() };
-      } catch { balances = null; }
-    }
+    const balances = walletState
+      ? { in: walletState[0].toString(), out: walletState[1].toString() }
+      : null;
+    const allowanceSufficient = inIsNativeToken
+      ? true
+      : walletState
+        ? walletState[2] >= amountIn
+        : false;
 
     return ok({
       chain: { id: chain.id, name: chain.name, chain_id: chain.chain_id },
@@ -469,6 +564,7 @@ export async function POST(req: Request) {
         ? { addr: routerAddr, kind: dexRow.router02 ? "router02" : "swaprouter" }
         : null,
       balances,
+      allowanceSufficient,
       cexCompare,
     });
   } catch (e: any) {

@@ -160,6 +160,7 @@ function migrate(db: DB) {
       sent_at       TEXT    NOT NULL DEFAULT (datetime('now'))
     );
     CREATE INDEX IF NOT EXISTS idx_alerts_sent ON alerts(sent_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_alerts_pos_sent ON alerts(position_id, sent_at DESC);
 
     -- token 元数据缓存：地址→符号/名称，扫描时按链读取并缓存，避免重复 RPC
     CREATE TABLE IF NOT EXISTS tokens (

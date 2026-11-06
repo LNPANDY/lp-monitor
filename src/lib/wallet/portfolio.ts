@@ -77,12 +77,10 @@ export async function computePortfolio(chainDbId: number, address: string): Prom
   const addr = address.toLowerCase() as `0x${string}`;
   const warnings: string[] = [];
 
-  // ===== 1. 加载该链 CEX 报价（含 __native__ 的 GAS 报价） =====
-  // 资产统计需要实时价格，跳过 binance.ts 的 30s 进程内缓存，强制拉最新价，
-  // 否则短时间内多次打开资产面板会看到过期价（典型场景：刚切换链/钱包后立即查看）。
+  // ===== 1. 加载该链 CEX 报价（含 __native__ 的 GAS 报价，复用 30s 缓存避免每次重复外网请求） =====
   const allMappings = loadAllMappings();
   const chainMappings = allMappings.get(chainDbId) ?? [];
-  const quoteByAddr = await buildQuotesByAddr(chainMappings, true);
+  const quoteByAddr = await buildQuotesByAddr(chainMappings);
 
   // ===== 2. 原生 GAS 余额 =====
   const items: AssetItem[] = [];
@@ -184,15 +182,26 @@ export async function computePortfolio(chainDbId: number, address: string): Prom
        AND last_liquidity != '' AND CAST(last_liquidity AS INTEGER) > 0`
     ).all(walletRow.id, chainDbId) as any[];
 
-    // 解析 token decimals（批量）
+    // 解析 token decimals（批量）与去重池子并发读取 slot0
     const allTokenAddrs = new Set<string>();
+    const uniquePools = new Set<string>();
     for (const p of positions) {
       allTokenAddrs.add(p.token0.toLowerCase());
       allTokenAddrs.add(p.token1.toLowerCase());
+      if (p.pool) uniquePools.add((p.pool as string).toLowerCase());
     }
-    const tokenMeta = allTokenAddrs.size > 0
-      ? await resolveTokens(client, chainDbId, [...allTokenAddrs])
-      : new Map<string, { symbol: string; decimals: number }>();
+    const [tokenMeta, poolPriceEntries] = await Promise.all([
+      allTokenAddrs.size > 0
+        ? resolveTokens(client, chainDbId, [...allTokenAddrs])
+        : Promise.resolve(new Map<string, { symbol: string; decimals: number }>()),
+      Promise.all(
+        [...uniquePools].map(async (poolAddr) => {
+          const sp = await readSqrtPrice(client, poolAddr as `0x${string}`);
+          return [poolAddr, sp] as const;
+        })
+      ),
+    ]);
+    const poolSqrtMap = new Map<string, bigint | null>(poolPriceEntries);
 
     for (const p of positions) {
       try {
@@ -201,7 +210,7 @@ export async function computePortfolio(chainDbId: number, address: string): Prom
         const pool = p.pool as `0x${string}`;
         if (!pool) continue;
 
-        const sqrtPrice = await readSqrtPrice(client, pool);
+        const sqrtPrice = poolSqrtMap.get(pool.toLowerCase()) ?? null;
         if (sqrtPrice === null) {
           warnings.push(`仓位 #${p.token_id} 读取池子 ${pool} 价格失败，跳过`);
           continue;

@@ -37,6 +37,7 @@ interface Position {
   id: number;
   dex_name: string;
   dex_display_name?: string;
+  dex_npm?: string;
   dex_id?: number;
   token_id: string;
   token0: string;
@@ -50,6 +51,7 @@ interface Position {
   last_current_tick: number;
   last_in_range: number;
   last_price0: string;
+  last_liquidity?: string;
   last_checked_at: string;
   notify_state: string;
   source: string;
@@ -58,6 +60,8 @@ interface Position {
   chain_name: string;
   chain_key: string;
   chain_id: number;
+  chain_rpc_urls?: string;
+  chain_symbol?: string;
   explorer_url: string;
   wallet_label: string;
   wallet_address: string;
@@ -77,16 +81,20 @@ interface MonitorState {
 }
 
 export default function DashboardPage() {
-  const { data: positions, mutate: reloadPos } = useSWR<Position[]>(
+  const { data: positions, mutate: reloadActivePos } = useSWR<Position[]>(
     "/api/positions",
     fetcher,
     { refreshInterval: 60_000 }
   );
-  const { data: closedPositions } = useSWR<Position[]>(
-    "/api/positions?all=1",
+  const { data: closedPositions, mutate: reloadClosedPos } = useSWR<Position[]>(
+    "/api/positions?state=closed",
     fetcher,
-    { refreshInterval: 60_000 }
+    { refreshInterval: 120_000, revalidateOnFocus: false }
   );
+  function reloadPos() {
+    reloadActivePos();
+    reloadClosedPos();
+  }
   const { data: mon, mutate: reloadMon } = useSWR<MonitorState>(
     "/api/monitor",
     fetcher,
@@ -95,9 +103,7 @@ export default function DashboardPage() {
 
   const list = positions ?? [];
   const outOfRange = list.filter((p) => p.last_in_range === 0);
-  const closed = (closedPositions ?? []).filter(
-    (p) => p.notify_state === "closed"
-  );
+  const closed = closedPositions ?? [];
   const [showClosed, setShowClosed] = useState(false);
   const [showScanSettings, setShowScanSettings] = useState(false);
   const [showPortfolio, setShowPortfolio] = useState(false);
@@ -305,7 +311,7 @@ export default function DashboardPage() {
 
       {/* 底部版本号 */}
       <div className="text-center text-xs text-ink-muted">
-        LP Monitor v{process.env.NEXT_PUBLIC_VERSION || "0.19.4"}
+        LP Monitor v{process.env.NEXT_PUBLIC_VERSION || "0.19.7"}
       </div>
     </div>
   );

@@ -59,6 +59,7 @@ interface QuoteResult {
   gasEstimate: string;
   router: { addr: string; kind: "router02" | "swaprouter" } | null;
   balances?: { in: string; out: string } | null;
+  allowanceSufficient?: boolean;
   executionPrice?: number;
   cexCompare?: {
     stableSymbol: string;
@@ -85,7 +86,7 @@ export function SwapQuoteSection({
   const { data: chains } = useSWR<any[]>("/api/chains", fetcher);
   const { data: allDexes } = useSWR<DexWithQuoter[]>("/api/dexes", fetcher);
   const { data: allMappings } = useSWR<CexToken[]>("/api/cex-mapping", fetcher);
-  const { address, sendTx, switchChain, connect } = useWallet();
+  const { address, chainId: walletChainId, sendTx, switchChain, connect } = useWallet();
 
   // 可用 DEX：配了 quoter 的（显示 链-DEX）
   const dexOptions = useMemo(
@@ -311,16 +312,16 @@ export function SwapQuoteSection({
     [dex, tokenInMeta, tokenOutMeta, slippage, feeOverride, address]
   );
 
-  // 防抖自动报价
+  // 防抖自动报价（350ms 极速响应）
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const autoFillTsRef = useRef(0);
   useEffect(() => {
     if (debounceRef.current) clearTimeout(debounceRef.current);
     debounceRef.current = setTimeout(() => {
-      if (Date.now() - autoFillTsRef.current < 1000) return;
+      if (Date.now() - autoFillTsRef.current < 800) return;
       const amount = editingSide === "in" ? amountIn : amountOut;
       if (amount && Number(amount) > 0) doQuote(amount, editingSide);
-    }, 600);
+    }, 350);
     return () => {
       if (debounceRef.current) clearTimeout(debounceRef.current);
     };
@@ -336,7 +337,7 @@ export function SwapQuoteSection({
     fetchBalances();
   }, [dex, inSym, outSym, address, tokenInMeta, tokenOutMeta, fetchBalances]);
 
-  /** 执行兑换（若 ERC20 授权不足会自动发起 approve 再执行 swap） */
+  /** 执行兑换（报价阶段已并发返回 allowanceSufficient，点击后 0 前置 RPC 秒弹钱包） */
   async function executeSwap() {
     let addr = address;
     if (!addr) {
@@ -357,36 +358,41 @@ export function SwapQuoteSection({
     setErr("");
     setTxHash("");
     try {
-      await switchChain(quote.chain.chain_id);
+      if (walletChainId !== quote.chain.chain_id) {
+        await switchChain(quote.chain.chain_id);
+      }
 
       const routerAddr = quote.router.addr;
       const amountInBig = BigInt(quote.amountIn);
 
       if (!quote.tokenIn.isNative) {
-        let needApprove = true;
-        try {
-          const ownerPad = addr.toLowerCase().replace(/^0x/, "").padStart(64, "0");
-          const spenderPad = routerAddr
-            .toLowerCase()
-            .replace(/^0x/, "")
-            .padStart(64, "0");
-          const p = (window as any).okxwallet || (window as any).ethereum;
-          const raw = p
-            ? ((await p.request({
-                method: "eth_call",
-                params: [
-                  {
-                    to: quote.tokenIn.addr,
-                    data: "0xdd62ed3e" + ownerPad + spenderPad,
-                  },
-                  "latest",
-                ],
-              })) as string)
-            : "0x0";
-          if (raw && raw !== "0x" && BigInt(raw) >= amountInBig) {
-            needApprove = false;
-          }
-        } catch {}
+        let needApprove = !quote.allowanceSufficient;
+        // 仅当报价时未携带钱包地址（未能预检 allowanceSufficient）时才兜底查一次链上 allowance
+        if (quote.allowanceSufficient === undefined) {
+          try {
+            const ownerPad = addr.toLowerCase().replace(/^0x/, "").padStart(64, "0");
+            const spenderPad = routerAddr
+              .toLowerCase()
+              .replace(/^0x/, "")
+              .padStart(64, "0");
+            const p = (window as any).okxwallet || (window as any).ethereum;
+            const raw = p
+              ? ((await p.request({
+                  method: "eth_call",
+                  params: [
+                    {
+                      to: quote.tokenIn.addr,
+                      data: "0xdd62ed3e" + ownerPad + spenderPad,
+                    },
+                    "latest",
+                  ],
+                })) as string)
+              : "0x0";
+            if (raw && raw !== "0x" && BigInt(raw) >= amountInBig) {
+              needApprove = false;
+            }
+          } catch {}
+        }
 
         if (needApprove) {
           const appTx = buildApproveCalldata(
@@ -394,8 +400,8 @@ export function SwapQuoteSection({
             routerAddr,
             MAX_UINT256
           );
-          const appHash = await sendTx(appTx);
-          await waitForTxReceipt(appHash, 45_000);
+          const appHash = await sendTx({ ...appTx, gas: 80000n });
+          await waitForTxReceipt(appHash, 15_000);
         }
       }
 

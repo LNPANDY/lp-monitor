@@ -11,7 +11,8 @@ export async function GET(req: Request) {
   const db = getDb();
   let sql = `SELECT p.*, w.label AS wallet_label, w.address AS wallet_address,
                     c.name AS chain_name, c.key AS chain_key, c.explorer_url, c.chain_id AS chain_id,
-                    d.name AS dex_display_name,
+                    c.rpc_urls AS chain_rpc_urls, c.symbol AS chain_symbol,
+                    d.name AS dex_display_name, d.npm AS dex_npm,
                     (SELECT a.type FROM alerts a WHERE a.position_id=p.id ORDER BY a.sent_at DESC LIMIT 1) AS last_alert_type,
                     (SELECT CASE WHEN m.id IS NOT NULL THEN 1 ELSE 0 END
                        FROM cex_alert_mutes m
@@ -28,5 +29,6 @@ export async function GET(req: Request) {
   if (only) { sql += " AND p.notify_state=?"; args.push(only); }
   else if (!includeClosed) { sql += " AND p.notify_state!='closed'"; }
   sql += " ORDER BY p.last_in_range ASC, p.last_checked_at DESC";
+  if (only === "closed") { sql += " LIMIT 60"; }
   return ok(db.prepare(sql).all(...args));
 }

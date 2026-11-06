@@ -16,7 +16,11 @@ interface Position {
   chain_id_ref: number;
   chain_id: number;
   chain_name: string;
+  chain_rpc_urls?: string;
+  chain_symbol?: string;
+  explorer_url?: string;
   dex_name: string;
+  dex_npm?: string;
   pool: string;
   token_id: string;
   token0_symbol?: string;
@@ -26,6 +30,7 @@ interface Position {
   wallet_address: string;
   source: string;
   staker_contract: string;
+  last_liquidity?: string;
 }
 
 interface RemoveParams {
@@ -77,22 +82,62 @@ export function RemovePositionButton({
   async function handleQuickRemove(andReopen: boolean) {
     setBusyMode(andReopen ? "reopen" : "remove");
     setTxHashes([]);
-    setStep("读取链上流动性…");
 
     try {
-      // 1. 拉取链上实时参数
-      const r = await fetch(`/api/positions/${position.id}/remove-params`, {
-        headers: authHeaders(),
-      });
-      const j = await r.json();
-      if (!j.ok) throw new Error(j.error || "获取撤池参数失败");
-      const params: RemoveParams = j.data;
-      setExplorerUrl(params.chain?.explorerUrl || "");
-
-      // 若点了「撤池重开」，立刻先把右侧建仓面板切到当前池子，撤池同时即可准备参数
-      if (andReopen && onReopenPool && params.chainIdRef && params.pool) {
-        onReopenPool(params.chainIdRef, params.pool);
+      // 若点了「撤池重开」，立刻先把左侧建仓面板切到当前池子，零延迟并发准备
+      if (andReopen && onReopenPool && position.chain_id_ref && position.pool) {
+        onReopenPool(position.chain_id_ref, position.pool);
       }
+
+      // 1. 优先复用列表已缓存的 NPM 与 liquidity（0ms 直弹钱包，省去 ~1.1s 后端 RPC 查询）
+      const cachedLiq = (() => {
+        try {
+          return BigInt(position.last_liquidity || "0");
+        } catch {
+          return 0n;
+        }
+      })();
+
+      let params: RemoveParams;
+      if (position.dex_npm && cachedLiq > 0n) {
+        let parsedRpcUrls: string[] = [];
+        try {
+          parsedRpcUrls = position.chain_rpc_urls
+            ? JSON.parse(position.chain_rpc_urls)
+            : [];
+        } catch {
+          parsedRpcUrls = [];
+        }
+        params = {
+          tokenId: position.token_id,
+          npm: position.dex_npm,
+          dexName: position.dex_name,
+          pool: position.pool,
+          chainIdRef: position.chain_id_ref,
+          pairFlip: position.pair_flip ?? 0,
+          stakerContract: position.staker_contract || "",
+          source: position.source || "direct",
+          liquidity: position.last_liquidity || "0",
+          realLiquidity: position.last_liquidity || "0",
+          ownerOf: position.wallet_address,
+          chain: {
+            chainId: position.chain_id,
+            name: position.chain_name,
+            rpcUrls: parsedRpcUrls,
+            explorerUrl: position.explorer_url || "",
+            nativeSymbol: position.chain_symbol || "ETH",
+          },
+        };
+      } else {
+        setStep("读取链上流动性…");
+        const r = await fetch(`/api/positions/${position.id}/remove-params`, {
+          headers: authHeaders(),
+        });
+        const j = await r.json();
+        if (!j.ok) throw new Error(j.error || "获取撤池参数失败");
+        params = j.data;
+      }
+      setExplorerUrl(params.chain?.explorerUrl || "");
 
       const liq = BigInt(params.realLiquidity || params.liquidity || "0");
       const isStaked =
