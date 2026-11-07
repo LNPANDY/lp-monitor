@@ -54,17 +54,46 @@ export function useInterval(cb: () => void, ms: number) {
 }
 
 /**
- * 价格展示：完全展开小数，绝不使用科学计数法（如 2.3815542e+15 → 2381554200000000）。
- * 小数尾部无意义的 0 会被 trim 掉。
+ * 价格展示：完全展开小数，绝不使用科学计数法，同时消除 IEEE-754 双精度浮点尾数噪音
+ * （如 0.14740000000000003 → 0.1474，0.14759227999999992 → 0.147592）。
  */
 export function fmtFull(n: number): string {
   if (!Number.isFinite(n)) return "—";
-  // 先用足够多的小数位展开，再 trim 末尾 0
-  let s = Math.abs(n) < 1 && n !== 0 ? n.toFixed(18) : n.toFixed(8);
+  if (n === 0) return "0";
+  const abs = Math.abs(n);
+  let cleaned: number;
+  if (abs >= 1000) {
+    cleaned = Number(n.toFixed(2));
+  } else if (abs >= 1) {
+    cleaned = Number(n.toFixed(6));
+  } else {
+    // 对 < 1 的价格（如 W0G ≈ 0.1474 或 W0G/WETH 汇率）保留 6 位有效数字，彻底消除 .00000000003 / .999999992 浮点噪音
+    cleaned = Number(n.toPrecision(6));
+  }
+  let s =
+    Math.abs(cleaned) < 1 && cleaned !== 0
+      ? cleaned.toFixed(12)
+      : cleaned.toFixed(6);
   if (s.indexOf(".") >= 0) s = s.replace(/0+$/, "").replace(/\.$/, "");
-  // 防御性：万一仍含 e/E，转成全数字
-  if (/[eE]/.test(s)) s = numberToString(n);
+  if (/[eE]/.test(s)) s = numberToString(cleaned);
   return s === "" || s === "-" ? "0" : s;
+}
+
+/**
+ * 代币数量可读格式化：避免 18 位精度代币（如 W0G）直接输出 1327.060654922942105068。
+ */
+export function fmtTokenAmount(val: string | number | undefined | null, maxDecimals = 2): string {
+  if (val === undefined || val === null || val === "") return "0";
+  const n = typeof val === "number" ? val : Number(val);
+  if (!Number.isFinite(n) || n === 0) return "0";
+  const abs = Math.abs(n);
+  if (abs >= 100) {
+    return n.toLocaleString("en-US", { maximumFractionDigits: maxDecimals });
+  }
+  if (abs >= 1) {
+    return n.toLocaleString("en-US", { maximumFractionDigits: Math.max(maxDecimals, 4) });
+  }
+  return fmtFull(n);
 }
 
 /**
@@ -90,3 +119,4 @@ export function numberToString(num: number): string {
     return sign + digits.slice(0, point) + "." + digits.slice(point);
   }
 }
+

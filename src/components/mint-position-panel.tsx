@@ -7,9 +7,9 @@
  * 2. 支持 ZIA DEX 一键开启 NFT 全局免签质押（setApprovalForAll）+ 质押前链上校验 verifyNftPoolMatch，
  *    让原本 2~4 步签名压缩到 1~2 步。
  */
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 import useSWR, { mutate } from "swr";
-import { fetcher, authHeaders, fmtFull } from "./util";
+import { fetcher, authHeaders, fmtFull, fmtTokenAmount } from "./util";
 import {
   useWallet,
   verifyNftPoolMatch,
@@ -24,12 +24,19 @@ import {
   buildStakeDepositCalldata,
   MAX_UINT256,
 } from "@/lib/wallet/build-mint";
+import { getAmountsForLiquidity, tickToSqrtPriceX96 } from "@/lib/v3/math";
+import type { PoolRewardRadarItem } from "@/app/page";
+import type { LivePairCexAnalysis, UseBinanceRealtimeReturn } from "@/lib/cex/use-binance-ws";
 
 interface Props {
   chainId: number;
   pool: string;
   externalData?: any;
   probeLoading?: boolean;
+  poolRadar?: PoolRewardRadarItem;
+  liveCex?: LivePairCexAnalysis | null;
+  w0gPriceUsd?: number;
+  binanceRt?: UseBinanceRealtimeReturn;
   onClose?: () => void;
   onCreated?: () => void;
   onFlipChanged?: () => void;
@@ -40,6 +47,10 @@ export function MintPositionPanel({
   pool: initialPool,
   externalData,
   probeLoading,
+  poolRadar,
+  liveCex,
+  w0gPriceUsd,
+  binanceRt,
   onClose,
   onCreated,
   onFlipChanged,
@@ -241,9 +252,50 @@ export function MintPositionPanel({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [address]);
 
+  // 建仓模式切换："min" = ⚡ 最小区间（单格冲锋）；"zero_to_above" = 🛡️ 0 ~ 现价略高（重U少主币 · 防跌不越界）
+  const [rangeMode, setRangeMode] = useState<"min" | "zero_to_above">("min");
+  const [zeroAboveExtraTicks, setZeroAboveExtraTicks] = useState<number>(3);
+  const [simCapitalUsd, setSimCapitalUsd] = useState<number>(1000);
+
+  /** 计算「0 ~ 现价略高 (+extraTicks 格)」对应的 [tickLower, tickUpper] 及重仓稳定币侧 */
+  const computeZeroToAboveRange = useCallback(
+    (extraTicks: number, baseTickOverride?: number) => {
+      if (!data?.pool) return null;
+      const spacing = data.pool.tickSpacing || 60;
+      const curTick = baseTickOverride ?? data.pool.currentTick;
+      const flipped = data.pairFlip === 1;
+      const baseWindowLower = Math.floor(curTick / spacing) * spacing;
+      const baseWindowUpper = baseWindowLower + spacing;
+
+      if (!flipped) {
+        // 未翻转（如 W0G/USDC.e、WBTC/USDC.e）：token0 为主币，token1 为稳定币(USDC.e)
+        // 主币价格 = 0 对应 MIN_TICK (-887220)，上界取当前最小窗口上界 + extraTicks * spacing
+        const minAligned = Math.ceil(-887272 / spacing) * spacing;
+        const upper = baseWindowUpper + extraTicks * spacing;
+        return {
+          tickLower: minAligned,
+          tickUpper: upper,
+          quoteSide: "token1" as const,
+        };
+      } else {
+        // 已翻转（如 USDC.e/WETH、USDC.e/SOL）：token0 为稳定币(USDC.e)，token1 为主币
+        // 主币价格 = 0 对应 MAX_TICK (+887220)，下界取当前最小窗口下界 - extraTicks * spacing
+        const maxAligned = Math.floor(887272 / spacing) * spacing;
+        const lower = baseWindowLower - extraTicks * spacing;
+        return {
+          tickLower: lower,
+          tickUpper: maxAligned,
+          quoteSide: "token0" as const,
+        };
+      }
+    },
+    [data]
+  );
+
   /** 刷新 tick（LP 波动快时用，默认对齐最新最小窗口） */
   async function refreshTick(useMinWindow = false) {
     if (useMinWindow) {
+      setRangeMode("min");
       setTickLower("");
       setTickUpper("");
       await fetchPool({
@@ -260,27 +312,39 @@ export function MintPositionPanel({
     }
   }
 
-  /** 快捷预设：以当前 tick 为中心的对称区间 */
-  async function applyPreset(pct: number) {
+  /** 模式 A：应用最小单格窗口（可选按链上当前 Tick 或按币安实时隐含 Tick 居中） */
+  async function applyMinWindowMode(useBinanceImplied = false) {
     if (!data) return;
-    const spacing = data.pool.tickSpacing;
-    const current = data.pool.currentTick;
-    if (pct === 0) {
-      // 最小窗口
-      const lower = Math.floor(current / spacing) * spacing;
-      const upper = lower + spacing;
-      await fetchPool({
-        range: { tick_lower: lower, tick_upper: upper },
-        withCompute: !!amount,
-        withWallet: !!address,
-      });
-      return;
-    }
-    const delta = Math.round(Math.log(1 + pct / 100) / Math.log(1.0001));
-    const lower = Math.floor((current - delta) / spacing) * spacing;
-    const upper = Math.ceil((current + delta) / spacing) * spacing;
+    setRangeMode("min");
+    const spacing = data.pool.tickSpacing || 60;
+    const refTick =
+      useBinanceImplied && liveCex
+        ? liveCex.impliedTick
+        : data.pool.currentTick;
+    const lower = Math.floor(refTick / spacing) * spacing;
+    const upper = lower + spacing;
+    setTickLower(String(lower));
+    setTickUpper(String(upper));
     await fetchPool({
       range: { tick_lower: lower, tick_upper: upper },
+      withCompute: !!amount,
+      withWallet: !!address,
+    });
+  }
+
+  /** 模式 B：应用「0 ~ 现价略高 (+extraTicks 格)」重 U 少主币模式 */
+  async function applyZeroToAboveMode(extraTicks: number) {
+    if (!data) return;
+    setRangeMode("zero_to_above");
+    setZeroAboveExtraTicks(extraTicks);
+    const r = computeZeroToAboveRange(extraTicks);
+    if (!r) return;
+    setTickLower(String(r.tickLower));
+    setTickUpper(String(r.tickUpper));
+    setSide(r.quoteSide);
+    await fetchPool({
+      range: { tick_lower: r.tickLower, tick_upper: r.tickUpper },
+      sideOverride: r.quoteSide,
       withCompute: !!amount,
       withWallet: !!address,
     });
@@ -522,6 +586,8 @@ export function MintPositionPanel({
               { ...dep, gas: 350000n },
               "质押"
             );
+            // 等待质押交易上链回执确认后再触发监控刷新，确保新仓位立即识别为质押中
+            await waitForTxReceipt(hd, 15000);
             setStep(3, { status: "done", hash: hd });
             setMsg(`✅ 创建并质押成功！tokenId=#${tokenId}`);
           } catch (e: any) {
@@ -534,6 +600,12 @@ export function MintPositionPanel({
       } else {
         setMsg(`✅ 仓位创建成功${tokenId ? `，tokenId=#${tokenId}` : ""}`);
       }
+      // 触发后台极速扫描同步新仓位状态
+      fetch("/api/monitor", {
+        method: "POST",
+        headers: authHeaders({ "Content-Type": "application/json" }),
+        body: JSON.stringify({ mode: "combined" }),
+      }).catch(() => {});
       onCreated?.();
     } catch (e: any) {
       setSteps((prev) =>
@@ -594,11 +666,211 @@ export function MintPositionPanel({
       )
     : "";
 
+  // 解析实时 token0 / token1 USD 价格，供建仓收益模拟器与对比表使用
+  const tokenPricesUsd = useMemo(() => {
+    if (!data?.pool) return { p0: 0, p1: 0, w0g: w0gPriceUsd ?? 0.147 };
+    let p0 =
+      binanceRt?.getTokenUsdPrice(chainId, data.pool.token0, sym0) ??
+      liveCex?.token0PriceUsd ??
+      poolRadar?.token0PriceUsd ??
+      0;
+    let p1 =
+      binanceRt?.getTokenUsdPrice(chainId, data.pool.token1, sym1) ??
+      liveCex?.token1PriceUsd ??
+      poolRadar?.token1PriceUsd ??
+      0;
+    const dexPrice = Number(data.pool.priceCurrent);
+    if (p0 <= 0 && p1 > 0 && dexPrice > 0) p0 = dexPrice * p1;
+    if (p1 <= 0 && p0 > 0 && dexPrice > 0) p1 = p0 / dexPrice;
+    const w0g =
+      binanceRt?.getTokenUsdPrice(
+        chainId,
+        "0x1cd0690ff9a693f5ef2dd976660a8dafc81a109c",
+        "W0G"
+      ) ??
+      w0gPriceUsd ??
+      0.147;
+    return { p0, p1, w0g };
+  }, [data, chainId, sym0, sym1, binanceRt, liveCex, poolRadar, w0gPriceUsd]);
+
+  // 针对任意给定区间 [tl, tu] 与投入本金 USD，实时模拟 Merkl 50/25/25 质押收益与双币配比
+  const simulateStrategy = useCallback(
+    (tl: number, tu: number, capitalUsd: number) => {
+      if (!data?.pool || capitalUsd <= 0 || tl >= tu) return null;
+      const { p0, p1, w0g } = tokenPricesUsd;
+      if (p0 <= 0 || p1 <= 0) return null;
+
+      const curTick = data.pool.currentTick;
+      const dec0 = data.pool.token0Decimals ?? poolRadar?.decimals0 ?? 18;
+      const dec1 = data.pool.token1Decimals ?? poolRadar?.decimals1 ?? 6;
+      const sqrtCur = tickToSqrtPriceX96(curTick);
+      const sqrtA = tickToSqrtPriceX96(tl);
+      const sqrtB = tickToSqrtPriceX96(tu);
+
+      const L_REF = 10n ** 18n;
+      const refAmounts = getAmountsForLiquidity(
+        sqrtCur,
+        sqrtA,
+        sqrtB,
+        L_REF,
+        dec0,
+        dec1
+      );
+      const refAmt0 = Number(refAmounts.amount0) || 0;
+      const refAmt1 = Number(refAmounts.amount1) || 0;
+      const refUsd = refAmt0 * p0 + refAmt1 * p1;
+      if (refUsd <= 0) return null;
+
+      const scale = capitalUsd / refUsd;
+      const amt0 = refAmt0 * scale;
+      const amt1 = refAmt1 * scale;
+      const usd0 = amt0 * p0;
+      const usd1 = amt1 * p1;
+      const pct0 = (usd0 / capitalUsd) * 100;
+      const pct1 = (usd1 / capitalUsd) * 100;
+      const liq = BigInt(Math.max(1, Math.floor(scale * 1e9))) * 10n ** 9n;
+      const inRange = curTick >= tl && curTick < tu;
+
+      let activeLShare = 0;
+      let token0Share = 0;
+      let token1Share = 0;
+      let rewardShare = 0;
+      let dailyW0g = 0;
+      let dailyUsd = 0;
+      let hourlyW0g = 0;
+      let hourlyUsd = 0;
+      let aprPct = 0;
+
+      if (poolRadar) {
+        const poolActiveL = poolRadar.totalActiveL
+          ? BigInt(poolRadar.totalActiveL)
+          : 0n;
+        const totalLAfter = poolActiveL + (inRange ? liq : 0n);
+        activeLShare =
+          inRange && totalLAfter > 0n
+            ? Number((liq * 1000000n) / totalLAfter) / 1_000_000
+            : 0;
+        const poolAmt0 = poolRadar.stakedToken0Human ?? 0;
+        const poolAmt1 = poolRadar.stakedToken1Human ?? 0;
+        token0Share = poolAmt0 + amt0 > 0 ? amt0 / (poolAmt0 + amt0) : 0;
+        token1Share = poolAmt1 + amt1 > 0 ? amt1 / (poolAmt1 + amt1) : 0;
+        rewardShare =
+          0.5 * activeLShare + 0.25 * token0Share + 0.25 * token1Share;
+        dailyW0g = poolRadar.dailyW0g * rewardShare;
+        hourlyW0g = dailyW0g / 24;
+        dailyUsd = dailyW0g * (w0g > 0 ? w0g : 0.147);
+        hourlyUsd = dailyUsd / 24;
+        aprPct = capitalUsd > 0 ? ((dailyUsd * 365) / capitalUsd) * 100 : 0;
+      }
+
+      return {
+        tl,
+        tu,
+        capitalUsd,
+        amt0,
+        amt1,
+        usd0,
+        usd1,
+        pct0,
+        pct1,
+        inRange,
+        activeLShare,
+        token0Share,
+        token1Share,
+        rewardShare,
+        hourlyW0g,
+        hourlyUsd,
+        dailyW0g,
+        dailyUsd,
+        aprPct,
+      };
+    },
+    [data, tokenPricesUsd, poolRadar]
+  );
+
+  // 当前用户输入金额对应的真实美元本金（若未输入则使用 simCapitalUsd）
+  const effectiveSimUsd = useMemo(() => {
+    if (data?.compute) {
+      const a0 = Number(data.compute.amount0Human) || 0;
+      const a1 = Number(data.compute.amount1Human) || 0;
+      const u = a0 * tokenPricesUsd.p0 + a1 * tokenPricesUsd.p1;
+      if (u > 1) return u;
+    }
+    return simCapitalUsd;
+  }, [data, tokenPricesUsd, simCapitalUsd]);
+
+  // 当前选中区间的实时收益模拟
+  const currentRangeSim = useMemo(() => {
+    const tl = Number(tickLower);
+    const tu = Number(tickUpper);
+    if (!Number.isFinite(tl) || !Number.isFinite(tu) || tl >= tu) return null;
+    return simulateStrategy(tl, tu, effectiveSimUsd);
+  }, [tickLower, tickUpper, effectiveSimUsd, simulateStrategy]);
+
+  // 三种典型开仓策略对比表（模式A 最小单格 vs 模式B 0~现价+1格 vs 模式B 0~现价+3格）
+  const strategyComparison = useMemo(() => {
+    if (!data?.pool) return [];
+    const spacing = data.pool.tickSpacing || 60;
+    const curTick = data.pool.currentTick;
+    const minLower = Math.floor(curTick / spacing) * spacing;
+    const minUpper = minLower + spacing;
+
+    const rZero1 = computeZeroToAboveRange(1);
+    const rZero3 = computeZeroToAboveRange(3);
+
+    const rows: {
+      id: string;
+      title: string;
+      badge: string;
+      mode: "min" | "zero_to_above";
+      extraTicks?: number;
+      sim: NonNullable<ReturnType<typeof simulateStrategy>>;
+    }[] = [];
+
+    const simMin = simulateStrategy(minLower, minUpper, effectiveSimUsd);
+    if (simMin) {
+      rows.push({
+        id: "min",
+        title: "⚡ 模式A：最小单格",
+        badge: "冲刺50%活跃L桶",
+        mode: "min",
+        sim: simMin,
+      });
+    }
+    if (rZero1) {
+      const s1 = simulateStrategy(rZero1.tickLower, rZero1.tickUpper, effectiveSimUsd);
+      if (s1) {
+        rows.push({
+          id: "zero1",
+          title: "🛡️ 模式B：0 ~ 现价+1格",
+          badge: "重U少主币 · 防跌",
+          mode: "zero_to_above",
+          extraTicks: 1,
+          sim: s1,
+        });
+      }
+    }
+    if (rZero3) {
+      const s3 = simulateStrategy(rZero3.tickLower, rZero3.tickUpper, effectiveSimUsd);
+      if (s3) {
+        rows.push({
+          id: "zero3",
+          title: "🛡️ 模式B：0 ~ 现价+3格",
+          badge: "推荐 · 历史#21631同款",
+          mode: "zero_to_above",
+          extraTicks: 3,
+          sim: s3,
+        });
+      }
+    }
+    return rows;
+  }, [data, effectiveSimUsd, computeZeroToAboveRange, simulateStrategy]);
+
   return (
     <div className="panel-inset border-cyan-500/30 p-4 text-xs">
       <div className="mb-2.5 flex items-center justify-between">
         <span className="text-sm font-semibold text-ink">
-          ② ➕ 极速建仓 & 自动质押（最小区间）
+          ② ➕ 极速建仓 & 自动质押（双模式 + 实时收益模拟）
         </span>
         {onClose && (
           <button className="btn-ghost btn-xs" onClick={onClose}>
@@ -643,8 +915,8 @@ export function MintPositionPanel({
             <button
               className="btn-ghost btn-xs"
               disabled={busy}
-              onClick={() => refreshTick(true)}
-              title="刷新最新 tick 并将区间对齐到当前最小窗口"
+              onClick={() => refreshTick(rangeMode === "min")}
+              title="刷新最新链上 tick"
             >
               ↻ 刷新 tick
             </button>
@@ -701,74 +973,153 @@ export function MintPositionPanel({
             )}
           </div>
 
-          {/* 区间 */}
-          <div className="flex flex-wrap items-center gap-1.5">
-            <span className="text-ink-soft shrink-0">区间</span>
-            <input
-              className="input !w-[92px] px-2 py-1 font-mono"
-              value={tickLower}
-              onChange={(e) => setTickLower(e.target.value)}
-              placeholder="tickLower"
-            />
-            <span>~</span>
-            <input
-              className="input !w-[92px] px-2 py-1 font-mono"
-              value={tickUpper}
-              onChange={(e) => setTickUpper(e.target.value)}
-              placeholder="tickUpper"
-            />
-            <button
-              className="btn-ghost btn-xs"
-              disabled={busy}
-              onClick={() =>
-                fetchPool({ withCompute: !!amount, withWallet: !!address })
-              }
-            >
-              应用
-            </button>
-            <span className="text-ink-soft ml-1">快捷</span>
-            <button
-              className="btn-ghost btn-xs"
-              disabled={busy}
-              onClick={() => applyPreset(0)}
-            >
-              最小窗口
-            </button>
-            <button
-              className="btn-ghost btn-xs"
-              disabled={busy}
-              onClick={() => applyPreset(1)}
-            >
-              ±1%
-            </button>
-            <button
-              className="btn-ghost btn-xs"
-              disabled={busy}
-              onClick={() => applyPreset(5)}
-            >
-              ±5%
-            </button>
-            <button
-              className="btn-ghost btn-xs"
-              disabled={busy}
-              onClick={() => applyPreset(10)}
-            >
-              ±10%
-            </button>
+          {/* ==================== Module ⑧：双模式窗口选择器（模式A 最小单格 vs 模式B 0~现价略高） ==================== */}
+          <div className="rounded-lg border border-white/[0.1] bg-surface-0/70 p-2.5 space-y-2">
+            <div className="grid grid-cols-2 gap-1.5">
+              <button
+                type="button"
+                disabled={busy}
+                onClick={() => applyMinWindowMode(false)}
+                className={`rounded-lg border px-2.5 py-1.5 text-left transition ${
+                  rangeMode === "min"
+                    ? "border-cyan-400 bg-cyan-500/20 text-white shadow-[0_0_10px_rgba(34,211,238,0.2)]"
+                    : "border-white/[0.1] bg-surface-1/60 text-ink-soft hover:text-ink"
+                }`}
+              >
+                <div className="font-semibold text-xs">
+                  ⚡ 模式 A：最小区间 (单格冲锋)
+                </div>
+                <div className="text-[10px] opacity-80">
+                  1 格 tickSpacing · 集中吃满 50% 活跃 L 奖池
+                </div>
+              </button>
+
+              <button
+                type="button"
+                disabled={busy}
+                onClick={() => applyZeroToAboveMode(zeroAboveExtraTicks)}
+                className={`rounded-lg border px-2.5 py-1.5 text-left transition ${
+                  rangeMode === "zero_to_above"
+                    ? "border-amber-400 bg-amber-500/20 text-white shadow-[0_0_10px_rgba(245,158,11,0.2)]"
+                    : "border-white/[0.1] bg-surface-1/60 text-ink-soft hover:text-ink"
+                }`}
+              >
+                <div className="font-semibold text-xs">
+                  🛡️ 模式 B：0 ~ 现价略高 (重U少主币)
+                </div>
+                <div className="text-[10px] opacity-80">
+                  98%+ 稳定币 + 少量 {isFlipped ? sym1 : sym0} · 下跌永不越界
+                </div>
+              </button>
+            </div>
+
+            {/* 模式专属快捷按钮 */}
+            {rangeMode === "min" ? (
+              <div className="flex flex-wrap items-center gap-1.5 text-[11px]">
+                <span className="text-ink-soft">单格对齐：</span>
+                <button
+                  type="button"
+                  disabled={busy}
+                  onClick={() => applyMinWindowMode(false)}
+                  className="btn-ghost btn-xs border border-cyan-500/35 text-cyan-200"
+                >
+                  🎯 按链上现价单格
+                </button>
+                {liveCex && (
+                  <button
+                    type="button"
+                    disabled={busy}
+                    onClick={() => applyMinWindowMode(true)}
+                    className="btn-ghost btn-xs border border-amber-400/40 text-amber-200"
+                    title={`按币安实时隐含 Tick (${liveCex.impliedTick}) 对齐最小单格`}
+                  >
+                    ⚡ 按币安实时价单格 (Tick {liveCex.impliedTick})
+                  </button>
+                )}
+              </div>
+            ) : (
+              <div className="space-y-1">
+                <div className="flex flex-wrap items-center gap-1.5 text-[11px]">
+                  <span className="text-amber-200 font-medium">
+                    上界高出现价：
+                  </span>
+                  {[
+                    { k: 0, label: "当前格上界" },
+                    { k: 1, label: "高 1 格 (+0.6%)" },
+                    { k: 3, label: "高 3 格 (+1.8% · 推荐)" },
+                    { k: 5, label: "高 5 格 (+3.0%)" },
+                  ].map((opt) => (
+                    <button
+                      key={opt.k}
+                      type="button"
+                      disabled={busy}
+                      onClick={() => applyZeroToAboveMode(opt.k)}
+                      className={`rounded border px-2 py-0.5 font-mono text-[11px] transition ${
+                        zeroAboveExtraTicks === opt.k
+                          ? "border-amber-400 bg-amber-500/25 text-amber-100 font-semibold"
+                          : "border-white/[0.12] bg-surface-1 text-ink-soft hover:text-ink"
+                      }`}
+                    >
+                      {opt.label}
+                    </button>
+                  ))}
+                </div>
+                <div className="text-[10.5px] text-amber-100/80">
+                  💡 <strong>重U少0G原理</strong>：下界锁定价格 0（Tick{" "}
+                  {!isFlipped ? "-887220" : "+887220"}），上界比现价高{" "}
+                  {zeroAboveExtraTicks} 格。只需投入大量{" "}
+                  <span className="font-mono font-semibold text-white">
+                    {!isFlipped ? sym1 : sym0}
+                  </span>{" "}
+                  + 极少量{" "}
+                  <span className="font-mono font-semibold text-white">
+                    {!isFlipped ? sym0 : sym1}
+                  </span>
+                  ，既在区间内吃补贴，且主币下跌时永远不会向下越界！
+                </div>
+              </div>
+            )}
+
+            {/* 精确 Tick 输入行 */}
+            <div className="flex flex-wrap items-center gap-1.5 pt-0.5">
+              <span className="text-ink-soft shrink-0">Tick 区间</span>
+              <input
+                className="input !w-[98px] px-2 py-1 font-mono"
+                value={tickLower}
+                onChange={(e) => setTickLower(e.target.value)}
+                placeholder="tickLower"
+              />
+              <span>~</span>
+              <input
+                className="input !w-[98px] px-2 py-1 font-mono"
+                value={tickUpper}
+                onChange={(e) => setTickUpper(e.target.value)}
+                placeholder="tickUpper"
+              />
+              <button
+                className="btn-ghost btn-xs"
+                disabled={busy}
+                onClick={() =>
+                  fetchPool({ withCompute: !!amount, withWallet: !!address })
+                }
+              >
+                应用区间
+              </button>
+            </div>
           </div>
 
           {/* 金额输入（自动计算另一侧；若已翻转则主币排第一） */}
           <div className="flex flex-wrap items-center gap-2">
             <span className="text-ink-soft shrink-0">投入</span>
             <select
-              className="input !w-auto min-w-[82px] max-w-[115px] py-1 pl-2 pr-5 font-semibold"
+              className="input !w-auto min-w-[82px] max-w-[125px] py-1 pl-2 pr-5 font-semibold"
               value={side}
               onChange={(e) => setSide(e.target.value as "token0" | "token1")}
             >
               {isFlipped ? (
                 <>
                   <option value="token1">{sym1} (主币)</option>
-                  <option value="token0">{sym0}</option>
+                  <option value="token0">{sym0} (U)</option>
                 </>
               ) : (
                 <>
@@ -778,23 +1129,23 @@ export function MintPositionPanel({
               )}
             </select>
             <input
-              className="input !w-[150px] px-2 py-1 font-mono"
+              className="input !w-[140px] px-2 py-1 font-mono"
               value={amount}
               onChange={(e) => setAmount(e.target.value)}
               placeholder="输入数量"
             />
             {data.balances && (
-              <span className="text-ink-soft font-mono">
+              <span className="text-ink-soft font-mono text-[11px]">
                 余额:{" "}
                 {isFlipped ? (
                   <>
-                    {sym1} {Number(data.balances.token1Human).toFixed(4)} ·{" "}
-                    {sym0} {Number(data.balances.token0Human).toFixed(4)}
+                    {sym1} {fmtTokenAmount(Number(data.balances.token1Human))} ·{" "}
+                    {sym0} {fmtTokenAmount(Number(data.balances.token0Human))}
                   </>
                 ) : (
                   <>
-                    {sym0} {Number(data.balances.token0Human).toFixed(4)} ·{" "}
-                    {sym1} {Number(data.balances.token1Human).toFixed(4)}
+                    {sym0} {fmtTokenAmount(Number(data.balances.token0Human))} ·{" "}
+                    {sym1} {fmtTokenAmount(Number(data.balances.token1Human))}
                   </>
                 )}
               </span>
@@ -810,8 +1161,17 @@ export function MintPositionPanel({
                   <div>
                     需要 {sym1}:{" "}
                     <strong className="font-mono text-ink">
-                      {data.compute.amount1Human}
+                      {fmtTokenAmount(Number(data.compute.amount1Human))}
                     </strong>
+                    {tokenPricesUsd.p1 > 0 && (
+                      <span className="ml-1 font-mono text-ink-soft">
+                        (≈ $
+                        {(
+                          Number(data.compute.amount1Human) * tokenPricesUsd.p1
+                        ).toFixed(1)}
+                        )
+                      </span>
+                    )}
                     {data.approvals?.token1?.sufficient && (
                       <span className="ml-1.5 text-ok">
                         （已授权，跳过 approve）
@@ -821,8 +1181,17 @@ export function MintPositionPanel({
                   <div>
                     需要 {sym0}:{" "}
                     <strong className="font-mono text-ink">
-                      {data.compute.amount0Human}
+                      {fmtTokenAmount(Number(data.compute.amount0Human))}
                     </strong>
+                    {tokenPricesUsd.p0 > 0 && (
+                      <span className="ml-1 font-mono text-ink-soft">
+                        (≈ $
+                        {(
+                          Number(data.compute.amount0Human) * tokenPricesUsd.p0
+                        ).toFixed(1)}
+                        )
+                      </span>
+                    )}
                     {data.approvals?.token0?.sufficient && (
                       <span className="ml-1.5 text-ok">
                         （已授权，跳过 approve）
@@ -835,8 +1204,17 @@ export function MintPositionPanel({
                   <div>
                     需要 {sym0}:{" "}
                     <strong className="font-mono text-ink">
-                      {data.compute.amount0Human}
+                      {fmtTokenAmount(Number(data.compute.amount0Human))}
                     </strong>
+                    {tokenPricesUsd.p0 > 0 && (
+                      <span className="ml-1 font-mono text-ink-soft">
+                        (≈ $
+                        {(
+                          Number(data.compute.amount0Human) * tokenPricesUsd.p0
+                        ).toFixed(1)}
+                        )
+                      </span>
+                    )}
                     {data.approvals?.token0?.sufficient && (
                       <span className="ml-1.5 text-ok">
                         （已授权，跳过 approve）
@@ -846,8 +1224,17 @@ export function MintPositionPanel({
                   <div>
                     需要 {sym1}:{" "}
                     <strong className="font-mono text-ink">
-                      {data.compute.amount1Human}
+                      {fmtTokenAmount(Number(data.compute.amount1Human))}
                     </strong>
+                    {tokenPricesUsd.p1 > 0 && (
+                      <span className="ml-1 font-mono text-ink-soft">
+                        (≈ $
+                        {(
+                          Number(data.compute.amount1Human) * tokenPricesUsd.p1
+                        ).toFixed(1)}
+                        )
+                      </span>
+                    )}
                     {data.approvals?.token1?.sufficient && (
                       <span className="ml-1.5 text-ok">
                         （已授权，跳过 approve）
@@ -863,7 +1250,7 @@ export function MintPositionPanel({
                 <div className="mt-1.5 border-t border-white/[0.08] pt-1.5 space-y-1">
                   {data.compute.stakedShareAfter !== undefined && (
                     <div>
-                      质押仓位占比：
+                      质押仓位活跃L占比：
                       <strong className="text-cyan-300 font-mono">
                         {(data.compute.stakedShareAfter * 100).toFixed(2)}%
                       </strong>
@@ -879,7 +1266,7 @@ export function MintPositionPanel({
                   )}
                   {data.compute.shareInPool !== undefined && (
                     <div>
-                      窗口流动性占比
+                      窗口总流动性占比
                       {data.compute.stakedShareAfter !== undefined
                         ? "（含未质押）"
                         : ""}
@@ -899,8 +1286,142 @@ export function MintPositionPanel({
             </div>
           )}
 
+          {/* ==================== Module ⑧：开仓实时质押收益模拟器 & 双模式对比表 ==================== */}
+          {poolRadar && currentRangeSim && (
+            <div className="rounded-lg border border-emerald-500/30 bg-emerald-500/10 p-2.5 space-y-2">
+              <div className="flex flex-wrap items-center justify-between gap-1">
+                <span className="font-semibold text-ink">
+                  🧮 建仓预计质押收益模拟（按本金 ≈ $
+                  {effectiveSimUsd.toFixed(0)}）
+                </span>
+                {!data.compute && (
+                  <div className="inline-flex items-center gap-1 font-mono text-[10px]">
+                    <span className="text-ink-soft">模拟本金:</span>
+                    {[500, 1000, 2000, 5000].map((u) => (
+                      <button
+                        key={u}
+                        type="button"
+                        onClick={() => setSimCapitalUsd(u)}
+                        className={`rounded px-1.5 py-0.5 ${
+                          simCapitalUsd === u
+                            ? "bg-emerald-500/30 text-emerald-100 font-bold border border-emerald-400/40"
+                            : "bg-white/[0.08] text-ink-soft hover:text-ink"
+                        }`}
+                      >
+                        ${u}
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              {/* 当前选中区间的预计产出 */}
+              <div className="grid grid-cols-3 gap-1.5 font-mono text-[11px]">
+                <div className="rounded bg-surface-0/70 px-2 py-1">
+                  <div className="font-sans text-[10px] text-ink-soft">
+                    ⏱ 预计每小时
+                  </div>
+                  <div className="font-semibold text-emerald-300">
+                    ${currentRangeSim.hourlyUsd.toFixed(2)}/h
+                  </div>
+                  <div className="text-[10px] text-ink-soft">
+                    {currentRangeSim.hourlyW0g.toFixed(2)} W0G
+                  </div>
+                </div>
+                <div className="rounded bg-surface-0/70 px-2 py-1">
+                  <div className="font-sans text-[10px] text-ink-soft">
+                    📅 预计每天
+                  </div>
+                  <div className="font-semibold text-emerald-300">
+                    ${currentRangeSim.dailyUsd.toFixed(2)}/d
+                  </div>
+                  <div className="text-[10px] text-ink-soft">
+                    {currentRangeSim.dailyW0g.toFixed(1)} W0G
+                  </div>
+                </div>
+                <div className="rounded bg-surface-0/70 px-2 py-1">
+                  <div className="font-sans text-[10px] text-ink-soft">
+                    🔥 预计综合 APR
+                  </div>
+                  <div className="font-bold text-amber-300">
+                    {currentRangeSim.aprPct.toFixed(0)}%
+                  </div>
+                  <div className="text-[10px] text-ink-soft">
+                    综合分 {(currentRangeSim.rewardShare * 100).toFixed(2)}%
+                  </div>
+                </div>
+              </div>
+
+              {/* 模式A vs 模式B 策略对比表（点击任意行即可一键切换区间） */}
+              {strategyComparison.length > 0 && (
+                <div className="overflow-x-auto rounded border border-white/[0.08] bg-surface-0/70">
+                  <table className="w-full text-left text-[10.5px] font-mono">
+                    <thead className="border-b border-white/[0.08] bg-white/[0.04] font-sans text-ink-soft">
+                      <tr>
+                        <th className="px-2 py-1">策略模式 (点击直接套用)</th>
+                        <th className="px-2 py-1">代币配比</th>
+                        <th className="px-2 py-1">日产 USD</th>
+                        <th className="px-2 py-1">预计 APR</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-white/[0.06]">
+                      {strategyComparison.map((row) => {
+                        const isRowActive =
+                          Number(tickLower) === row.sim.tl &&
+                          Number(tickUpper) === row.sim.tu;
+                        return (
+                          <tr
+                            key={row.id}
+                            onClick={() => {
+                              if (row.mode === "min") {
+                                applyMinWindowMode(false);
+                              } else {
+                                applyZeroToAboveMode(row.extraTicks ?? 3);
+                              }
+                            }}
+                            className={`cursor-pointer transition ${
+                              isRowActive
+                                ? "bg-cyan-500/20 text-white"
+                                : "hover:bg-white/[0.05] text-ink"
+                            }`}
+                          >
+                            <td className="px-2 py-1 font-sans">
+                              <div className="font-semibold">{row.title}</div>
+                              <div className="text-[9.5px] text-ink-soft">
+                                [{row.sim.tl}, {row.sim.tu}] · {row.badge}
+                              </div>
+                            </td>
+                            <td className="px-2 py-1">
+                              <div>
+                                {sym0}: {fmtTokenAmount(row.sim.amt0)} (
+                                {row.sim.pct0.toFixed(0)}%)
+                              </div>
+                              <div className="text-cyan-200">
+                                {sym1}: {fmtTokenAmount(row.sim.amt1)} (
+                                {row.sim.pct1.toFixed(0)}%)
+                              </div>
+                            </td>
+                            <td className="px-2 py-1 text-emerald-300 font-semibold">
+                              ${row.sim.dailyUsd.toFixed(2)}/d
+                              <div className="text-[9.5px] font-normal text-ink-soft">
+                                {row.sim.dailyW0g.toFixed(1)} W0G
+                              </div>
+                            </td>
+                            <td className="px-2 py-1 font-bold text-amber-300">
+                              {row.sim.aprPct.toFixed(0)}%
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+          )}
+
           <button
-            className="btn-primary text-xs"
+            className="btn-primary text-xs w-full py-2 font-semibold"
             disabled={busy || !data.compute || !data.dex}
             onClick={execute}
           >
@@ -908,8 +1429,8 @@ export function MintPositionPanel({
               ? busy
                 ? "执行中…"
                 : data.matchedStaking?.length > 0
-                  ? "创建仓位并质押"
-                  : "创建仓位"
+                  ? `🚀 创建仓位并自动质押 (${rangeMode === "min" ? "最小单格" : "0~现价略高"})`
+                  : "🚀 创建仓位"
               : "连接钱包"}
           </button>
 

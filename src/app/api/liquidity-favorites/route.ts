@@ -2,6 +2,7 @@ import { getDb, isPairFlipped } from "@/lib/db";
 import { ok, fail, getBody } from "@/lib/api";
 import { getClient } from "@/lib/chains";
 import { resolveTokens } from "@/lib/chains/tokens";
+import { ZIA_INCENTIVIZED_POOLS } from "@/lib/monitor/merkl-rewards";
 
 export const dynamic = "force-dynamic";
 
@@ -80,23 +81,45 @@ export async function GET(req: Request) {
     let t1 = row.token1 || "";
     let sym0 = row.token0_symbol || "";
     let sym1 = row.token1_symbol || "";
+    let fee: number | null = row.fee && row.fee > 0 ? Number(row.fee) : null;
 
-    // 如果缺少 token0/token1 或 symbol，尝试从 positions 表同池子记录补全
-    if (!t0 || !t1 || !sym0 || !sym1) {
+    // 如果缺少 token0/token1、symbol 或 fee，尝试从 positions 表同池子记录补全
+    if (!t0 || !t1 || !sym0 || !sym1 || !fee) {
       const pos = db.prepare(`
-        SELECT token0, token1, token0_symbol, token1_symbol, pair_flip
+        SELECT token0, token1, token0_symbol, token1_symbol, fee, pair_flip
         FROM positions
         WHERE chain_id_ref = ? AND LOWER(pool) = LOWER(?)
         ORDER BY last_checked_at DESC
         LIMIT 1
-      `).get(row.chain_id_ref, row.pool_addr) as { token0: string; token1: string; token0_symbol: string; token1_symbol: string; pair_flip: number } | undefined;
+      `).get(row.chain_id_ref, row.pool_addr) as { token0: string; token1: string; token0_symbol: string; token1_symbol: string; fee: number; pair_flip: number } | undefined;
 
       if (pos) {
         if (!t0) t0 = pos.token0 || "";
         if (!t1) t1 = pos.token1 || "";
         if (!sym0) sym0 = pos.token0_symbol || "";
         if (!sym1) sym1 = pos.token1_symbol || "";
+        if (!fee && pos.fee && pos.fee > 0) fee = Number(pos.fee);
       }
+    }
+
+    // 再从 ZIA 预设激励池定义兜底补全 token0/token1/symbol/fee
+    const ziaDef = ZIA_INCENTIVIZED_POOLS.find(
+      (p) => p.pool.toLowerCase() === (row.pool_addr || "").toLowerCase()
+    );
+    if (ziaDef) {
+      if (!t0) t0 = ziaDef.token0;
+      if (!t1) t1 = ziaDef.token1;
+      if (!sym0) sym0 = ziaDef.symbol0;
+      if (!sym1) sym1 = ziaDef.symbol1;
+      if (!fee) fee = ziaDef.fee;
+    }
+
+    // 若 label 里含 0.3% / 0.05% / 0.01% / 1% 字样，解析为 fee
+    if (!fee && row.label) {
+      if (row.label.includes("0.01%")) fee = 100;
+      else if (row.label.includes("0.05%")) fee = 500;
+      else if (row.label.includes("0.3%")) fee = 3000;
+      else if (row.label.includes("1%")) fee = 10000;
     }
 
     // 如果有 symbol 但还没有 token 地址，尝试从 tokens 缓存表反查地址以匹配 pair_flips
@@ -126,6 +149,7 @@ export async function GET(req: Request) {
       token1: t1,
       token0_symbol: sym0,
       token1_symbol: sym1,
+      fee,
       pair_flip,
     };
   });

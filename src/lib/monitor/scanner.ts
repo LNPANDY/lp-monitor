@@ -111,9 +111,9 @@ export async function runScan(): Promise<ScanSummary> {
 
       console.log(`[scanner-deep] wallet ${w.address} chain ${chain.name}: discover=${direct.length}d+${staked.length}s recover=${recovered.length} ${(Date.now()-tWallet0)}ms`);
 
-      // ===== 预取本链 CEX 报价（开启 CEX 对比时）=====
+      // ===== 预取本链 CEX 报价（无论推送开关是否开启，均写入展示字段）=====
       const chainMappings = cexMappingsByChain.get(w.chain_id_ref) ?? [];
-      if (cexEnabled && chainMappings.length > 0) {
+      if (chainMappings.length > 0) {
         const needFetch = chainMappings.filter((m) => !cexQuoteByAddr.has(m.tokenAddr));
         if (needFetch.length > 0) {
           const byAddr = await buildQuotesByAddr(needFetch);
@@ -609,6 +609,10 @@ export interface CexPricePayload {
   token0CexSymbol: string; // 如 '0GUSDT'
   /** token1 的币安 symbol */
   token1CexSymbol: string; // 如 'ETHUSDT'
+  /** token0 的实时 USD 报价 */
+  token0Price?: number;
+  /** token1 的实时 USD 报价 */
+  token1Price?: number;
   /** 展示用：两侧计价币种，如 'USDT' 或 'USDT/USDC'（不再参与汇率判定） */
   quote: string;
   /** DEX 池价：1 token0 = dexRate token1（整币单位，已按 decimals 换算） */
@@ -686,6 +690,8 @@ export function computeCexPriceDiff(
     pairLabel: `${sym0}/${sym1}`,
     token0CexSymbol: q0.symbol,
     token1CexSymbol: q1.symbol,
+    token0Price: q0.price,
+    token1Price: q1.price,
     quote,
     dexRate,
     cexRate,
@@ -738,17 +744,27 @@ export function buildCexPriceNotification(
 }
 
 /**
- * 价格展示：完全展开小数，绝不使用科学计数法。
- * 如 2.3815542e+15 → 2381554200000000；0.00000123 → 0.00000123。
- * 告警文案里出现科学计数法很难读，统一展开。
+ * 价格展示：完全展开小数，绝不使用科学计数法，同时用有效数字裁剪消除 IEEE-754 尾数噪音
+ * （如 0.14759227999999992 → 0.147592）。
  */
 export function fmt(n: number): string {
   if (!Number.isFinite(n)) return "—";
   if (n === 0) return "0";
-  let s = Math.abs(n) < 1 ? n.toFixed(18) : n.toFixed(8);
+  const abs = Math.abs(n);
+  let s: string;
+  if (abs < 1) {
+    const clean = Number(n.toPrecision(6));
+    const leadingZeros = Math.max(0, -Math.floor(Math.log10(abs)) - 1);
+    const decimals = Math.min(18, leadingZeros + 6);
+    s = clean.toFixed(decimals);
+  } else if (abs < 1000) {
+    const clean = Number(n.toPrecision(8));
+    s = clean.toFixed(6);
+  } else {
+    s = n.toFixed(4);
+  }
   if (s.indexOf(".") >= 0) s = s.replace(/0+$/, "").replace(/\.$/, "");
-  // 防御性：万一仍含 e/E，手动按小数点移位展开
-  if (/[eE]/.test(s)) s = numberToFullString(n);
+  if (/[eE]/.test(s)) s = numberToFullString(Number(n.toPrecision(8)));
   return s === "" || s === "-" ? "0" : s;
 }
 

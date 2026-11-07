@@ -122,23 +122,19 @@ export function sqrtPriceX96ToHumanPrice(
   decimals1: number
 ): string {
   // price = (sqrtPriceX96 / 2^96)^2 × 10^(decimals0 - decimals1)
-  // 1. priceX192 = sqrtPriceX96^2，量纲为 raw token0 / raw token1
-  // 2. 引入 Q18 精度：priceScaled = priceX192 × 10^18 / 2^192
-  // 3. decimals 差的放大/缩小仍在 Q18 量纲内进行，最后统一按 Q18 格式化
+  // 必须在 >> 192n 之前乘上 10^decDiff（当 decDiff > 0 如 W0G(18)/USDC.e(6) 时，raw 比值为 10^-13，先 >> 192n 会截断有效位）
   const priceX192 = sqrtPriceX96 * sqrtPriceX96;
-  const expPrecision = 18n;
-  const priceScaled = (priceX192 * (10n ** expPrecision)) >> 192n;
-
-  const decDiff = decimals0 - decimals1; // >0: token0 更大单位，需放大；<0: 需缩小
+  const expPrecision = 18;
+  const decDiff = decimals0 - decimals1;
   let price: bigint;
   if (decDiff >= 0) {
-    price = priceScaled * 10n ** BigInt(decDiff);
+    price = (priceX192 * 10n ** BigInt(expPrecision + decDiff)) >> 192n;
   } else {
-    price = priceScaled / (10n ** BigInt(-decDiff));
+    price = (priceX192 * 10n ** BigInt(expPrecision)) / ((1n << 192n) * 10n ** BigInt(-decDiff));
   }
 
-  // price 量纲恒为 Q18（1 token0 = price / 10^18 token1）
-  return formatBigInt(price, Number(expPrecision));
+  const rawStr = formatBigInt(price, expPrecision);
+  return cleanPriceString(rawStr);
 }
 
 /**
@@ -151,6 +147,27 @@ export function tickToPriceDisplay(tick: number, decimals0: number, decimals1: n
 }
 
 // ==================== 工具函数 ====================
+
+/** 清理价格字符串中的浮点尾数噪音（保留 6 位有效数字/小数） */
+export function cleanPriceString(rawStr: string): string {
+  const n = Number(rawStr);
+  if (!Number.isFinite(n) || n === 0) return rawStr;
+  const abs = Math.abs(n);
+  let cleaned: number;
+  if (abs >= 1000) {
+    cleaned = Number(n.toFixed(2));
+  } else if (abs >= 1) {
+    cleaned = Number(n.toFixed(6));
+  } else {
+    cleaned = Number(n.toPrecision(6));
+  }
+  let s =
+    Math.abs(cleaned) < 1 && cleaned !== 0
+      ? cleaned.toFixed(12)
+      : cleaned.toFixed(6);
+  if (s.indexOf(".") >= 0) s = s.replace(/0+$/, "").replace(/\.$/, "");
+  return s === "" || s === "-" ? "0" : s;
+}
 
 /** bigint 数量格式化为带适当小数的字符串（如 "1234.5678"）。 */
 export function formatBigInt(value: bigint, decimals: number): string {
@@ -169,7 +186,18 @@ export function formatBigInt(value: bigint, decimals: number): string {
   return sign + intPart.toString() + "." + fracStr;
 }
 
-/** 将原始 token 数量（wei 单位 bigint）格式化为可读字符串。 */
+/** 将原始 token 数量（wei 单位 bigint）格式化为可读字符串（自动截断 18 位尾数噪音，保留可读精度）。 */
 export function formatTokenAmount(weiAmount: bigint, decimals: number): string {
-  return formatBigInt(weiAmount, decimals);
+  const raw = formatBigInt(weiAmount, decimals);
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n === 0) return "0";
+  const abs = Math.abs(n);
+  if (abs >= 100) {
+    return Number(n.toFixed(2)).toString();
+  }
+  if (abs >= 1) {
+    return Number(n.toFixed(4)).toString();
+  }
+  return cleanPriceString(raw);
 }
+

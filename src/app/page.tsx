@@ -1,13 +1,15 @@
 "use client";
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useMemo } from "react";
 import useSWR, { mutate } from "swr";
-import { fetcher, authHeaders, short, timeAgo, fmtFull } from "@/components/util";
+import { fetcher, authHeaders, short, timeAgo, fmtFull, fmtTokenAmount } from "@/components/util";
 import { SwapQuoteSection } from "@/components/swap-quote-section";
 import { useWallet } from "@/lib/wallet/use-wallet";
 import { LiquidityButton } from "@/components/liquidity-button";
 import { LiquidityProbe } from "@/components/liquidity-probe";
 import { RemovePositionButton } from "@/components/remove-position-button";
 import { Field } from "@/components/form";
+import { tickToSqrtPriceX96, getAmountsForLiquidity } from "@/lib/v3/math";
+import { useBinanceRealtime, type UseBinanceRealtimeReturn } from "@/lib/cex/use-binance-ws";
 
 /** 推送冷却可选值（分钟） */
 const COOLDOWN_OPTIONS = [0, 2, 5, 10, 20, 30, 60];
@@ -127,7 +129,7 @@ interface MonitorState {
   merklRewards?: MerklRewardsSummary | null;
 }
 
-interface PositionRewardEstimate {
+export interface PositionRewardEstimate {
   positionId?: number;
   tokenId: string;
   pool: string;
@@ -135,10 +137,19 @@ interface PositionRewardEstimate {
   pairLabel: string;
   inRange: boolean;
   positionUsd: number;
+  symbol0?: string;
+  symbol1?: string;
+  amount0Human?: number;
+  amount1Human?: number;
+  amount0Usd?: number;
+  amount1Usd?: number;
   activeLShare: number;
   token0Share: number;
   token1Share: number;
   rewardShare: number;
+  dailyActiveLUsd?: number;
+  dailyToken0Usd?: number;
+  dailyToken1Usd?: number;
   poolDailyW0g: number;
   poolHourlyW0g: number;
   hourlyW0g: number;
@@ -149,14 +160,26 @@ interface PositionRewardEstimate {
   potentialDailyW0g: number;
   potentialDailyUsd: number;
   potentialAprPct: number;
+  rebalanceSwapUsd?: number;
+  rebalanceFeeUsd?: number;
+  hourlyGainUsd?: number;
+  breakevenHours?: number | null;
 }
 
-interface PoolRewardRadarItem {
+export interface PoolRewardRadarItem {
   key: string;
   pairLabel: string;
   chainIdRef: number;
   pool: string;
   vault: string;
+  token0?: string;
+  token1?: string;
+  symbol0?: string;
+  symbol1?: string;
+  decimals0?: number;
+  decimals1?: number;
+  token0PriceUsd?: number;
+  token1PriceUsd?: number;
   fee: number;
   tickSpacing: number;
   currentTick: number;
@@ -168,6 +191,16 @@ interface PoolRewardRadarItem {
   dailyW0g: number;
   hourlyW0g: number;
   dailyRewardUsd: number;
+  dailyActiveLUsd?: number;
+  dailyToken0Usd?: number;
+  dailyToken1Usd?: number;
+  totalActiveL?: string;
+  stakedToken0Human?: number;
+  stakedToken1Human?: number;
+  stakedToken0Usd?: number;
+  stakedToken1Usd?: number;
+  token0BucketAprPct?: number;
+  token1BucketAprPct?: number;
   stakedTvlUsd: number;
   narrowStakedTvlUsd: number;
   narrowPositionCount: number;
@@ -182,7 +215,7 @@ interface PoolRewardRadarItem {
   isHighApr: boolean;
 }
 
-interface MerklRewardsSummary {
+export interface MerklRewardsSummary {
   checkedAt: string;
   durationMs: number;
   chainIdRef: number | null;
@@ -207,7 +240,120 @@ interface MerklRewardsSummary {
   alertsSent: number;
 }
 
+function inferTokenDecimals(tokenAddr: string, symbol?: string): number {
+  const addr = (tokenAddr || "").toLowerCase();
+  const sym = (symbol || "").toUpperCase();
+  if (
+    addr === "0x1f3aa82227281ca364bfb3d253b0f1af1da6473e" ||
+    addr === "0x1217bfe6c773eec6cc4a38b5dc45b92292b6e189" ||
+    sym.includes("USDC") ||
+    sym.includes("USDT")
+  ) {
+    return 6;
+  }
+  if (addr === "0x0555e30da8f98308edb960aa94c0db47230d2b9c" || sym.includes("BTC")) {
+    return 8;
+  }
+  if (addr === "0x2b269f9deb4804c5a4bd97e4d951c775beaa0cc5" || sym === "SOL" || sym === "WSOL") {
+    return 9;
+  }
+  return 18;
+}
+
+export interface PositionHoldingsInfo {
+  sym0: string;
+  sym1: string;
+  amt0: number;
+  amt1: number;
+  usd0: number;
+  usd1: number;
+  totalUsd: number;
+  pct0: number;
+  pct1: number;
+  isSingleSided: boolean;
+}
+
+function computePositionHoldings(
+  p: Position,
+  rewardEst?: PositionRewardEstimate,
+  binanceRt?: UseBinanceRealtimeReturn,
+  fallbackW0gUsd?: number
+): PositionHoldingsInfo | null {
+  const sym0 = p.token0_symbol || rewardEst?.symbol0 || short(p.token0);
+  const sym1 = p.token1_symbol || rewardEst?.symbol1 || short(p.token1);
+
+  let amt0 = rewardEst?.amount0Human;
+  let amt1 = rewardEst?.amount1Human;
+
+  if (
+    (amt0 === undefined || amt1 === undefined) &&
+    p.last_liquidity &&
+    /^\d+$/.test(p.last_liquidity) &&
+    BigInt(p.last_liquidity) > 0n
+  ) {
+    try {
+      const dec0 = inferTokenDecimals(p.token0, sym0);
+      const dec1 = inferTokenDecimals(p.token1, sym1);
+      const sqrtCurrent = tickToSqrtPriceX96(p.last_current_tick);
+      const sqrtA = tickToSqrtPriceX96(p.tick_lower);
+      const sqrtB = tickToSqrtPriceX96(p.tick_upper);
+      const res = getAmountsForLiquidity(
+        sqrtCurrent,
+        sqrtA,
+        sqrtB,
+        BigInt(p.last_liquidity),
+        dec0,
+        dec1
+      );
+      amt0 = Number(res.amount0) || 0;
+      amt1 = Number(res.amount1) || 0;
+    } catch {
+      // ignore
+    }
+  }
+
+  if (amt0 === undefined || amt1 === undefined) return null;
+
+  let p0Usd = binanceRt?.getTokenUsdPrice(p.chain_id_ref, p.token0, sym0) ?? null;
+  let p1Usd = binanceRt?.getTokenUsdPrice(p.chain_id_ref, p.token1, sym1) ?? null;
+
+  if ((!p0Usd || p0Usd <= 0) && sym0.toUpperCase().includes("0G") && fallbackW0gUsd) {
+    p0Usd = fallbackW0gUsd;
+  }
+  if ((!p1Usd || p1Usd <= 0) && sym1.toUpperCase().includes("0G") && fallbackW0gUsd) {
+    p1Usd = fallbackW0gUsd;
+  }
+
+  const dexPrice0 = Number(p.last_price0);
+  if ((!p0Usd || p0Usd <= 0) && p1Usd && p1Usd > 0 && Number.isFinite(dexPrice0) && dexPrice0 > 0) {
+    p0Usd = dexPrice0 * p1Usd;
+  } else if ((!p1Usd || p1Usd <= 0) && p0Usd && p0Usd > 0 && Number.isFinite(dexPrice0) && dexPrice0 > 0) {
+    p1Usd = p0Usd / dexPrice0;
+  }
+
+  const usd0 = p0Usd && p0Usd > 0 ? amt0 * p0Usd : rewardEst?.amount0Usd ?? 0;
+  const usd1 = p1Usd && p1Usd > 0 ? amt1 * p1Usd : rewardEst?.amount1Usd ?? 0;
+  const totalUsd = usd0 + usd1 > 0 ? usd0 + usd1 : rewardEst?.positionUsd ?? 0;
+  const pct0 = totalUsd > 0 ? (usd0 / totalUsd) * 100 : amt0 > 0 && amt1 === 0 ? 100 : 0;
+  const pct1 = totalUsd > 0 ? (usd1 / totalUsd) * 100 : amt1 > 0 && amt0 === 0 ? 100 : 0;
+  const isSingleSided = (amt0 <= 1e-9 && amt1 > 0) || (amt1 <= 1e-9 && amt0 > 0);
+
+  return {
+    sym0,
+    sym1,
+    amt0,
+    amt1,
+    usd0,
+    usd1,
+    totalUsd,
+    pct0,
+    pct1,
+    isSingleSided,
+  };
+}
+
 export default function DashboardPage() {
+  const binanceRt = useBinanceRealtime();
   const { data: positions, mutate: reloadActivePos } = useSWR<Position[]>(
     "/api/positions",
     fetcher,
@@ -922,7 +1068,11 @@ export default function DashboardPage() {
         {/* ==================== 左栏（5/12）：三段式联动工作台（探针 -> 建仓 -> Swap） ==================== */}
         <div className="lg:col-span-5 space-y-4 lg:sticky lg:top-4">
           <div ref={probeRef}>
-            <LiquidityProbe externalPool={externalPool} />
+            <LiquidityProbe
+              externalPool={externalPool}
+              merkl={merkl}
+              binanceRt={binanceRt}
+            />
           </div>
 
           {/* 链上资产统计（可折叠抽屉） */}
@@ -965,6 +1115,7 @@ export default function DashboardPage() {
                       merkl?.positions?.[`id:${p.id}`]
                     }
                     w0gPriceUsd={merkl?.w0gPriceUsd}
+                    binanceRt={binanceRt}
                     highlight
                     onFlipped={reloadPos}
                     onReopenPool={handleReopenPool}
@@ -992,6 +1143,7 @@ export default function DashboardPage() {
                       merkl?.positions?.[`id:${p.id}`]
                     }
                     w0gPriceUsd={merkl?.w0gPriceUsd}
+                    binanceRt={binanceRt}
                     onFlipped={reloadPos}
                     onReopenPool={handleReopenPool}
                   />
@@ -1806,6 +1958,7 @@ function PositionCard({
   p,
   rewardEst,
   w0gPriceUsd,
+  binanceRt,
   highlight,
   closed,
   onFlipped,
@@ -1814,6 +1967,7 @@ function PositionCard({
   p: Position;
   rewardEst?: PositionRewardEstimate;
   w0gPriceUsd?: number;
+  binanceRt?: UseBinanceRealtimeReturn;
   highlight?: boolean;
   closed?: boolean;
   onFlipped?: () => void;
@@ -1821,21 +1975,73 @@ function PositionCard({
 }) {
   const { address: connectedWallet } = useWallet();
   const inRange = p.last_in_range === 1;
+  // 若 Merkl ZiaVault 扫描已发现该 tokenId 在质押金库内，即使 DB source 尚未刷完也立即识别为质押中
+  const isStaked = p.source === "staking" || !!rewardEst;
+  const effectiveStaker = p.staker_contract || rewardEst?.vault || "";
   const explorer = p.explorer_url?.replace(/\/$/, "");
   const dexLabel = p.dex_display_name || p.dex_name;
-  const marginLower =
-    ((p.last_current_tick - p.tick_lower) /
-      Math.max(p.tick_upper - p.tick_lower, 1)) *
-    100;
-  const marginUpper =
-    ((p.tick_upper - p.last_current_tick) /
-      Math.max(p.tick_upper - p.tick_lower, 1)) *
-    100;
-  const sym0 = p.token0_symbol || short(p.token0);
-  const sym1 = p.token1_symbol || short(p.token1);
+  const span = Math.max(p.tick_upper - p.tick_lower, 1);
+  const marginLower = ((p.last_current_tick - p.tick_lower) / span) * 100;
+  const marginUpper = ((p.tick_upper - p.last_current_tick) / span) * 100;
+  const sym0 = p.token0_symbol || rewardEst?.symbol0 || short(p.token0);
+  const sym1 = p.token1_symbol || rewardEst?.symbol1 || short(p.token1);
   const pair = p.pair_flip ? `${sym1}/${sym0}` : `${sym0}/${sym1}`;
-  const cexInfo = parseCexPrice(p.last_cex_price);
-  const cexWarnThresh = 0.01;
+  const dbCexInfo = parseCexPrice(p.last_cex_price);
+
+  // 实时币安双指针与套利死角分析（优先使用前端实时 WS 报价，兜底用 DB 快照）
+  const liveCex = useMemo(() => {
+    const dexRate0 = Number(p.last_price0);
+    const rt = binanceRt?.analyzePairCex(
+      p.chain_id_ref,
+      p.token0,
+      p.token1,
+      sym0,
+      sym1,
+      dexRate0,
+      p.last_current_tick,
+      p.tick_lower,
+      p.tick_upper,
+      p.fee
+    );
+    if (rt) return rt;
+    if (dbCexInfo && dbCexInfo.cexRate > 0 && dbCexInfo.dexRate > 0) {
+      const tickDelta = Math.round(
+        Math.log(dbCexInfo.cexRate / dbCexInfo.dexRate) / Math.log(1.0001)
+      );
+      const impliedTick = p.last_current_tick + tickDelta;
+      const impliedMarginLowerPct = ((impliedTick - p.tick_lower) / span) * 100;
+      const impliedMarginUpperPct = ((p.tick_upper - impliedTick) / span) * 100;
+      const feeRate = (p.fee || 3000) / 1_000_000;
+      return {
+        token0PriceUsd: dbCexInfo.token0Price ?? 0,
+        token1PriceUsd: dbCexInfo.token1Price ?? 1,
+        token0CexSymbol: dbCexInfo.token0CexSymbol || sym0,
+        token1CexSymbol: dbCexInfo.token1CexSymbol || sym1,
+        cexRate: dbCexInfo.cexRate,
+        dexRate: dbCexInfo.dexRate,
+        diff: dbCexInfo.diff,
+        absDiff: dbCexInfo.absDiff,
+        feeRate,
+        withinFeeDeadzone: dbCexInfo.absDiff < feeRate,
+        exceedsAlertThreshold: dbCexInfo.absDiff >= feeRate * 2,
+        impliedTick,
+        tickDelta,
+        impliedInRange: impliedTick >= p.tick_lower && impliedTick < p.tick_upper,
+        impliedMarginLowerPct,
+        impliedMarginUpperPct,
+      };
+    }
+    return null;
+  }, [binanceRt, p, sym0, sym1, dbCexInfo, span]);
+
+  // 实时双币持仓拆解（Module ③）
+  const holdings = useMemo(
+    () =>
+      !closed
+        ? computePositionHoldings(p, rewardEst, binanceRt, w0gPriceUsd)
+        : null,
+    [closed, p, rewardEst, binanceRt, w0gPriceUsd]
+  );
 
   const walletDisplay = p.wallet_label
     ? `${p.wallet_label} (${short(p.wallet_address)})`
@@ -1855,21 +2061,35 @@ function PositionCard({
   const displayPrice0 = p.last_price0
     ? fmtFull(flip ? 1 / Number(p.last_price0) : Number(p.last_price0))
     : p.last_price0;
-  const displayCexRate = cexInfo
+  const displayCexRate = liveCex
     ? flip
-      ? 1 / cexInfo.cexRate
-      : cexInfo.cexRate
+      ? 1 / liveCex.cexRate
+      : liveCex.cexRate
     : 0;
-  const displayToken0Cex = cexInfo
-    ? flip
-      ? cexInfo.token1CexSymbol
-      : cexInfo.token0CexSymbol
+  const displayToken0Cex = liveCex
+    ? (flip ? liveCex.token1CexSymbol : liveCex.token0CexSymbol) || displaySym0
     : "";
-  const displayToken1Cex = cexInfo
-    ? flip
-      ? cexInfo.token0CexSymbol
-      : cexInfo.token1CexSymbol
+  const displayToken1Cex = liveCex
+    ? (flip ? liveCex.token0CexSymbol : liveCex.token1CexSymbol) || displaySym1
     : "";
+
+  const onChainClampedPct = Math.min(Math.max(marginLower, 0), 100);
+  const impliedClampedPct = liveCex
+    ? Math.min(Math.max(liveCex.impliedMarginLowerPct, 0), 100)
+    : null;
+  const pullLeftPct =
+    impliedClampedPct !== null
+      ? Math.min(onChainClampedPct, impliedClampedPct)
+      : 0;
+  const pullWidthPct =
+    impliedClampedPct !== null
+      ? Math.abs(impliedClampedPct - onChainClampedPct)
+      : 0;
+
+  const liveW0gUsd =
+    binanceRt?.getTokenUsdPrice(p.chain_id_ref, "0x1cd0690ff9a693f5ef2dd976660a8dafc81a109c", "W0G") ??
+    w0gPriceUsd ??
+    0;
 
   return (
     <div
@@ -1903,7 +2123,7 @@ function PositionCard({
             {!closed && p.last_alert_type === "cex_price" && (
               <span className="tag-warn">CEX 价差</span>
             )}
-            {!closed && p.source === "staking" && (
+            {!closed && isStaked && (
               <span className="tag-muted">质押中</span>
             )}
           </div>
@@ -1926,6 +2146,11 @@ function PositionCard({
             }`}
           >
             {p.last_current_tick}
+            {liveCex && (
+              <span className="ml-1.5 text-xs text-amber-300" title="币安实时价格对应的池内隐含目标 Tick">
+                (⚡币安Tick {liveCex.impliedTick})
+              </span>
+            )}
           </span>
         </Row>
         <Row label="区间">
@@ -1933,40 +2158,42 @@ function PositionCard({
             [{p.tick_lower}, {p.tick_upper}]
           </span>
         </Row>
-        <Row label="价格">
+        <Row label="DEX 池价">
           <span className="font-mono">
             1 {displaySym0} ≈ {displayPrice0} {displaySym1}
           </span>
         </Row>
-        {cexInfo && displayToken0Cex && displayToken1Cex && (
-          <Row label={`CEX 汇率 (${displayToken0Cex}÷${displayToken1Cex})`}>
-            <span className="font-mono">
+        {liveCex && (
+          <Row label={`CEX 实时汇率 (${displayToken0Cex}÷${displayToken1Cex})`}>
+            <span className="font-mono text-cyan-200">
               1 {displaySym0} = {fmtFull(displayCexRate)} {displaySym1}
             </span>
           </Row>
         )}
-        {cexInfo && (
-          <Row label="CEX差价">
+        {liveCex && (
+          <Row label="CEX 实时价差">
             <span
               className={`font-mono ${
-                cexInfo.absDiff >= cexWarnThresh
-                  ? "text-warn font-semibold"
-                  : "text-ok"
+                !liveCex.withinFeeDeadzone
+                  ? "text-amber-300 font-semibold"
+                  : "text-emerald-300"
               }`}
             >
-              差 {pctSigned(cexInfo.diff)}
+              差 {pctSigned(liveCex.diff)}
             </span>
-            <span className="ml-1 font-mono text-ink-soft">
-              {fmtFull(displayCexRate)}
+            <span className="ml-1.5 font-mono text-xs text-ink-soft">
+              ({liveCex.tickDelta >= 0 ? "+" : ""}
+              {liveCex.tickDelta} tick)
             </span>
           </Row>
         )}
 
-        {/* 区间位置可视化 */}
-        <div className="pt-1.5 pb-0.5">
-          <div className="relative h-2 w-full rounded bg-white/[0.1]">
+        {/* ==================== Module ②：双指针区间雷达（链上 Tick + 币安隐含 Tick + 0.30% 套利死角判定） ==================== */}
+        <div className="pt-2 pb-1 space-y-1">
+          <div className="relative h-2.5 w-full rounded bg-white/[0.1] overflow-visible">
+            {/* 区间内绿底 */}
             <div
-              className="absolute inset-y-0 left-0 rounded bg-emerald-500/35"
+              className="absolute inset-y-0 left-0 rounded bg-emerald-500/30"
               style={{
                 width: `${
                   inRange
@@ -1977,30 +2204,131 @@ function PositionCard({
                 }%`,
               }}
             />
+            {/* 链上 Tick 与 币安隐含 Tick 之间的套利牵引带 */}
+            {impliedClampedPct !== null && pullWidthPct > 0.5 && (
+              <div
+                className="absolute inset-y-0 rounded bg-amber-400/30"
+                style={{
+                  left: `${pullLeftPct}%`,
+                  width: `${pullWidthPct}%`,
+                }}
+                title="链上现价与币安隐含价之间的套利牵引区"
+              />
+            )}
+            {/* 指针 1：链上当前 Tick */}
             <div
-              className="absolute top-1/2 h-3.5 w-1.5 -translate-y-1/2 rounded"
+              className="absolute top-1/2 h-4 w-1.5 -translate-y-1/2 rounded shadow"
               style={{
-                left: `${Math.min(
-                  Math.max(
-                    ((p.last_current_tick - p.tick_lower) /
-                      Math.max(p.tick_upper - p.tick_lower, 1)) *
-                      100,
-                    0
-                  ),
-                  100
-                )}%`,
+                left: `${onChainClampedPct}%`,
                 background: inRange ? "#10b981" : "#f43f5e",
               }}
+              title={`链上当前 Tick: ${p.last_current_tick} (距下界 ${marginLower.toFixed(1)}%)`}
             />
+            {/* 指针 2：币安实时隐含 Tick */}
+            {impliedClampedPct !== null && liveCex && (
+              <div
+                className="absolute top-1/2 h-4 w-1.5 -translate-y-1/2 rounded border border-amber-200 bg-amber-400 shadow-[0_0_8px_#f59e0b]"
+                style={{
+                  left: `${impliedClampedPct}%`,
+                }}
+                title={`⚡ 币安实时隐含 Tick: ${liveCex.impliedTick} (距下界 ${liveCex.impliedMarginLowerPct.toFixed(1)}%)`}
+              />
+            )}
           </div>
-          <div className="mt-1 flex justify-between text-[11px] font-mono text-ink-soft">
-            <span>距下界 {marginLower.toFixed(1)}%</span>
-            <span>距上界 {marginUpper.toFixed(1)}%</span>
+
+          <div className="flex flex-wrap items-center justify-between gap-1 text-[11px] font-mono text-ink-soft">
+            <span>
+              🟢 链上距下界 {marginLower.toFixed(1)}% / 距上界 {marginUpper.toFixed(1)}%
+            </span>
+            {liveCex && (
+              <span
+                className={
+                  liveCex.impliedInRange ? "text-amber-300" : "text-rose-300 font-semibold"
+                }
+              >
+                ⚡ 币安位置 {liveCex.impliedMarginLowerPct.toFixed(1)}%
+                {!liveCex.impliedInRange ? " (池外)" : ""}
+              </span>
+            )}
           </div>
+
+          {/* 0.30% 手续费死角 vs 套利临界状态条 */}
+          {!closed && liveCex && (
+            <div
+              className={`rounded border px-2 py-1 text-[11px] font-mono flex flex-wrap items-center justify-between gap-1 ${
+                liveCex.withinFeeDeadzone
+                  ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-200"
+                  : "border-amber-500/45 bg-amber-500/15 text-amber-200"
+              }`}
+            >
+              {liveCex.withinFeeDeadzone ? (
+                <span>
+                  🛡️ 手续费死角：价差 {(liveCex.absDiff * 100).toFixed(2)}% &lt;{" "}
+                  {(liveCex.feeRate * 100).toFixed(2)}% 池费（套利不触发）
+                </span>
+              ) : (
+                <span>
+                  ⚡ 套利临界：价差 {(liveCex.absDiff * 100).toFixed(2)}% ≥{" "}
+                  {(liveCex.feeRate * 100).toFixed(2)}% 池费 · 机器人即将把 Tick 推向{" "}
+                  {liveCex.impliedTick}
+                </span>
+              )}
+            </div>
+          )}
         </div>
 
-        {/* 已质押仓位：实时每小时 / 每日 Merkl 奖励估算（按 CEX 实时 0G 价格折算 USD） */}
-        {!closed && p.source === "staking" && rewardEst && (
+        {/* ==================== Module ③：实时双币持仓拆解（数量 + USD + 双色比例条） ==================== */}
+        {!closed && holdings && (
+          <div className="my-1.5 rounded-lg border border-white/[0.08] bg-surface-0/60 p-2 text-xs space-y-1.5">
+            <div className="flex flex-wrap items-center justify-between gap-1">
+              <span className="font-semibold text-ink">
+                💰 实时持仓构成{" "}
+                <span className="font-mono text-cyan-300">
+                  (≈ ${holdings.totalUsd.toFixed(1)})
+                </span>
+              </span>
+              {holdings.isSingleSided && (
+                <span className="rounded bg-amber-500/20 px-1.5 py-0.5 font-mono text-[10px] font-semibold text-amber-200 border border-amber-400/35">
+                  ⚠️ 100% 单边 ({holdings.amt0 > holdings.amt1 ? holdings.sym0 : holdings.sym1})
+                </span>
+              )}
+            </div>
+            {/* 双色持仓比例条 */}
+            <div className="flex h-1.5 w-full overflow-hidden rounded bg-white/[0.08]">
+              <div
+                className="bg-emerald-400 transition-all"
+                style={{ width: `${Math.min(Math.max(holdings.pct0, 0), 100)}%` }}
+              />
+              <div
+                className="bg-cyan-400 transition-all"
+                style={{ width: `${Math.min(Math.max(holdings.pct1, 0), 100)}%` }}
+              />
+            </div>
+            <div className="grid grid-cols-2 gap-1.5 font-mono text-[11px]">
+              <div className="flex items-center justify-between rounded bg-white/[0.03] px-1.5 py-0.5">
+                <span className="text-emerald-300 font-semibold">{holdings.sym0}</span>
+                <span className="text-ink">
+                  {fmtTokenAmount(holdings.amt0)}{" "}
+                  <span className="text-ink-soft">
+                    (${holdings.usd0.toFixed(0)} · {holdings.pct0.toFixed(0)}%)
+                  </span>
+                </span>
+              </div>
+              <div className="flex items-center justify-between rounded bg-white/[0.03] px-1.5 py-0.5">
+                <span className="text-cyan-300 font-semibold">{holdings.sym1}</span>
+                <span className="text-ink">
+                  {fmtTokenAmount(holdings.amt1)}{" "}
+                  <span className="text-ink-soft">
+                    (${holdings.usd1.toFixed(0)} · {holdings.pct1.toFixed(0)}%)
+                  </span>
+                </span>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* ==================== Module ④：Merkl 50/25/25 三桶得分明细 & 越界重开磨损回本测算 ==================== */}
+        {!closed && isStaked && rewardEst && (
           <div
             className={`my-2 rounded-lg border p-2.5 text-xs space-y-1.5 ${
               rewardEst.inRange
@@ -2012,7 +2340,7 @@ function PositionCard({
               <span className="font-semibold text-ink">
                 🎁 质押奖励估算{" "}
                 <span className="font-normal text-ink-soft">
-                  (0G=${(w0gPriceUsd ?? 0).toFixed(4)})
+                  (0G=${fmtFull(liveW0gUsd)})
                 </span>
               </span>
               <span
@@ -2047,28 +2375,89 @@ function PositionCard({
               </div>
             </div>
 
+            {/* Merkl 50% / 25% / 25% 三桶拆解明细 */}
+            <div className="grid grid-cols-3 gap-1 pt-0.5 font-mono text-[10px]">
+              <div
+                className={`rounded px-1.5 py-1 border ${
+                  rewardEst.inRange
+                    ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-200"
+                    : "border-rose-500/35 bg-rose-500/10 text-rose-300"
+                }`}
+              >
+                <div className="font-sans opacity-80">⚡ 活跃L (50%)</div>
+                <div className="font-semibold">
+                  {(rewardEst.activeLShare * 100).toFixed(1)}% 池内
+                </div>
+                <div className="opacity-90">
+                  ${(rewardEst.dailyActiveLUsd ?? 0).toFixed(2)}/d
+                </div>
+              </div>
+              <div className="rounded border border-white/[0.08] bg-surface-0/50 px-1.5 py-1 text-ink">
+                <div className="font-sans text-ink-soft">
+                  🪙 {rewardEst.symbol0 || sym0} (25%)
+                </div>
+                <div className="font-semibold">
+                  {(rewardEst.token0Share * 100).toFixed(1)}% 池内
+                </div>
+                <div className="text-cyan-200">
+                  ${(rewardEst.dailyToken0Usd ?? 0).toFixed(2)}/d
+                </div>
+              </div>
+              <div className="rounded border border-white/[0.08] bg-surface-0/50 px-1.5 py-1 text-ink">
+                <div className="font-sans text-ink-soft">
+                  💵 {rewardEst.symbol1 || sym1} (25%)
+                </div>
+                <div className="font-semibold">
+                  {(rewardEst.token1Share * 100).toFixed(1)}% 池内
+                </div>
+                <div className="text-cyan-200">
+                  ${(rewardEst.dailyToken1Usd ?? 0).toFixed(2)}/d
+                </div>
+              </div>
+            </div>
+
             <div className="flex flex-wrap items-center justify-between gap-1 text-[11px] font-mono text-ink-soft">
               <span>本金 ≈ ${rewardEst.positionUsd.toFixed(0)}</span>
               <span>
-                活跃L占比 {(rewardEst.activeLShare * 100).toFixed(1)}% · 综合分{" "}
-                {(rewardEst.rewardShare * 100).toFixed(1)}%
+                综合加权得分 {(rewardEst.rewardShare * 100).toFixed(2)}%
               </span>
             </div>
 
+            {/* 越界重开磨损回本测算器 */}
             {!rewardEst.inRange && rewardEst.potentialDailyUsd > rewardEst.dailyUsd && (
-              <div className="rounded border border-amber-400/30 bg-amber-500/15 px-2 py-1 text-[11px] text-amber-200">
-                ⚠️ 当前已越界，50% 活跃L奖励暂停！重开回区间预计可恢复至{" "}
-                <span className="font-mono font-semibold">
-                  {rewardEst.potentialDailyW0g.toFixed(1)} W0G/d ($
-                  {rewardEst.potentialDailyUsd.toFixed(2)}/d · APR{" "}
-                  {rewardEst.potentialAprPct.toFixed(0)}%)
-                </span>
+              <div className="rounded border border-amber-400/40 bg-amber-500/15 p-2 text-[11px] text-amber-100 space-y-1">
+                <div className="flex flex-wrap items-center justify-between gap-1 font-semibold text-amber-200">
+                  <span>🧮 越界重开磨损回本测算</span>
+                  {rewardEst.breakevenHours !== null &&
+                    rewardEst.breakevenHours !== undefined && (
+                      <span className="rounded bg-amber-400/25 px-1.5 py-0.5 font-mono text-amber-100 border border-amber-300/40">
+                        ⏱ 预计 {rewardEst.breakevenHours.toFixed(1)}h (
+                        {Math.round(rewardEst.breakevenHours * 60)}分钟) 回本
+                      </span>
+                    )}
+                </div>
+                <div className="font-mono text-[10.5px] space-y-0.5 text-amber-100/90">
+                  <div>
+                    • 换币磨损：需换约 $
+                    {(rewardEst.rebalanceSwapUsd ?? rewardEst.positionUsd * 0.5).toFixed(0)} ×{" "}
+                    {(p.fee / 10000).toFixed(2)}% 池费 ≈{" "}
+                    <span className="font-semibold text-white">
+                      ${(rewardEst.rebalanceFeeUsd ?? 0).toFixed(2)}
+                    </span>
+                  </div>
+                  <div>
+                    • 重开增收：+${(rewardEst.hourlyGainUsd ?? 0).toFixed(2)}/h ($
+                    {rewardEst.dailyUsd.toFixed(2)}/d → $
+                    {rewardEst.potentialDailyUsd.toFixed(2)}/d · APR{" "}
+                    {rewardEst.potentialAprPct.toFixed(0)}%)
+                  </div>
+                </div>
               </div>
             )}
           </div>
         )}
 
-        <Row label={p.source === "staking" ? "质押钱包" : "持仓钱包"}>
+        <Row label={isStaked ? "质押钱包" : "持仓钱包"}>
           <span
             className="inline-flex flex-wrap items-center justify-end gap-1.5 font-mono text-xs"
             title={p.wallet_address}
@@ -2082,7 +2471,7 @@ function PositionCard({
             {!closed && isWalletMismatched && (
               <span
                 className="rounded bg-amber-500/20 px-1.5 py-0.5 text-[10px] font-sans font-medium text-amber-200 border border-amber-500/40"
-                title={`当前连接钱包为 ${short(connectedWallet!)}，与该仓位${p.source === "staking" ? "质押" : "持仓"}钱包不一致，无法直接解押`}
+                title={`当前连接钱包为 ${short(connectedWallet!)}，与该仓位${isStaked ? "质押" : "持仓"}钱包不一致，无法直接解押`}
               >
                 ⚠️ 非当前钱包
               </span>
@@ -2090,15 +2479,15 @@ function PositionCard({
           </span>
         </Row>
         <Row label="检查时间">{timeAgo(p.last_checked_at)}</Row>
-        {p.source === "staking" && (
+        {isStaked && effectiveStaker && (
           <Row label="质押合约">
             <a
               className="underline font-mono text-cyan-300"
-              href={`${explorer}/address/${p.staker_contract}`}
+              href={`${explorer}/address/${effectiveStaker}`}
               target="_blank"
               rel="noreferrer"
             >
-              {short(p.staker_contract)}
+              {short(effectiveStaker)}
             </a>
           </Row>
         )}
@@ -2130,14 +2519,18 @@ function PositionCard({
       {!closed && (
         <LiquidityButton
           positionId={p.id}
-          staking={p.source === "staking"}
+          staking={isStaked}
           pairFlip={p.pair_flip}
         />
       )}
 
       {!closed && (
         <RemovePositionButton
-          position={p}
+          position={
+            isStaked && p.source !== "staking"
+              ? { ...p, source: "staking", staker_contract: effectiveStaker }
+              : p
+          }
           onRemoved={onFlipped}
           onReopenPool={
             onReopenPool
@@ -2169,6 +2562,8 @@ interface CexPricePayload {
   pairLabel: string;
   token0CexSymbol: string;
   token1CexSymbol: string;
+  token0Price?: number;
+  token1Price?: number;
   quote: string;
   dexRate: number;
   cexRate: number;

@@ -171,6 +171,12 @@ export interface PositionRewardEstimate {
   inRange: boolean;
   /** 仓位当前折算美元本金 */
   positionUsd: number;
+  symbol0?: string;
+  symbol1?: string;
+  amount0Human?: number;
+  amount1Human?: number;
+  amount0Usd?: number;
+  amount1Usd?: number;
   /** 在池内已质押活跃流动性（in-range L）中的占比 0~1 */
   activeLShare: number;
   /** 在池内已质押 Token0 中的占比 0~1 */
@@ -179,6 +185,9 @@ export interface PositionRewardEstimate {
   token1Share: number;
   /** 综合 Merkl 奖励权重占比 0~1 (50% L + 25% T0 + 25% T1) */
   rewardShare: number;
+  dailyActiveLUsd?: number;
+  dailyToken0Usd?: number;
+  dailyToken1Usd?: number;
   /** 所在池子每日总发放 W0G */
   poolDailyW0g: number;
   /** 所在池子每小时总发放 W0G */
@@ -199,6 +208,11 @@ export interface PositionRewardEstimate {
   potentialDailyUsd: number;
   /** 若当前已越界，回到区间内时的潜在 APR% */
   potentialAprPct: number;
+  /** 越界重开磨损回本测算字段 */
+  rebalanceSwapUsd?: number;
+  rebalanceFeeUsd?: number;
+  hourlyGainUsd?: number;
+  breakevenHours?: number | null;
 }
 
 /** 单个激励池的实时竞争格局与 $1,000 单格收益测算 */
@@ -208,6 +222,14 @@ export interface PoolRewardRadarItem {
   chainIdRef: number;
   pool: string;
   vault: string;
+  token0?: string;
+  token1?: string;
+  symbol0?: string;
+  symbol1?: string;
+  decimals0?: number;
+  decimals1?: number;
+  token0PriceUsd?: number;
+  token1PriceUsd?: number;
   fee: number;
   tickSpacing: number;
   currentTick: number;
@@ -225,6 +247,16 @@ export interface PoolRewardRadarItem {
   hourlyW0g: number;
   /** 池子每日奖励折合 USD */
   dailyRewardUsd: number;
+  dailyActiveLUsd?: number;
+  dailyToken0Usd?: number;
+  dailyToken1Usd?: number;
+  totalActiveL?: string;
+  stakedToken0Human?: number;
+  stakedToken1Human?: number;
+  stakedToken0Usd?: number;
+  stakedToken1Usd?: number;
+  token0BucketAprPct?: number;
+  token1BucketAprPct?: number;
   /** 已质押总 TVL (USD) */
   stakedTvlUsd: number;
   /** 池内窄区间（≤ 4 个 tickSpacing）在位竞争资金 (USD) —— 真正与你抢 50% 活跃 L 奖池的对手盘 */
@@ -697,6 +729,7 @@ export async function scanMerklRewardsAndApr(opts?: {
           const poolDailyW0g = epoch.totalDailyW0g * poolDef.budgetWeight;
           const poolHourlyW0g = poolDailyW0g / 24;
           const dailyRewardUsd = poolDailyW0g * w0gPriceUsd;
+          const poolFeeRate = (poolDef.fee || 3000) / 1_000_000;
 
           // 为该池内所有已质押 NFT 计算单仓实时奖励（并写入 positionsResult）
           for (const nft of parsedNfts) {
@@ -719,6 +752,10 @@ export async function scanMerklRewardsAndApr(opts?: {
             const hourlyUsd = hourlyW0g * w0gPriceUsd;
             const aprPct = nft.usd > 0 ? ((dailyUsd * 365) / nft.usd) * 100 : 0;
 
+            const dailyActiveLUsd = dailyRewardUsd * WEIGHT_ACTIVE_L * activeLShare;
+            const dailyToken0Usd = dailyRewardUsd * WEIGHT_TOKEN0 * token0Share;
+            const dailyToken1Usd = dailyRewardUsd * WEIGHT_TOKEN1 * token1Share;
+
             // 若当前已越界，计算若将其平移回当前同等宽度区间可拿到的潜在收益
             const potentialActiveLShare =
               nft.inRange
@@ -732,8 +769,18 @@ export async function scanMerklRewardsAndApr(opts?: {
               WEIGHT_TOKEN1 * token1Share;
             const potentialDailyW0g = poolDailyW0g * potentialRewardShare;
             const potentialDailyUsd = potentialDailyW0g * w0gPriceUsd;
+            const potentialHourlyUsd = potentialDailyUsd / 24;
             const potentialAprPct =
               nft.usd > 0 ? ((potentialDailyUsd * 365) / nft.usd) * 100 : 0;
+
+            // 越界重开磨损回本测算：越界时 100% 单边持仓，重开居中需换币约 50% 本金，承担池子手续费
+            const rebalanceSwapUsd = nft.inRange ? 0 : nft.usd * 0.5;
+            const rebalanceFeeUsd = rebalanceSwapUsd * poolFeeRate;
+            const hourlyGainUsd = Math.max(0, potentialHourlyUsd - hourlyUsd);
+            const breakevenHours =
+              !nft.inRange && hourlyGainUsd > 0.0001
+                ? rebalanceFeeUsd / hourlyGainUsd
+                : null;
 
             const est: PositionRewardEstimate = {
               positionId: userPos?.id,
@@ -743,10 +790,19 @@ export async function scanMerklRewardsAndApr(opts?: {
               pairLabel: poolDef.pairLabel,
               inRange: nft.inRange,
               positionUsd: nft.usd,
+              symbol0: poolDef.symbol0,
+              symbol1: poolDef.symbol1,
+              amount0Human: nft.amt0,
+              amount1Human: nft.amt1,
+              amount0Usd: nft.amt0 * p0Usd,
+              amount1Usd: nft.amt1 * p1Usd,
               activeLShare,
               token0Share,
               token1Share,
               rewardShare,
+              dailyActiveLUsd,
+              dailyToken0Usd,
+              dailyToken1Usd,
               poolDailyW0g,
               poolHourlyW0g,
               hourlyW0g,
@@ -757,6 +813,10 @@ export async function scanMerklRewardsAndApr(opts?: {
               potentialDailyW0g,
               potentialDailyUsd,
               potentialAprPct,
+              rebalanceSwapUsd,
+              rebalanceFeeUsd,
+              hourlyGainUsd,
+              breakevenHours,
             };
 
             positionsResult[tidStr] = est;
@@ -800,12 +860,30 @@ export async function scanMerklRewardsAndApr(opts?: {
           const sim1000HourlyUsd = sim1000HourlyW0g * w0gPriceUsd;
           const sim1000AprPct = ((sim1000DailyUsd * 365) / 1000) * 100;
 
+          const stakedToken0Usd = totalAmt0 * p0Usd;
+          const stakedToken1Usd = totalAmt1 * p1Usd;
+          const dailyActiveLPoolUsd = dailyRewardUsd * WEIGHT_ACTIVE_L;
+          const dailyToken0PoolUsd = dailyRewardUsd * WEIGHT_TOKEN0;
+          const dailyToken1PoolUsd = dailyRewardUsd * WEIGHT_TOKEN1;
+          const token0BucketAprPct =
+            stakedToken0Usd > 0 ? ((dailyToken0PoolUsd * 365) / stakedToken0Usd) * 100 : 0;
+          const token1BucketAprPct =
+            stakedToken1Usd > 0 ? ((dailyToken1PoolUsd * 365) / stakedToken1Usd) * 100 : 0;
+
           poolsRadar.push({
             key: poolDef.key,
             pairLabel: poolDef.pairLabel,
             chainIdRef: ogChain.id,
             pool: poolDef.pool,
             vault: poolDef.vault,
+            token0: poolDef.token0,
+            token1: poolDef.token1,
+            symbol0: poolDef.symbol0,
+            symbol1: poolDef.symbol1,
+            decimals0: poolDef.decimals0,
+            decimals1: poolDef.decimals1,
+            token0PriceUsd: p0Usd,
+            token1PriceUsd: p1Usd,
             fee: poolDef.fee,
             tickSpacing,
             currentTick,
@@ -817,6 +895,16 @@ export async function scanMerklRewardsAndApr(opts?: {
             dailyW0g: poolDailyW0g,
             hourlyW0g: poolHourlyW0g,
             dailyRewardUsd,
+            dailyActiveLUsd: dailyActiveLPoolUsd,
+            dailyToken0Usd: dailyToken0PoolUsd,
+            dailyToken1Usd: dailyToken1PoolUsd,
+            totalActiveL: totalActiveLiq.toString(),
+            stakedToken0Human: totalAmt0,
+            stakedToken1Human: totalAmt1,
+            stakedToken0Usd,
+            stakedToken1Usd,
+            token0BucketAprPct,
+            token1BucketAprPct,
             stakedTvlUsd,
             narrowStakedTvlUsd,
             narrowPositionCount,

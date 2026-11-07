@@ -17,24 +17,29 @@
  */
 import { getDb } from "../db";
 
-/** 币安 REST 域名。国内访问不稳时可在 .env.local 里覆盖。 */
-const BINANCE_HOST = process.env.BINANCE_HOST ?? "https://api.binance.com";
+/** 币安 REST 域名列表：优先使用官方无地域限制的纯行情加速节点 data-api.binance.vision（避免美区/云主机 HTTP 451），自动故障转移。 */
+const BINANCE_HOSTS = process.env.BINANCE_HOST
+  ? [process.env.BINANCE_HOST, "https://data-api.binance.vision", "https://api.binance.com"]
+  : ["https://data-api.binance.vision", "https://api.binance.com", "https://api1.binance.com"];
 
-/** 报价缓存的存活时间。扫描间隔通常 ≥1 分钟，缓存 30s 足够跨 token 复用又不过期。 */
-const CACHE_TTL_MS = 30_000;
+let _preferredHostIdx = 0;
+let _lastLatencyMs = 0;
+let _lastHostUsed = BINANCE_HOSTS[0];
+
+/** 报价缓存的存活时间。常规后台扫描缓存 15s；实时行情接口传 skipCache=true 或短缓存。 */
+const CACHE_TTL_MS = 15_000;
 
 /** 一条 token→CEX 报价的映射记录（对应 token_symbols 表）。 */
 export interface CexMapping {
   chainIdRef: number;
   tokenAddr: string; // 小写
+  tokenSymbol?: string; // 链上代币符号，如 'W0G' / 'USDC.e'
   cexSymbol: string; // 大写，如 '0GUSDT'。固定价时此字段仅用于展示，不查币安
   /** 固定价。非 null 时走固定价（如 USDC.e=1），不再查币安接口 */
   fixedPrice: number | null;
   /** 计价币种，如 'USDT'/'USDC'。固定价时必填；走币安时从 cex_symbol 推导（留空则自动切分） */
   quote: string;
-  /** 翻转：true 时对币安报价取倒数并交换 base/quote。
-   *  典型场景：币安只有 USDCUSDT（1 USDC = x USDT），而链上 token 是 USDT，
-   *  配 USDCUSDT 并翻转 → 1 USDT = 1/x USDC。 */
+  /** 翻转：true 时对币安报价取倒数并交换 base/quote。 */
   inverted: boolean;
 }
 
@@ -46,13 +51,14 @@ export interface CexQuote {
   quote: string;
   /** base 币种符号，如 '0G' / 'ETH' / 'WBTC' */
   base: string;
+  /** 24 小时涨跌幅百分比（如 -1.24 表示 -1.24%），可选 */
+  change24hPct?: number;
 }
 
 // ===== 进程内缓存：symbol → { quote, ts } =====
 const _priceCache = new Map<string, { quote: CexQuote; ts: number }>();
+const _change24hCache = new Map<string, { pct: number; ts: number }>();
 
-// 已知币安计价币种（用于把 '0GUSDT' 切成 base='0G' / quote='USDT'）。
-// 顺序无所谓，但优先匹配长的（如 USDC 优先于 USD —— 币安现货基本无 USD 计价，留作兜底）。
 const KNOWN_QUOTES = ["USDT", "USDC", "FDUSD", "TUSD", "BUSD", "BTC", "ETH", "BNB", "EUR", "TRY", "BRL"];
 
 /** 把 '0GUSDT' 切成 { base:'0G', quote:'USDT' }。切不出（无已知计价币种）时 quote 留空。 */
@@ -68,19 +74,18 @@ export function splitSymbol(symbol: string): { base: string; quote: string } {
 
 /**
  * 加载所有启用的 token→CEX 映射（按链分组返回，方便扫描时按 wallet.chain_id_ref 取）。
- * key = chainIdRef，value = 该链上 token_addr(小写) → CexMapping 列表。
- * 固定价（fixedPrice 非空）的映射也会加载，扫描时直接用固定价不查币安。
  */
 export function loadAllMappings(): Map<number, CexMapping[]> {
   const db = getDb();
   const rows = db
     .prepare(
-      `SELECT chain_id_ref, token_addr, cex_symbol, fixed_price, quote, inverted
+      `SELECT chain_id_ref, token_addr, token_symbol, cex_symbol, fixed_price, quote, inverted
        FROM token_symbols WHERE enabled=1`
     )
     .all() as {
       chain_id_ref: number;
       token_addr: string;
+      token_symbol?: string;
       cex_symbol: string;
       fixed_price: number | null;
       quote: string;
@@ -92,7 +97,8 @@ export function loadAllMappings(): Map<number, CexMapping[]> {
     arr.push({
       chainIdRef: r.chain_id_ref,
       tokenAddr: r.token_addr.toLowerCase(),
-      cexSymbol: r.cex_symbol.toUpperCase(),
+      tokenSymbol: r.token_symbol || "",
+      cexSymbol: (r.cex_symbol || "").toUpperCase(),
       fixedPrice: r.fixed_price !== null ? r.fixed_price : null,
       quote: (r.quote || "").toUpperCase(),
       inverted: r.inverted === 1,
@@ -103,15 +109,37 @@ export function loadAllMappings(): Map<number, CexMapping[]> {
 }
 
 /**
- * 批量获取多个币安 symbol 的当前报价（去重 + 进程内缓存 + 单次 REST）。
- *
- * @param symbols 大写 symbol 数组，如 ['0GUSDT','WETHUSDT','WETHUSDT']（重复会被去重）
- * @param skipCache 为 true 时跳过缓存，强制从币安拉最新价（资产统计等需要实时价格的场景用）
- * @returns symbol → CexQuote。拉取失败的 symbol 不会出现在结果里。
+ * 内部辅助：带多节点自动故障转移的币安请求
+ */
+async function fetchFromBinanceHosts(pathAndQuery: string, timeoutMs = 3500): Promise<any | null> {
+  for (let attempt = 0; attempt < BINANCE_HOSTS.length; attempt++) {
+    const idx = (_preferredHostIdx + attempt) % BINANCE_HOSTS.length;
+    const host = BINANCE_HOSTS[idx];
+    const t0 = Date.now();
+    try {
+      const resp = await fetch(`${host}${pathAndQuery}`, {
+        headers: { Accept: "application/json" },
+        cache: "no-store",
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+      if (!resp.ok) continue;
+      const data = await resp.json();
+      _preferredHostIdx = idx;
+      _lastLatencyMs = Date.now() - t0;
+      _lastHostUsed = host;
+      return data;
+    } catch {
+      // 切下一个备用域名
+    }
+  }
+  return null;
+}
+
+/**
+ * 批量获取多个币安 symbol 的当前报价（去重 + 进程内缓存 + 单次 REST + 自动节点切换）。
  */
 export async function fetchQuotes(symbols: string[], skipCache = false): Promise<Map<string, CexQuote>> {
   const out = new Map<string, CexQuote>();
-  // 去重 + 大写
   const uniq = [...new Set(symbols.map((s) => s.toUpperCase()))].filter(Boolean);
   if (uniq.length === 0) return out;
 
@@ -131,35 +159,46 @@ export async function fetchQuotes(symbols: string[], skipCache = false): Promise
   }
   if (todo.length === 0) return out;
 
-  // 币安 /api/v3/ticker/price 支持 symbols=[...] 数组查询（URL 里是方括号包裹的 JSON 字符串数组）。
-  // 一次请求拿回多个 symbol 的最新成交价。失败则整体降级（逐个重试成本高，直接放弃本次报价）。
-  //
-  // 重要：必须显式 cache:'no-store'。Next.js 14 服务端 fetch 默认是 force-cache，
-  // 会把币安响应缓存进 Data Cache，导致即便跳过了进程内 _priceCache（skipCache=true），
-  // 拿到的仍是上一次币安请求的缓存响应——资产统计会显示过期报价。
-  // 进程内 _priceCache 已做 30s 跨 token 复用，HTTP 层不需要再缓存。
   try {
     const symbolsParam = encodeURIComponent(JSON.stringify(todo));
-    const url = `${BINANCE_HOST}/api/v3/ticker/price?symbols=${symbolsParam}`;
-    const resp = await fetch(url, { headers: { Accept: "application/json" }, cache: "no-store" });
-    if (!resp.ok) throw new Error(`binance status ${resp.status}`);
-    const data = (await resp.json()) as Array<{ symbol: string; price: string }>;
-    for (const item of data) {
-      const price = Number(item.price);
-      if (!Number.isFinite(price) || price <= 0) continue;
-      const { base, quote } = splitSymbol(item.symbol);
-      const q: CexQuote = { symbol: item.symbol.toUpperCase(), price, base, quote };
-      out.set(q.symbol, q);
-      _priceCache.set(q.symbol, { quote: q, ts: now });
+    const data = (await fetchFromBinanceHosts(`/api/v3/ticker/price?symbols=${symbolsParam}`)) as Array<{
+      symbol: string;
+      price: string;
+    }> | null;
+    if (Array.isArray(data)) {
+      for (const item of data) {
+        const price = Number(item.price);
+        if (!Number.isFinite(price) || price <= 0) continue;
+        const { base, quote } = splitSymbol(item.symbol);
+        const chg = _change24hCache.get(item.symbol.toUpperCase())?.pct;
+        const q: CexQuote = {
+          symbol: item.symbol.toUpperCase(),
+          price,
+          base,
+          quote,
+          ...(chg !== undefined ? { change24hPct: chg } : {}),
+        };
+        out.set(q.symbol, q);
+        _priceCache.set(q.symbol, { quote: q, ts: now });
+      }
+    } else {
+      // 若整批缓存过期但本次网络抖动，降级返回旧缓存值避免前端闪烁空白
+      for (const s of todo) {
+        const stale = _priceCache.get(s);
+        if (stale) out.set(s, stale.quote);
+      }
     }
   } catch {
-    // 整批失败：保持缓存不动，本次没拿到的 symbol 在 out 里就不存在，调用方降级跳过。
+    for (const s of todo) {
+      const stale = _priceCache.get(s);
+      if (stale) out.set(s, stale.quote);
+    }
   }
 
   return out;
 }
 
-/** 单 symbol 快捷取价（带缓存）。扫描器内部一般用 fetchQuotes 批量，此函数便于复用/调试。 */
+/** 单 symbol 快捷取价（带缓存）。 */
 export async function fetchQuote(symbol: string): Promise<CexQuote | null> {
   const m = await fetchQuotes([symbol]);
   return m.get(symbol.toUpperCase()) ?? null;
@@ -167,33 +206,28 @@ export async function fetchQuote(symbol: string): Promise<CexQuote | null> {
 
 /**
  * 按一条链的映射构造 token_addr(小写) → CexQuote。
- * 固定价映射（fixedPrice 非空）直接构造报价，不查币安；币安映射批量去拉。
- * 翻转映射（inverted=true）对拉到的报价取倒数并交换 base/quote：
- *   原报价 1 USDC = 1.0001 USDT → 翻转后 1 USDT = 0.9999 USDC
- * 用于扫描器：一次性拿到本链所有 token 的报价，无需区分固定/币安/翻转来源。
- *
- * @param skipCache 为 true 时跳过币安报价的进程内缓存，强制拉最新价。
- *                  资产统计等需要实时价格的场景应传 true，避免展示 30s 内的过期价。
+ * 修复：当固定价映射（如 USDC.e fixedPrice=1）未填 cexSymbol 时，自动回退为 quote 或 tokenSymbol（如 'USDC'），
+ * 彻底解决前端出现 `(0GUSDC/)` 残缺括号及仓位卡片漏显示 `CEX 汇率` 行的问题。
  */
 export async function buildQuotesByAddr(mappings: CexMapping[], skipCache = false): Promise<Map<string, CexQuote>> {
   const out = new Map<string, CexQuote>();
-  // 1) 固定价：直接构造，base 取 token_symbol（映射里没存，用 cex_symbol 切分兜底），quote 用 quote 字段
   const binanceSymbols = new Set<string>();
   for (const m of mappings) {
     if (m.fixedPrice !== null && Number.isFinite(m.fixedPrice) && m.fixedPrice > 0) {
-      const { base } = splitSymbol(m.cexSymbol);
+      const fallbackSym = m.cexSymbol || m.quote || m.tokenSymbol || "USDC";
+      const { base } = splitSymbol(fallbackSym);
       const q: CexQuote = {
-        symbol: m.cexSymbol, // 展示用
+        symbol: fallbackSym,
         price: m.fixedPrice,
-        base,
+        base: base || m.tokenSymbol || "USDC",
         quote: m.quote || "USD",
+        change24hPct: 0,
       };
       out.set(m.tokenAddr, q);
     } else {
       if (m.cexSymbol) binanceSymbols.add(m.cexSymbol);
     }
   }
-  // 2) 币安映射：批量拉价，回填到 byAddr（翻转的取倒数）
   if (binanceSymbols.size > 0) {
     const fresh = await fetchQuotes([...binanceSymbols], skipCache);
     for (const m of mappings) {
@@ -201,12 +235,12 @@ export async function buildQuotesByAddr(mappings: CexMapping[], skipCache = fals
       const q = fresh.get(m.cexSymbol);
       if (!q) continue;
       if (m.inverted) {
-        // 翻转：原 1 base = price quote → 1 quote = 1/price base
         out.set(m.tokenAddr, {
           symbol: q.symbol,
           price: 1 / q.price,
           base: q.quote,
           quote: q.base,
+          ...(q.change24hPct !== undefined ? { change24hPct: -q.change24hPct } : {}),
         });
       } else {
         out.set(m.tokenAddr, q);
@@ -216,7 +250,98 @@ export async function buildQuotesByAddr(mappings: CexMapping[], skipCache = fals
   return out;
 }
 
+/**
+ * 获取全局实时 CEX 快照（含 24h 涨跌幅、各链 tokenAddr 报价映射、REST 延迟统计），
+ * 供前端顶栏实时行情条首屏渲染及 WebSocket 断线兜底使用。
+ */
+let _lastSnapshotTs = 0;
+let _lastSnapshotData: any = null;
+
+export async function getLiveCexSnapshot(force = false) {
+  const now = Date.now();
+  if (!force && _lastSnapshotData && now - _lastSnapshotTs < 2_000) {
+    return _lastSnapshotData;
+  }
+
+  const allByChain = loadAllMappings();
+  const mappingsList: CexMapping[] = [];
+  const symbolsSet = new Set<string>(["0GUSDT", "ETHUSDT", "BTCUSDT", "SOLUSDT", "LINKUSDT"]);
+  for (const [, arr] of allByChain) {
+    for (const m of arr) {
+      mappingsList.push(m);
+      if (m.fixedPrice === null && m.cexSymbol) {
+        symbolsSet.add(m.cexSymbol.toUpperCase());
+      }
+    }
+  }
+
+  const symbols = [...symbolsSet];
+  // 若距离上次 24hr 涨跌幅拉取已满 15s，则用 /api/v3/ticker/24hr?symbols=[...] 同时更新最新价与 24h 涨跌幅
+  const need24hr = symbols.some((s) => {
+    const c = _change24hCache.get(s);
+    return !c || now - c.ts > 15_000;
+  });
+
+  if (need24hr && symbols.length > 0) {
+    const param = encodeURIComponent(JSON.stringify(symbols));
+    const data24 = (await fetchFromBinanceHosts(
+      `/api/v3/ticker/24hr?symbols=${param}&type=MINI`,
+      3500
+    )) as Array<{
+      symbol: string;
+      lastPrice: string;
+      openPrice: string;
+    }> | null;
+    if (Array.isArray(data24)) {
+      for (const item of data24) {
+        const sym = item.symbol.toUpperCase();
+        const close = Number(item.lastPrice);
+        const open = Number(item.openPrice);
+        if (!Number.isFinite(close) || close <= 0) continue;
+        const pct = open > 0 ? ((close - open) / open) * 100 : 0;
+        _change24hCache.set(sym, { pct, ts: now });
+        const { base, quote } = splitSymbol(sym);
+        const q: CexQuote = { symbol: sym, price: close, base, quote, change24hPct: pct };
+        _priceCache.set(sym, { quote: q, ts: now });
+      }
+    } else {
+      await fetchQuotes(symbols, true);
+    }
+  } else {
+    await fetchQuotes(symbols, true);
+  }
+
+  const quotesBySymbol: Record<string, CexQuote> = {};
+  for (const s of symbols) {
+    const hit = _priceCache.get(s);
+    if (hit) quotesBySymbol[s] = hit.quote;
+  }
+
+  const quotesByChainAddr: Record<string, CexQuote> = {};
+  for (const [chainId, arr] of allByChain) {
+    const byAddr = await buildQuotesByAddr(arr, false);
+    for (const [addr, q] of byAddr) {
+      quotesByChainAddr[`${chainId}:${addr.toLowerCase()}`] = q;
+      quotesByChainAddr[addr.toLowerCase()] = q;
+    }
+  }
+
+  _lastSnapshotTs = now;
+  _lastSnapshotData = {
+    updatedAt: new Date(now).toISOString(),
+    latencyMs: _lastLatencyMs,
+    host: _lastHostUsed,
+    quotesBySymbol,
+    quotesByChainAddr,
+    mappings: mappingsList,
+  };
+  return _lastSnapshotData;
+}
+
 /** 清空报价缓存（配置变更/测试时调用）。 */
 export function invalidateQuoteCache() {
   _priceCache.clear();
+  _change24hCache.clear();
+  _lastSnapshotData = null;
 }
+

@@ -8,9 +8,10 @@ import { getDb, isPairFlipped } from "../db";
 import { listChains, getClient } from "../chains";
 import type { PublicClient } from "viem";
 import { resolveTokens } from "../chains/tokens";
-import { listDexes } from "../chains/dexes";
+import { listDexes, listStaking } from "../chains/dexes";
 import { getAdapter } from "../adapters";
 import { batchReadPoolTicks, primePoolAddressCache } from "../adapters/v3-fork";
+import { findZiaVaultStakedPositions } from "../staking/discover";
 import { isCexPriceEnabled, getTickMoveThreshold, isTickMoveEnabled } from "../db/settings";
 import { notifyAll } from "../notify";
 import { shouldPush, recordPush } from "../notify/dedup";
@@ -150,11 +151,47 @@ async function processChainPositions(chain: any, positions: any[], chainIdRef: n
     }
     const client = chainClient.client;
     
-    // 获取DEX信息
+    // 获取DEX信息与质押合约信息
     const dexes = listDexes().filter(d => d.chain_id_ref === chain.id);
     if (dexes.length === 0) {
       console.error(`[scanner-known] 链 ${chain.key} 没有配置DEX`);
       return;
+    }
+    const stakingList = listStaking(chainIdRef, true);
+
+    // 自愈同步：通过 ZiaVault 1-RPC 极速检查已知仓位是否已被质押（解决一键质押后仍显示持仓钱包的延迟问题）
+    if (stakingList.length > 0) {
+      const uniqueWallets = Array.from(
+        new Set(positions.map(p => String(p.wallet_address || "").toLowerCase()).filter(w => /^0x[a-f0-9]{40}$/.test(w)))
+      ) as `0x${string}`[];
+      if (uniqueWallets.length > 0) {
+        try {
+          const stakedByWallet = await findZiaVaultStakedPositions(client, uniqueWallets, dexes, stakingList);
+          const stakedByTokenId = new Map<string, { stakerContract?: string; stakingId?: number }>();
+          for (const [, list] of stakedByWallet) {
+            for (const dp of list) {
+              stakedByTokenId.set(String(dp.tokenId), {
+                stakerContract: dp.stakerContract,
+                stakingId: dp.stakingId,
+              });
+            }
+          }
+          for (const pos of positions) {
+            const stInfo = stakedByTokenId.get(String(pos.token_id));
+            if (stInfo && (pos.source !== "staking" || (stInfo.stakerContract && pos.staker_contract !== stInfo.stakerContract))) {
+              pos.source = "staking";
+              pos.staker_contract = stInfo.stakerContract ?? pos.staker_contract;
+              pos.staking_id = stInfo.stakingId ?? pos.staking_id;
+              db.prepare(
+                `UPDATE positions SET source='staking', staker_contract=?, staking_id=? WHERE id=?`
+              ).run(pos.staker_contract ?? null, pos.staking_id ?? null, pos.id);
+              console.log(`[scanner-known] 自愈同步质押状态: #${pos.token_id} -> staking @ ${pos.staker_contract}`);
+            }
+          }
+        } catch (e) {
+          console.warn(`[scanner-known] ZiaVault 质押自愈检查失败:`, (e as Error).message);
+        }
+      }
     }
     
     // 解析代币信息

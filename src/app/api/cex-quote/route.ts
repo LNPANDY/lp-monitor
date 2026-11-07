@@ -1,19 +1,20 @@
 import { ok, fail } from "@/lib/api";
-import { fetchQuote, splitSymbol } from "@/lib/cex/binance";
+import { fetchQuote, splitSymbol, getLiveCexSnapshot } from "@/lib/cex/binance";
 
 export const dynamic = "force-dynamic";
 
 /**
- * GET: 实时拉取某个币安交易对的最新报价（配置页「测试报价」按钮用）。
- *   ?symbol=0GUSDT
- *
- * 返回：{ symbol, price, base, quote }
- * 失败（symbol 不存在 / 币安不可达）返回 400 + 错误信息。
+ * GET:
+ *   1) ?all=1（或无 symbol 参数）：返回全局币安实时报价快照（含 24h 涨跌幅、tokenAddr 映射、延迟 ms），供顶栏与双指针雷达使用。
+ *   2) ?symbol=0GUSDT：拉取单个币安交易对报价（配置页「测试报价」按钮用）。
  */
 export async function GET(req: Request) {
   const url = new URL(req.url);
   const raw = (url.searchParams.get("symbol") ?? "").trim().toUpperCase();
-  if (!raw) return fail("缺少 symbol 参数");
+  if (!raw || url.searchParams.get("all") === "1") {
+    const snap = await getLiveCexSnapshot(url.searchParams.get("force") === "1");
+    return ok(snap);
+  }
   if (!/^[A-Z0-9]{2,20}$/.test(raw)) return fail("symbol 格式非法（应为如 0GUSDT 的大写字母数字）");
 
   const q = await fetchQuote(raw);
@@ -23,3 +24,4 @@ export async function GET(req: Request) {
   const { base, quote } = splitSymbol(q.symbol);
   return ok({ symbol: q.symbol, price: q.price, base, quote });
 }
+
