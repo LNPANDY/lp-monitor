@@ -56,6 +56,8 @@ interface Position {
   notify_state: string;
   source: string;
   staker_contract: string;
+  available_staker_contract?: string;
+  available_staker_label?: string;
   chain_id_ref: number;
   chain_name: string;
   chain_key: string;
@@ -311,7 +313,7 @@ export default function DashboardPage() {
 
       {/* 底部版本号 */}
       <div className="text-center text-xs text-ink-muted">
-        LP Monitor v{process.env.NEXT_PUBLIC_VERSION || "0.19.7"}
+        LP Monitor v{process.env.NEXT_PUBLIC_VERSION || "0.19.8"}
       </div>
     </div>
   );

@@ -22,7 +22,7 @@ import { buildQuotesByAddr } from "@/lib/cex/binance";
 
 export const dynamic = "force-dynamic";
 
-/** QuoterV1.quoteExactInputSingle：5 个平铺参数，返回仅 amountOut */
+/** QuoterV1：quoteExactInputSingle / quoteExactOutputSingle 平铺参数 */
 const QUOTER_V1_ABI = [
   {
     name: "quoteExactInputSingle",
@@ -37,9 +37,22 @@ const QUOTER_V1_ABI = [
     ],
     outputs: [{ name: "amountOut", type: "uint256" }],
   },
+  {
+    name: "quoteExactOutputSingle",
+    type: "function",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "tokenIn", type: "address" },
+      { name: "tokenOut", type: "address" },
+      { name: "fee", type: "uint24" },
+      { name: "amountOut", type: "uint256" },
+      { name: "sqrtPriceLimitX96", type: "uint160" },
+    ],
+    outputs: [{ name: "amountIn", type: "uint256" }],
+  },
 ] as const;
 
-/** QuoterV2.quoteExactInputSingle：struct 参数，返回 amountOut + sqrtPriceAfter 等 */
+/** QuoterV2：quoteExactInputSingle / quoteExactOutputSingle struct 参数 */
 const QUOTER_V2_ABI = [
   {
     name: "quoteExactInputSingle",
@@ -60,6 +73,30 @@ const QUOTER_V2_ABI = [
     ],
     outputs: [
       { name: "amountOut", type: "uint256" },
+      { name: "sqrtPriceX96After", type: "uint160" },
+      { name: "initializedTicksCrossed", type: "uint32" },
+      { name: "gasEstimate", type: "uint256" },
+    ],
+  },
+  {
+    name: "quoteExactOutputSingle",
+    type: "function",
+    stateMutability: "nonpayable",
+    inputs: [
+      {
+        name: "params",
+        type: "tuple",
+        components: [
+          { name: "tokenIn", type: "address" },
+          { name: "tokenOut", type: "address" },
+          { name: "amount", type: "uint256" },
+          { name: "fee", type: "uint24" },
+          { name: "sqrtPriceLimitX96", type: "uint160" },
+        ],
+      },
+    ],
+    outputs: [
+      { name: "amountIn", type: "uint256" },
       { name: "sqrtPriceX96After", type: "uint160" },
       { name: "initializedTicksCrossed", type: "uint32" },
       { name: "gasEstimate", type: "uint256" },
@@ -273,31 +310,15 @@ export async function POST(req: Request) {
 
     let targetOutRaw = 0n;
     let amountIn = 0n;
-    let preFetchedSlot0: readonly [bigint, number, number, number] | null = null;
     if (b.target_out) {
       targetOutRaw = parseHumanAmount(b.target_out, decOut);
       if (targetOutRaw <= 0n) return fail("target_out 须为正数");
-      preFetchedSlot0 = (await client.readContract({
-        address: pool as `0x${string}`,
-        abi: POOL_SLOT0_ABI,
-        functionName: "slot0",
-      })) as readonly [bigint, number, number, number];
-      const poolSortedSpot =
-        (Number(preFetchedSlot0[0]) ** 2 / Number(1n << 96n) ** 2) *
-        Math.pow(10, dec0 - dec1);
-      const inIsToken0 = inMeta.addr.toLowerCase() === poolToken0;
-      const spot = inIsToken0 ? poolSortedSpot : 1 / poolSortedSpot;
-      if (spot <= 0 || !Number.isFinite(spot)) return fail("读取池子价格失败");
-      amountIn = parseHumanAmount(
-        (Number(targetOutRaw) / Number(10n ** BigInt(decOut)) / spot).toPrecision(15),
-        decIn
-      );
     } else {
       amountIn = parseHumanAmount(b.amount_in ?? "0", decIn);
+      if (amountIn <= 0n) return fail("金额须为正数");
     }
-    if (amountIn <= 0n) return fail("金额须为正数");
 
-    // 5. 单次并行 RTT：Quoter 报价 + Pool slot0 +（可选）钱包余额与 Router 授权额度
+    // 5. 单次并行 RTT：Quoter 报价（正向 quoteExactInputSingle / 反向 quoteExactOutputSingle）+ Pool slot0 + 钱包状态
     const quoter = dexRow.quoter as `0x${string}`;
     const quoterKey = `${b.chain_id}:${quoter.toLowerCase()}`;
     const quoterVerCache = getQuoterVersionCache();
@@ -308,7 +329,7 @@ export async function POST(req: Request) {
     const inIsNativeToken = b.token_in_addr?.toLowerCase() === "__native__";
     const outIsNativeToken = b.token_out_addr?.toLowerCase() === "__native__";
 
-    const runQuoter = async (): Promise<{ amountOut: bigint; gasEstimate: bigint }> => {
+    const runExactInQuoter = async (inAmt: bigint): Promise<{ amountOut: bigint; gasEstimate: bigint }> => {
       if (knownVer === "v1") {
         const r1 = (await client.readContract({
           address: quoter,
@@ -317,7 +338,7 @@ export async function POST(req: Request) {
           args: [
             inMeta.addr as `0x${string}`,
             outMeta.addr as `0x${string}`,
-            amountIn,
+            inAmt,
             fee,
             0n,
           ],
@@ -333,7 +354,7 @@ export async function POST(req: Request) {
             {
               tokenIn: inMeta.addr as `0x${string}`,
               tokenOut: outMeta.addr as `0x${string}`,
-              amountIn,
+              amountIn: inAmt,
               fee,
               sqrtPriceLimitX96: 0n,
             },
@@ -350,7 +371,7 @@ export async function POST(req: Request) {
             args: [
               inMeta.addr as `0x${string}`,
               outMeta.addr as `0x${string}`,
-              amountIn,
+              inAmt,
               fee,
               0n,
             ],
@@ -361,6 +382,72 @@ export async function POST(req: Request) {
           throw new Error(
             `报价失败：QuoterV2 与 V1 签名均不匹配——${String(v1Err?.message ?? v1Err).slice(0, 120)}`
           );
+        }
+      }
+    };
+
+    /**
+     * 反向精确输出报价（用户在 TokenOut 输入目标数量如 0.1）：
+     * 直接调用链上 Quoter.quoteExactOutputSingle(targetOutRaw)，由池子合约一步精确反算包含手续费与价格滑点后的真实 amountIn，
+     * 不仅比旧版「先串行读 slot0 再调 Quoter」少 1 个 RTT（更快），而且钱包模拟出来的输出数量精确等于 0.1！
+     */
+    const runExactOutQuoter = async (
+      outAmt: bigint
+    ): Promise<{ amountIn: bigint; gasEstimate: bigint } | null> => {
+      if (knownVer === "v1") {
+        try {
+          const r1 = (await client.readContract({
+            address: quoter,
+            abi: QUOTER_V1_ABI,
+            functionName: "quoteExactOutputSingle",
+            args: [
+              inMeta.addr as `0x${string}`,
+              outMeta.addr as `0x${string}`,
+              fee,
+              outAmt,
+              0n,
+            ],
+          })) as bigint;
+          return { amountIn: r1, gasEstimate: 0n };
+        } catch {
+          return null;
+        }
+      }
+      try {
+        const result = (await client.readContract({
+          address: quoter,
+          abi: QUOTER_V2_ABI,
+          functionName: "quoteExactOutputSingle",
+          args: [
+            {
+              tokenIn: inMeta.addr as `0x${string}`,
+              tokenOut: outMeta.addr as `0x${string}`,
+              amount: outAmt,
+              fee,
+              sqrtPriceLimitX96: 0n,
+            },
+          ],
+        })) as readonly [bigint, bigint, number, bigint];
+        quoterVerCache.set(quoterKey, "v2");
+        return { amountIn: result[0], gasEstimate: result[3] };
+      } catch {
+        try {
+          const r1 = (await client.readContract({
+            address: quoter,
+            abi: QUOTER_V1_ABI,
+            functionName: "quoteExactOutputSingle",
+            args: [
+              inMeta.addr as `0x${string}`,
+              outMeta.addr as `0x${string}`,
+              fee,
+              outAmt,
+              0n,
+            ],
+          })) as bigint;
+          quoterVerCache.set(quoterKey, "v1");
+          return { amountIn: r1, gasEstimate: 0n };
+        } catch {
+          return null;
         }
       }
     };
@@ -380,17 +467,16 @@ export async function POST(req: Request) {
       }
     };
 
-    const [quoteRes, slot0Res, walletState] = await Promise.all([
-      runQuoter(),
-      preFetchedSlot0
-        ? Promise.resolve(preFetchedSlot0)
-        : (client
-            .readContract({
-              address: pool as `0x${string}`,
-              abi: POOL_SLOT0_ABI,
-              functionName: "slot0",
-            })
-            .catch(() => null) as Promise<readonly [bigint, number, number, number] | null>),
+    const [directQuoteRes, exactOutRes, slot0Res, walletState] = await Promise.all([
+      targetOutRaw > 0n ? Promise.resolve(null) : runExactInQuoter(amountIn),
+      targetOutRaw > 0n ? runExactOutQuoter(targetOutRaw) : Promise.resolve(null),
+      client
+        .readContract({
+          address: pool as `0x${string}`,
+          abi: POOL_SLOT0_ABI,
+          functionName: "slot0",
+        })
+        .catch(() => null) as Promise<readonly [bigint, number, number, number] | null>,
       walletAddr
         ? Promise.all([
             readBal(inMeta.addr, inIsNativeToken),
@@ -409,8 +495,46 @@ export async function POST(req: Request) {
         : Promise.resolve(null),
     ]);
 
-    const { amountOut, gasEstimate } = quoteRes;
-    if (amountOut <= 0n) {
+    let amountOut = 0n;
+    let gasEstimate = 0n;
+
+    if (targetOutRaw > 0n) {
+      if (exactOutRes && exactOutRes.amountIn > 0n) {
+        // 路径 A（最快 & 最准）：链上 quoteExactOutputSingle 直接返回精确 amountIn（加 1 wei 防止整除截断导致少 1 wei）
+        amountIn = exactOutRes.amountIn + 1n;
+        amountOut = targetOutRaw;
+        gasEstimate = exactOutRes.gasEstimate;
+      } else {
+        // 路径 B（兜底：若某自建 Quoter 未实现 quoteExactOutputSingle）：
+        // 用 slot0 + 池子手续费率补偿 (1e6 / (1e6 - fee)) 估算初值，调一次 quoteExactInputSingle 后按真实成交比例做精确线性修正
+        if (!slot0Res) return fail("读取池子价格失败");
+        const poolSortedSpot =
+          (Number(slot0Res[0]) ** 2 / Number(1n << 96n) ** 2) *
+          Math.pow(10, dec0 - dec1);
+        const inIsToken0 = inMeta.addr.toLowerCase() === poolToken0;
+        const spot = inIsToken0 ? poolSortedSpot : 1 / poolSortedSpot;
+        if (spot <= 0 || !Number.isFinite(spot)) return fail("读取池子价格失败");
+        const feeFactor = 1_000_000 / Math.max(1, 1_000_000 - fee);
+        const estIn = parseHumanAmount(
+          ((Number(targetOutRaw) / Number(10n ** BigInt(decOut)) / spot) * feeFactor).toPrecision(15),
+          decIn
+        );
+        if (estIn <= 0n) return fail("估算输入金额失败");
+        const q1 = await runExactInQuoter(estIn);
+        if (q1.amountOut <= 0n) {
+          return fail("报价结果为 0：池子流动性可能不足以完成这笔兑换", 422);
+        }
+        // 按实测成交率反推精确 amountIn（将价格冲击与手续费一并校准到位）
+        amountIn = (estIn * targetOutRaw + q1.amountOut - 1n) / q1.amountOut + 1n;
+        amountOut = targetOutRaw;
+        gasEstimate = q1.gasEstimate;
+      }
+    } else if (directQuoteRes) {
+      amountOut = directQuoteRes.amountOut;
+      gasEstimate = directQuoteRes.gasEstimate;
+    }
+
+    if (amountOut <= 0n || amountIn <= 0n) {
       return fail("报价结果为 0：池子流动性可能不足以完成这笔兑换", 422);
     }
 

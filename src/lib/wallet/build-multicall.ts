@@ -127,6 +127,81 @@ export function buildWithdrawCalldata(tokenId: bigint): string {
   });
 }
 
+/** 构造追加流动性的 increaseLiquidity calldata（保持原区间与 tokenId 不变） */
+export function buildIncreaseLiquidityCalldata(
+  npm: string,
+  params: {
+    tokenId: bigint;
+    amount0Desired: bigint;
+    amount1Desired: bigint;
+    slippagePct?: number;
+  }
+): { to: string; data: string } {
+  const deadline = BigInt(Math.floor(Date.now() / 1000) + 1800);
+  const slip = BigInt(Math.floor((params.slippagePct ?? 0.5) * 100));
+  const amount0Min = (params.amount0Desired * (10000n - slip)) / 10000n;
+  const amount1Min = (params.amount1Desired * (10000n - slip)) / 10000n;
+  const data = encodeFunctionData({
+    abi: NPM_WRITE_ABI,
+    functionName: "increaseLiquidity",
+    args: [
+      {
+        tokenId: params.tokenId,
+        amount0Desired: params.amount0Desired,
+        amount1Desired: params.amount1Desired,
+        amount0Min,
+        amount1Min,
+        deadline,
+      },
+    ],
+  });
+  return { to: npm, data };
+}
+
+/**
+ * 构造「部分减仓 + 提取本金与手续费（不销毁 NFT）」的 multicall calldata
+ * 适用于支持 multicall 的标准 V3 DEX。
+ */
+export function buildPartialDecreaseMulticallCalldata(
+  npm: string,
+  tokenId: bigint,
+  deltaLiquidity: bigint,
+  recipient: string
+): { to: string; data: string } {
+  const deadline = BigInt(Math.floor(Date.now() / 1000) + 3600);
+  const decreaseData = encodeFunctionData({
+    abi: NPM_WRITE_ABI,
+    functionName: "decreaseLiquidity",
+    args: [
+      {
+        tokenId,
+        liquidity: deltaLiquidity,
+        amount0Min: 0n,
+        amount1Min: 0n,
+        deadline,
+      },
+    ],
+  });
+  const collectData = encodeFunctionData({
+    abi: NPM_WRITE_ABI,
+    functionName: "collect",
+    args: [
+      {
+        tokenId,
+        recipient: recipient as `0x${string}`,
+        amount0Max: UINT128_MAX,
+        amount1Max: UINT128_MAX,
+      },
+    ],
+  });
+  const multicallData = encodeFunctionData({
+    abi: NPM_WRITE_ABI,
+    functionName: "multicall",
+    args: [[decreaseData, collectData]],
+  });
+  return { to: npm, data: multicallData };
+}
+
 /** 预探测该 NPM 合约是否支持 multicall（通过 eth_call 静态模拟） */
 export async function checkMulticallSupport(
   npm: string,
