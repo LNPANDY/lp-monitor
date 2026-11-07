@@ -2,7 +2,7 @@ import { getDb, isPairFlipped } from "@/lib/db";
 import { ok, fail, getBody } from "@/lib/api";
 import { getClient } from "@/lib/chains";
 import { resolveTokens } from "@/lib/chains/tokens";
-import { ZIA_INCENTIVIZED_POOLS } from "@/lib/monitor/merkl-rewards";
+import { ZIA_INCENTIVIZED_POOLS, ZIA_PAST_POOLS } from "@/lib/monitor/merkl-rewards";
 
 export const dynamic = "force-dynamic";
 
@@ -102,8 +102,8 @@ export async function GET(req: Request) {
       }
     }
 
-    // 再从 ZIA 预设激励池定义兜底补全 token0/token1/symbol/fee
-    const ziaDef = ZIA_INCENTIVIZED_POOLS.find(
+    // 再从 ZIA 预设激励池（含已结束历史池）定义兜底补全 token0/token1/symbol/fee
+    const ziaDef = [...ZIA_INCENTIVIZED_POOLS, ...ZIA_PAST_POOLS].find(
       (p) => p.pool.toLowerCase() === (row.pool_addr || "").toLowerCase()
     );
     if (ziaDef) {

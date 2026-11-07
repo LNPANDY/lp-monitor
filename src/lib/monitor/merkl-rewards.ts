@@ -34,14 +34,15 @@ export const MERKL_DISTRIBUTION_CREATOR = "0x8BB4C975Ff3c250e0ceEA271728547f3802
 export const W0G_TOKEN_ADDRESS = "0x1cd0690ff9a693f5ef2dd976660a8dafc81a109c";
 export const ZIA_NPM_ADDRESS = "0x5143ba6007c197b4cf66c20601b9db97e0f98c6a" as const;
 
-/** Merkl 三因子权重（经链上单池质押者实际领奖数据反推校准：50% 活跃L + 25% Token0 + 25% Token1） */
-export const WEIGHT_ACTIVE_L = 0.5;
-export const WEIGHT_TOKEN0 = 0.25;
-export const WEIGHT_TOKEN1 = 0.25;
+/** Merkl 官方 ZIA Campaign 参数权重（weightFees: 6000, weightToken0: 2000, weightToken1: 2000 -> 60% 活跃L + 20% Token0 + 20% Token1） */
+export const WEIGHT_ACTIVE_L = 0.6;
+export const WEIGHT_TOKEN0 = 0.2;
+export const WEIGHT_TOKEN1 = 0.2;
 
 /**
- * 0G 主网 ZIA 6 大活跃 Merkl 激励池基准配置（Campaign #130 ~ #135）。
- * 若链上开启新周期且总预算变化，会按最新链上周期总预算等比缩放各池日产出。
+ * 0G 主网 ZIA 活跃 Merkl 激励池基准配置（Campaign #130 ~ #135，2026-10-30 18:00 UTC ~ 2026-11-13 19:00 UTC）。
+ * 注：oUSDT/USDC.e 0.01% 已停止激励（Merkl status = PAST），其预算已迁移至 W0G/iAI 1%。
+ * 运行时会优先从 Merkl 官方 v4 API 实时同步各池最新 LIVE 状态与精确每日 W0G 产出，链上/本地配置作为兜底。
  */
 export interface ZiaIncentivizedPoolDef {
   key: string;
@@ -56,7 +57,7 @@ export interface ZiaIncentivizedPoolDef {
   decimals1: number;
   fee: number;
   tickSpacing: number;
-  /** 当前 14 天周期的基准净奖励总量（W0G） */
+  /** 当前 14.0417 天周期的基准净奖励总量（W0G） */
   baseEpochW0g: number;
   /** 占 ZIA 全协议总奖池比例 */
   budgetWeight: number;
@@ -76,24 +77,8 @@ export const ZIA_INCENTIVIZED_POOLS: ZiaIncentivizedPoolDef[] = [
     decimals1: 18,
     fee: 3000,
     tickSpacing: 60,
-    baseEpochW0g: 25705.0, // Campaign #134: 1,836.07 W0G/day
+    baseEpochW0g: 25705.0, // Campaign #134: 1,830.62 W0G/day
     budgetWeight: 25705.0 / 80655.5,
-  },
-  {
-    key: "wbtc-usdc-3000",
-    pairLabel: "WBTC/USDC.e 0.3%",
-    pool: "0xd356377752c708621d23c8d886fe2f5ca5f9cec2",
-    vault: "0xb7acb2ed1f4fb8f16846b7b3f2c8c608660af1d3",
-    token0: "0x0555e30da8f98308edb960aa94c0db47230d2b9c",
-    token1: "0x1f3aa82227281ca364bfb3d253b0f1af1da6473e",
-    symbol0: "WBTC",
-    symbol1: "USDC.e",
-    decimals0: 8,
-    decimals1: 6,
-    fee: 3000,
-    tickSpacing: 60,
-    baseEpochW0g: 18915.0, // Campaign #130: 1,351.07 W0G/day
-    budgetWeight: 18915.0 / 80655.5,
   },
   {
     key: "w0g-usdc-3000",
@@ -108,24 +93,24 @@ export const ZIA_INCENTIVIZED_POOLS: ZiaIncentivizedPoolDef[] = [
     decimals1: 6,
     fee: 3000,
     tickSpacing: 60,
-    baseEpochW0g: 14550.0, // Campaign #132: 1,039.29 W0G/day
-    budgetWeight: 14550.0 / 80655.5,
+    baseEpochW0g: 18915.0, // Campaign #130: 1,347.06 W0G/day (第 2 大主力激励池)
+    budgetWeight: 18915.0 / 80655.5,
   },
   {
-    key: "usdc-link-3000",
-    pairLabel: "USDC.e/LINK 0.3%",
-    pool: "0xbdb60e0c534cd9db07dd8560d74801f8fb5cb2e3",
-    vault: "0x6e64cddc2d85cdd287002bf1c1eec649973f8595",
-    token0: "0x1f3aa82227281ca364bfb3d253b0f1af1da6473e",
-    token1: "0x76159c2b43ff6f630193e37ec68452169914c1bb",
-    symbol0: "USDC.e",
-    symbol1: "LINK",
-    decimals0: 6,
-    decimals1: 18,
+    key: "wbtc-usdc-3000",
+    pairLabel: "WBTC/USDC.e 0.3%",
+    pool: "0xd356377752c708621d23c8d886fe2f5ca5f9cec2",
+    vault: "0xb7acb2ed1f4fb8f16846b7b3f2c8c608660af1d3",
+    token0: "0x0555e30da8f98308edb960aa94c0db47230d2b9c",
+    token1: "0x1f3aa82227281ca364bfb3d253b0f1af1da6473e",
+    symbol0: "WBTC",
+    symbol1: "USDC.e",
+    decimals0: 8,
+    decimals1: 6,
     fee: 3000,
     tickSpacing: 60,
-    baseEpochW0g: 8730.0, // Campaign #135: 623.57 W0G/day
-    budgetWeight: 8730.0 / 80655.5,
+    baseEpochW0g: 14550.0, // Campaign #132: 1,036.20 W0G/day
+    budgetWeight: 14550.0 / 80655.5,
   },
   {
     key: "usdc-sol-3000",
@@ -140,9 +125,45 @@ export const ZIA_INCENTIVIZED_POOLS: ZiaIncentivizedPoolDef[] = [
     decimals1: 9,
     fee: 3000,
     tickSpacing: 60,
-    baseEpochW0g: 8487.5, // Campaign #131: 606.25 W0G/day
+    baseEpochW0g: 8730.0, // Campaign #135: 621.72 W0G/day
+    budgetWeight: 8730.0 / 80655.5,
+  },
+  {
+    key: "usdc-link-3000",
+    pairLabel: "USDC.e/LINK 0.3%",
+    pool: "0xbdb60e0c534cd9db07dd8560d74801f8fb5cb2e3",
+    vault: "0x6e64cddc2d85cdd287002bf1c1eec649973f8595",
+    token0: "0x1f3aa82227281ca364bfb3d253b0f1af1da6473e",
+    token1: "0x76159c2b43ff6f630193e37ec68452169914c1bb",
+    symbol0: "USDC.e",
+    symbol1: "LINK",
+    decimals0: 6,
+    decimals1: 18,
+    fee: 3000,
+    tickSpacing: 60,
+    baseEpochW0g: 8487.5, // Campaign #131: 604.45 W0G/day
     budgetWeight: 8487.5 / 80655.5,
   },
+  {
+    key: "w0g-iai-10000",
+    pairLabel: "W0G/iAI 1%",
+    pool: "0x9d440fdff4ec6bae47d9b30254b20ff13096fb4f",
+    vault: "0x1bca1cce8a8b474f30341f7bddaf29e0891bd733",
+    token0: "0x1cd0690ff9a693f5ef2dd976660a8dafc81a109c",
+    token1: "0xc77fbd3824cc68e612b26114d176879addc29463",
+    symbol0: "W0G",
+    symbol1: "iAI",
+    decimals0: 18,
+    decimals1: 18,
+    fee: 10000,
+    tickSpacing: 200,
+    baseEpochW0g: 4268.0, // Campaign #133: 303.95 W0G/day
+    budgetWeight: 4268.0 / 80655.5,
+  },
+];
+
+/** 历史曾激励但当前已停止激励（Merkl status = PAST）的池子元数据，仅用于收藏池费率/符号补全，不参与奖励雷达计算 */
+export const ZIA_PAST_POOLS: ZiaIncentivizedPoolDef[] = [
   {
     key: "usdt-usdc-100",
     pairLabel: "USDT/USDC.e 0.01%",
@@ -156,8 +177,8 @@ export const ZIA_INCENTIVIZED_POOLS: ZiaIncentivizedPoolDef[] = [
     decimals1: 6,
     fee: 100,
     tickSpacing: 1,
-    baseEpochW0g: 4268.0, // Campaign #133: 304.86 W0G/day
-    budgetWeight: 4268.0 / 80655.5,
+    baseEpochW0g: 0,
+    budgetWeight: 0,
   },
 ];
 
@@ -319,12 +340,14 @@ interface MerklRuntimeState {
   running: boolean;
   /** 记录每个池上次推送高 APR 告警的时间戳与当时 APR，避免重复轰炸 */
   lastPoolAlertMap: Record<string, { ts: number; aprPct: number }>;
-  /** 链上 DistributionCreator 周期缓存（10 分钟刷新一次） */
+  /** 链上 DistributionCreator 与 Merkl 官方 API 周期缓存（5 分钟刷新一次） */
   epochCache: {
     ts: number;
     startSec: number;
     endSec: number;
     totalDailyW0g: number;
+    perPoolDailyW0g: Record<string, number>;
+    merklTokenPrices: Record<string, number>;
   } | null;
 }
 
@@ -367,64 +390,135 @@ export function getLastMerklRewardsSummary(): MerklRewardsSummary | null {
 }
 
 /**
- * 从 DistributionCreator (0x8BB4C975...) 动态同步最新活跃周期的起止时间与每日总 W0G 预算。
- * 默认基准：Campaign #130~#135 (2026-10-30 18:00 UTC ~ 2026-11-13 19:00 UTC, 共 80,655.5 W0G / 14.0417 天 = 5,744.0 W0G/天)。
+ * 优先从 Merkl 官方 v4 API (`https://api.merkl.xyz/v4/opportunities?chainId=16661&items=100`) 实时同步各 ZIA 池的
+ * LIVE/PAST 状态、精确每日 W0G 发放量与起止时间；若 API 不可达则回退至链上 DistributionCreator (0x8BB4C975...)。
  */
 async function syncEpochFromChain(client: PublicClient): Promise<{
   startSec: number;
   endSec: number;
   totalDailyW0g: number;
+  perPoolDailyW0g: Record<string, number>;
+  merklTokenPrices: Record<string, number>;
 }> {
   const st = getMerklState();
   const nowMs = Date.now();
-  if (st.epochCache && nowMs - st.epochCache.ts < 600_000) {
+  if (st.epochCache && nowMs - st.epochCache.ts < 300_000) {
     return st.epochCache;
   }
 
-  // 默认基准周期（Campaign #130 ~ #135）
-  let startSec = 1793383200; // 2026-10-30T18:00:00Z
-  let endSec = 1794596400;   // 2026-11-13T19:00:00Z
+  // 默认基准周期（Campaign #130 ~ #135: 2026-10-30 18:00 UTC ~ 2026-11-13 19:00 UTC）
+  let startSec = 1793383200;
+  let endSec = 1794596400;
   let totalDailyW0g = 80655.5 / (1213200 / 86400);
+  const perPoolDailyW0g: Record<string, number> = {};
+  const merklTokenPrices: Record<string, number> = {};
 
+  // 1. 优先从 Merkl 官方 v4 API 获取每个池子的精确日奖励与 LIVE 状态
+  let syncedFromMerklApi = false;
   try {
-    // 读取最新 #130 ~ #135 的链上数据验证，并探测是否存在 #137+ 新周期
-    const indices = [130, 131, 132, 133, 134, 135];
-    const calls = await Promise.all(
-      indices.map((idx) =>
-        client
-          .call({
-            to: MERKL_DISTRIBUTION_CREATOR,
-            data: (`0x4912c658` + idx.toString(16).padStart(64, "0")) as `0x${string}`,
-          })
-          .catch(() => null)
-      )
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 4500);
+    const res = await fetch(
+      `https://api.merkl.xyz/v4/opportunities?chainId=${OG_MAINNET_CHAIN_ID}&items=100`,
+      { signal: ctrl.signal, cache: "no-store" }
     );
-    let sumW0g = 0;
-    let foundStart = 0;
-    let foundDuration = 0;
-    for (const res of calls) {
-      const hex = res?.data;
-      if (!hex || hex.length < 2 + 64 * 7) continue;
-      const amt = Number(BigInt("0x" + hex.slice(2 + 64 * 3, 2 + 64 * 4))) / 1e18;
-      const cType = parseInt(hex.slice(2 + 64 * 4, 2 + 64 * 5), 16);
-      const cStart = parseInt(hex.slice(2 + 64 * 5, 2 + 64 * 6), 16);
-      const cDur = parseInt(hex.slice(2 + 64 * 6, 2 + 64 * 7), 16);
-      if (cType === 179 && amt > 0 && cDur > 0) {
-        sumW0g += amt;
-        foundStart = cStart;
-        foundDuration = cDur;
+    clearTimeout(timer);
+    if (res.ok) {
+      const list = (await res.json()) as any[];
+      if (Array.isArray(list) && list.length > 0) {
+        let liveZiaDailySum = 0;
+        let minStart = 0;
+        let maxEnd = 0;
+        for (const opp of list) {
+          if (!opp || opp.type !== "ZIA" || !opp.identifier) continue;
+          const poolLower = String(opp.identifier).toLowerCase();
+          for (const tok of opp.tokens || []) {
+            if (tok?.address && Number.isFinite(tok?.price) && tok.price > 0) {
+              merklTokenPrices[String(tok.address).toLowerCase()] = Number(tok.price);
+            }
+          }
+          if (opp.status !== "LIVE") {
+            perPoolDailyW0g[poolLower] = 0;
+            continue;
+          }
+          const bd = opp.rewardsRecord?.breakdowns?.[0];
+          let dailyW0g = 0;
+          if (bd?.amount) {
+            try {
+              dailyW0g = Number(BigInt(String(bd.amount))) / 1e18;
+            } catch {
+              dailyW0g = Number(bd.open) || 0;
+            }
+          } else if (Number.isFinite(bd?.open)) {
+            dailyW0g = Number(bd.open);
+          }
+          perPoolDailyW0g[poolLower] = dailyW0g;
+          liveZiaDailySum += dailyW0g;
+          const s = Number(opp.earliestCampaignStart);
+          const e = Number(opp.latestCampaignEnd);
+          if (Number.isFinite(s) && s > 0 && (!minStart || s < minStart)) minStart = s;
+          if (Number.isFinite(e) && e > maxEnd) maxEnd = e;
+        }
+        if (liveZiaDailySum > 0) {
+          totalDailyW0g = liveZiaDailySum;
+          if (minStart > 0) startSec = minStart;
+          if (maxEnd > 0) endSec = maxEnd;
+          syncedFromMerklApi = true;
+        }
       }
     }
-    if (sumW0g > 0 && foundDuration > 0) {
-      startSec = foundStart;
-      endSec = foundStart + foundDuration;
-      totalDailyW0g = sumW0g / (foundDuration / 86400);
-    }
   } catch {
-    // 降级使用内置基准
+    // Merkl API 超时或受限时自动回退链上读取
   }
 
-  const epoch = { ts: nowMs, startSec, endSec, totalDailyW0g };
+  // 2. 若 Merkl API 不可达，从链上 DistributionCreator 读取最新周期总预算并按最新校准权重分配
+  if (!syncedFromMerklApi) {
+    try {
+      const indices = [130, 131, 132, 133, 134, 135];
+      const calls = await Promise.all(
+        indices.map((idx) =>
+          client
+            .call({
+              to: MERKL_DISTRIBUTION_CREATOR,
+              data: (`0x4912c658` + idx.toString(16).padStart(64, "0")) as `0x${string}`,
+            })
+            .catch(() => null)
+        )
+      );
+      let sumW0g = 0;
+      let foundStart = 0;
+      let foundDuration = 0;
+      for (const res of calls) {
+        const hex = res?.data;
+        if (!hex || hex.length < 2 + 64 * 7) continue;
+        const amt = Number(BigInt("0x" + hex.slice(2 + 64 * 3, 2 + 64 * 4))) / 1e18;
+        const cType = parseInt(hex.slice(2 + 64 * 4, 2 + 64 * 5), 16);
+        const cStart = parseInt(hex.slice(2 + 64 * 5, 2 + 64 * 6), 16);
+        const cDur = parseInt(hex.slice(2 + 64 * 6, 2 + 64 * 7), 16);
+        if (cType === 179 && amt > 0 && cDur > 0) {
+          sumW0g += amt;
+          foundStart = cStart;
+          foundDuration = cDur;
+        }
+      }
+      if (sumW0g > 0 && foundDuration > 0) {
+        startSec = foundStart;
+        endSec = foundStart + foundDuration;
+        totalDailyW0g = sumW0g / (foundDuration / 86400);
+      }
+    } catch {
+      // 降级使用内置基准
+    }
+  }
+
+  const epoch = {
+    ts: nowMs,
+    startSec,
+    endSec,
+    totalDailyW0g,
+    perPoolDailyW0g,
+    merklTokenPrices,
+  };
   st.epochCache = epoch;
   return epoch;
 }
@@ -583,6 +677,15 @@ export async function scanMerklRewardsAndApr(opts?: {
       resolveTokenUsdPrices(client, ogChain.id),
     ]);
 
+    // 合并来自 Merkl 官方 API 的代币 USD 价格（如 iAI 等未在 CEX 配置中的代币）
+    if (epoch.merklTokenPrices) {
+      for (const [addrLower, p] of Object.entries(epoch.merklTokenPrices)) {
+        if (!priceByToken.has(addrLower) && Number.isFinite(p) && p > 0) {
+          priceByToken.set(addrLower, p);
+        }
+      }
+    }
+
     // 查询数据库中 0G 链上所有的活跃仓位（用于关联 positionId 和补充不在预设 6 池中的其它质押仓位）
     const dbPositions = db
       .prepare(
@@ -610,10 +713,19 @@ export async function scanMerklRewardsAndApr(opts?: {
     const positionsResult: Record<string, PositionRewardEstimate> = {};
     const poolsRadar: PoolRewardRadarItem[] = [];
 
-    // 并发扫描 6 大 ZIA 激励池
+    // 并发扫描 ZIA 活跃激励池
     await Promise.all(
       ZIA_INCENTIVIZED_POOLS.map(async (poolDef) => {
         try {
+          const poolLower = poolDef.pool.toLowerCase();
+          const apiDailyW0g = epoch.perPoolDailyW0g?.[poolLower];
+          const poolDailyW0g =
+            apiDailyW0g !== undefined
+              ? apiDailyW0g
+              : epoch.totalDailyW0g * poolDef.budgetWeight;
+          // 若某池在 Merkl 官方 API 中已停止激励（status = PAST / dailyW0g = 0），直接跳过不展示
+          if (poolDailyW0g <= 0) return;
+
           const slot0 = (await client.readContract({
             address: poolDef.pool,
             abi: V3_POOL_ABI,
@@ -726,7 +838,6 @@ export async function scanMerklRewardsAndApr(opts?: {
             });
           }
 
-          const poolDailyW0g = epoch.totalDailyW0g * poolDef.budgetWeight;
           const poolHourlyW0g = poolDailyW0g / 24;
           const dailyRewardUsd = poolDailyW0g * w0gPriceUsd;
           const poolFeeRate = (poolDef.fee || 3000) / 1_000_000;

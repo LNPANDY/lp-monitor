@@ -829,7 +829,7 @@ export default function DashboardPage() {
           <div className="flex flex-wrap items-center justify-between gap-2">
             <div className="flex flex-wrap items-center gap-2">
               <span className="text-sm font-semibold text-ink">
-                🎯 ZIA Merkl 质押奖励精算 & 高 APR 机会猎手（50% 活跃L + 25% Token0 + 25% Token1）
+                🎯 ZIA Merkl 质押奖励精算 & 高 APR 机会猎手（60% 活跃L + 20% Token0 + 20% Token1）
               </span>
               {merkl && (
                 <span className="text-xs font-mono text-cyan-300">
@@ -2375,7 +2375,7 @@ function PositionCard({
               </div>
             </div>
 
-            {/* Merkl 50% / 25% / 25% 三桶拆解明细 */}
+            {/* Merkl 60% / 20% / 20% 三桶拆解明细 */}
             <div className="grid grid-cols-3 gap-1 pt-0.5 font-mono text-[10px]">
               <div
                 className={`rounded px-1.5 py-1 border ${
@@ -2384,7 +2384,7 @@ function PositionCard({
                     : "border-rose-500/35 bg-rose-500/10 text-rose-300"
                 }`}
               >
-                <div className="font-sans opacity-80">⚡ 活跃L (50%)</div>
+                <div className="font-sans opacity-80">⚡ 活跃L (60%)</div>
                 <div className="font-semibold">
                   {(rewardEst.activeLShare * 100).toFixed(1)}% 池内
                 </div>
@@ -2394,7 +2394,7 @@ function PositionCard({
               </div>
               <div className="rounded border border-white/[0.08] bg-surface-0/50 px-1.5 py-1 text-ink">
                 <div className="font-sans text-ink-soft">
-                  🪙 {rewardEst.symbol0 || sym0} (25%)
+                  🪙 {rewardEst.symbol0 || sym0} (20%)
                 </div>
                 <div className="font-semibold">
                   {(rewardEst.token0Share * 100).toFixed(1)}% 池内
@@ -2405,7 +2405,7 @@ function PositionCard({
               </div>
               <div className="rounded border border-white/[0.08] bg-surface-0/50 px-1.5 py-1 text-ink">
                 <div className="font-sans text-ink-soft">
-                  💵 {rewardEst.symbol1 || sym1} (25%)
+                  💵 {rewardEst.symbol1 || sym1} (20%)
                 </div>
                 <div className="font-semibold">
                   {(rewardEst.token1Share * 100).toFixed(1)}% 池内

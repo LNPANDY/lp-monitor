@@ -755,7 +755,7 @@ export function MintPositionPanel({
         token0Share = poolAmt0 + amt0 > 0 ? amt0 / (poolAmt0 + amt0) : 0;
         token1Share = poolAmt1 + amt1 > 0 ? amt1 / (poolAmt1 + amt1) : 0;
         rewardShare =
-          0.5 * activeLShare + 0.25 * token0Share + 0.25 * token1Share;
+          0.6 * activeLShare + 0.2 * token0Share + 0.2 * token1Share;
         dailyW0g = poolRadar.dailyW0g * rewardShare;
         hourlyW0g = dailyW0g / 24;
         dailyUsd = dailyW0g * (w0g > 0 ? w0g : 0.147);
@@ -832,7 +832,7 @@ export function MintPositionPanel({
       rows.push({
         id: "min",
         title: "⚡ 模式A：最小单格",
-        badge: "冲刺50%活跃L桶",
+        badge: "冲刺60%活跃L桶",
         mode: "min",
         sim: simMin,
       });
@@ -990,7 +990,7 @@ export function MintPositionPanel({
                   ⚡ 模式 A：最小区间 (单格冲锋)
                 </div>
                 <div className="text-[10px] opacity-80">
-                  1 格 tickSpacing · 集中吃满 50% 活跃 L 奖池
+                  1 格 tickSpacing · 集中吃满 60% 活跃 L 奖池
                 </div>
               </button>
 

@@ -1018,10 +1018,10 @@ export function LiquidityProbe({
               <div className="grid grid-cols-3 gap-1.5 font-mono text-[10.5px]">
                 <div className="rounded border border-emerald-500/30 bg-surface-0/70 p-1.5 space-y-0.5">
                   <div className="font-sans font-semibold text-emerald-300">
-                    ⚡ 活跃L桶 (50%)
+                    ⚡ 活跃L桶 (60%)
                   </div>
                   <div className="text-ink">
-                    ${(matchedPoolRadar.dailyActiveLUsd ?? matchedPoolRadar.dailyRewardUsd * 0.5).toFixed(1)}/天
+                    ${(matchedPoolRadar.dailyActiveLUsd ?? matchedPoolRadar.dailyRewardUsd * 0.6).toFixed(1)}/天
                   </div>
                   <div className="text-[10px] text-ink-soft">
                     窄幅对手: ${matchedPoolRadar.narrowStakedTvlUsd.toFixed(0)} (
@@ -1034,10 +1034,10 @@ export function LiquidityProbe({
 
                 <div className="rounded border border-white/[0.1] bg-surface-0/70 p-1.5 space-y-0.5">
                   <div className="font-sans font-semibold text-cyan-200">
-                    🪙 {matchedPoolRadar.symbol0 || result.token0Symbol}桶 (25%)
+                    🪙 {matchedPoolRadar.symbol0 || result.token0Symbol}桶 (20%)
                   </div>
                   <div className="text-ink">
-                    ${(matchedPoolRadar.dailyToken0Usd ?? matchedPoolRadar.dailyRewardUsd * 0.25).toFixed(1)}/天
+                    ${(matchedPoolRadar.dailyToken0Usd ?? matchedPoolRadar.dailyRewardUsd * 0.2).toFixed(1)}/天
                   </div>
                   <div className="text-[10px] text-ink-soft">
                     池内质押: ${(matchedPoolRadar.stakedToken0Usd ?? 0).toFixed(0)}
@@ -1049,10 +1049,10 @@ export function LiquidityProbe({
 
                 <div className="rounded border border-white/[0.1] bg-surface-0/70 p-1.5 space-y-0.5">
                   <div className="font-sans font-semibold text-cyan-200">
-                    💵 {matchedPoolRadar.symbol1 || result.token1Symbol}桶 (25%)
+                    💵 {matchedPoolRadar.symbol1 || result.token1Symbol}桶 (20%)
                   </div>
                   <div className="text-ink">
-                    ${(matchedPoolRadar.dailyToken1Usd ?? matchedPoolRadar.dailyRewardUsd * 0.25).toFixed(1)}/天
+                    ${(matchedPoolRadar.dailyToken1Usd ?? matchedPoolRadar.dailyRewardUsd * 0.2).toFixed(1)}/天
                   </div>
                   <div className="text-[10px] text-ink-soft">
                     池内质押: ${(matchedPoolRadar.stakedToken1Usd ?? 0).toFixed(0)}
@@ -1079,7 +1079,7 @@ export function LiquidityProbe({
                       matchedPoolRadar.stakedToken0Usd ?? 0,
                       matchedPoolRadar.stakedToken1Usd ?? 0
                     ).toFixed(0)}
-                    ），单靠 25% 持币桶被动年化即达{" "}
+                    ），单靠 20% 持币桶被动年化即达{" "}
                     <span className="font-mono font-semibold text-amber-200">
                       {Math.max(
                         matchedPoolRadar.token0BucketAprPct,
