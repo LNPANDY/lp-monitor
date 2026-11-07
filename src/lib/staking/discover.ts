@@ -433,6 +433,78 @@ export async function eachLimit<T>(
   await Promise.all(workers);
 }
 
+/**
+ * ZIA Vault 1-RPC 极速质押发现：
+ * ZiaVault 合约在 Slot 9 维护了 `mapping(address user => uint256[] tokenIds)`，
+ * 并暴露只读选择器 `0xa4d5e1ff(address)` 直接返回该钱包当前质押的所有 tokenId 数组。
+ * 无需 eth_getLogs 扫块，不受区块跨度限制，1 个并发 RTT 即可100%精确获取所有质押仓位。
+ */
+export async function findZiaVaultStakedPositions(
+  client: PublicClient,
+  wallets: Address[],
+  dexes: DexRow[],
+  staking: StakingRow[]
+): Promise<Map<string, DiscoveredPosition[]>> {
+  const byWallet = new Map<string, DiscoveredPosition[]>();
+  for (const w of wallets) {
+    byWallet.set(w.toLowerCase(), []);
+  }
+  if (wallets.length === 0 || staking.length === 0 || dexes.length === 0) {
+    return byWallet;
+  }
+
+  const defaultDexId = dexes[0].id;
+  const tasks: { walletLower: string; s: StakingRow; dexId: number }[] = [];
+  for (const w of wallets) {
+    const walletLower = w.toLowerCase();
+    for (const s of staking) {
+      if (!/^0x[a-fA-F0-9]{40}$/.test(s.contract)) continue;
+      const dexId =
+        s.dex_id && dexes.some((d) => d.id === s.dex_id)
+          ? s.dex_id
+          : defaultDexId;
+      tasks.push({ walletLower, s, dexId });
+    }
+  }
+
+  await eachLimit(tasks, 12, async ({ walletLower, s, dexId }) => {
+    try {
+      const paddedWallet = walletLower.replace(/^0x/, "").padStart(64, "0");
+      const data = `0xa4d5e1ff${paddedWallet}` as `0x${string}`;
+      const res = await client.call({
+        to: s.contract as Address,
+        data,
+      });
+      const hex = res.data;
+      if (!hex || hex.length < 130) return;
+      const raw = hex.slice(2);
+      const count = parseInt(raw.slice(64, 128), 16);
+      if (!Number.isFinite(count) || count <= 0 || count > 500) return;
+      const list = byWallet.get(walletLower);
+      if (!list) return;
+      for (let i = 0; i < count; i++) {
+        const start = 128 + i * 64;
+        const chunk = raw.slice(start, start + 64);
+        if (chunk.length < 64) break;
+        const tokenId = BigInt("0x" + chunk).toString();
+        if (tokenId !== "0") {
+          list.push({
+            tokenId,
+            dexId,
+            source: "staking",
+            stakerContract: s.contract,
+            stakingId: s.id,
+          });
+        }
+      }
+    } catch {
+      // 非 ZiaVault 合约忽略
+    }
+  });
+
+  return byWallet;
+}
+
 export async function resolveStakingOwner(
   client: PublicClient,
   stakingContract: Address,
@@ -440,7 +512,28 @@ export async function resolveStakingOwner(
   expectOwner: Address
 ): Promise<string[]> {
   const matched: string[] = [];
+  const expectLower = expectOwner.toLowerCase();
   await eachLimit(tokenIds, 8, async (id) => {
+    // 1. 优先尝试 ZiaVault Slot 7 owner getter: 0x67ba6b53(uint256 tokenId) -> address
+    try {
+      const paddedId = BigInt(id).toString(16).padStart(64, "0");
+      const res = await client.call({
+        to: stakingContract,
+        data: `0x67ba6b53${paddedId}` as `0x${string}`,
+      });
+      if (res.data && res.data.length >= 66) {
+        const ownerAddr = ("0x" + res.data.slice(-40)).toLowerCase();
+        if (ownerAddr === expectLower) {
+          matched.push(id);
+          return;
+        }
+        if (ownerAddr !== "0x0000000000000000000000000000000000000000") {
+          return;
+        }
+      }
+    } catch {}
+
+    // 2. 降级尝试标准 Uniswap V3 Staker deposits(uint256)
     try {
       const res = (await client.readContract({
         address: stakingContract,
@@ -448,7 +541,7 @@ export async function resolveStakingOwner(
         functionName: "deposits",
         args: [BigInt(id)],
       })) as unknown as any[];
-      if ((res[0] as string).toLowerCase() === expectOwner.toLowerCase()) {
+      if ((res[0] as string).toLowerCase() === expectLower) {
         matched.push(id);
       }
     } catch {}

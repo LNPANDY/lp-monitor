@@ -15,9 +15,11 @@ import { listDexes, listStaking } from "../chains/dexes";
 import {
   findDirectPositions,
   findRecentPositionsForWallets,
+  findZiaVaultStakedPositions,
   eachLimit,
   type DiscoveredPosition,
 } from "../staking/discover";
+import { ensureStakingPoolMeta } from "../staking/match";
 import { ownerOf } from "../adapters/v3-fork";
 import { getAdapter } from "../adapters";
 import { estimateBlockTimeSec, secondsToBlocks } from "../chains/blocktime";
@@ -155,15 +157,20 @@ export async function runFastDiscover(opts: {
       );
       const nowIso = new Date().toISOString();
 
-      // 1. 一次性批量扫描本链所有启用钱包的 Transfer 事件（每个 DEX 仅 2 次 getLogs RPC）
-      const batchLogs = await findRecentPositionsForWallets(
-        client,
-        wallets.map((w) => w.address as Address),
-        dexes,
-        staking,
-        fromBlock,
-        latest
-      );
+      // 1. 一次性批量扫描本链所有启用钱包的 Transfer 事件 + ZiaVault (0xa4d5e1ff) 质押直读 + 预热质押池元数据
+      const walletAddrs = wallets.map((w) => w.address as Address);
+      const [batchLogs, vaultStakedByWallet] = await Promise.all([
+        findRecentPositionsForWallets(
+          client,
+          walletAddrs,
+          dexes,
+          staking,
+          fromBlock,
+          latest
+        ),
+        findZiaVaultStakedPositions(client, walletAddrs, dexes, staking),
+        ensureStakingPoolMeta(client, chainIdRef, staking).catch(() => {}),
+      ]);
 
       for (const w of wallets) {
         try {
@@ -189,6 +196,11 @@ export async function runFastDiscover(opts: {
           const mergedMap = new Map<string, DiscoveredPosition>();
           for (const c of cands.candidates) {
             mergedMap.set(`${c.dexId}:${c.tokenId}`, c);
+          }
+          // 合并 ZiaVault 0xa4d5e1ff 直读到的全部质押中 tokenId（不受区块范围限制，100% 不漏老质押仓位）
+          const vaultList = vaultStakedByWallet.get(walletLower) ?? [];
+          for (const vc of vaultList) {
+            mergedMap.set(`${vc.dexId}:${vc.tokenId}`, vc);
           }
 
           // 2. 仅当全新钱包（DB 尚无任何仓位）首次接入时，快速拉取尾部最新 15 个直持 NFT

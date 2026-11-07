@@ -10,6 +10,7 @@ import { isPairFlipped } from "@/lib/db";
 import { getClient } from "@/lib/chains";
 import { ok, fail, getBody } from "@/lib/api";
 import { listDexes, listStaking } from "@/lib/chains/dexes";
+import { ensureStakingPoolMeta, matchStakingContractsForPool } from "@/lib/staking/match";
 import {
   tickToSqrtPriceX96,
   computeLiquidityFromAmount,
@@ -102,19 +103,16 @@ export async function POST(req: Request) {
         ? dexes.find((d) => (d.factory || "").toLowerCase() === poolFactory.toLowerCase())
         : undefined) ?? dexes[0];
 
-    const normSym = (s: string) =>
-      (s || "").toLowerCase().replace(/\.(e|b|c|m|w)$/i, "").trim();
-    const base0 = normSym(sym0);
-    const base1 = normSym(sym1);
     const allStaking = listStaking(b.chain_id, true);
-    const matchedStaking = allStaking.filter((s) => {
-      const rawLabel = (s.pair_label || "").toLowerCase();
-      if (!rawLabel) return false;
-      const labelBases = rawLabel
-        .split(/[\/\s,]+/)
-        .map((t) => normSym(t))
-        .filter((t) => t && !/^\d+(\.\d+)?%?$/.test(t));
-      return labelBases.includes(base0) && labelBases.includes(base1);
+    await ensureStakingPoolMeta(client, b.chain_id, allStaking);
+    const matchedStaking = matchStakingContractsForPool(allStaking, {
+      chainIdRef: b.chain_id,
+      dexId: matchedDex?.id,
+      token0,
+      token1,
+      symbol0: sym0,
+      symbol1: sym1,
+      fee: Number(fee),
     });
 
     // 3. 单次并行 RTT 读取：池子实时状态（slot0 + liquidity）+（若有钱包）余额与授权

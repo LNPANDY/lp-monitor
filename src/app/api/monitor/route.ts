@@ -10,6 +10,10 @@ import {
   triggerCombinedScan,
   triggerFullScan,
 } from "@/lib/monitor/enhanced-scheduler";
+import {
+  getLastStakingSecuritySummary,
+  scanStakingSecurity,
+} from "@/lib/monitor/staking-security";
 import { ok, fail, getBody } from "@/lib/api";
 
 export const dynamic = "force-dynamic";
@@ -17,6 +21,11 @@ export const dynamic = "force-dynamic";
 /** 返回当前调度状态与上次扫描摘要。 */
 export async function GET() {
   ensureEnhancedScheduler();
+  let stakingSecurity = getLastStakingSecuritySummary();
+  if (!stakingSecurity) {
+    // 首次启动时尚未完成首轮扫描，异步触发一次快速质押安全检查
+    scanStakingSecurity().catch(() => {});
+  }
   return ok({
     combinedRunning: isCombinedRunning(),
     fullRunning: isFullRunning(),
@@ -24,6 +33,7 @@ export async function GET() {
     fullCron: currentFullScanCron(),  // 保留别名供前端向后兼容展示
     lastCombined: lastCombinedSummary(),
     lastFull: lastFullScanSummary(),
+    stakingSecurity,
   });
 }
 

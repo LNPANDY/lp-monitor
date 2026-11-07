@@ -2,6 +2,7 @@ import { getDb, isPairFlipped } from "@/lib/db";
 import { ok, fail, getBody } from "@/lib/api";
 import { getClient } from "@/lib/chains";
 import { listDexes, listStaking } from "@/lib/chains/dexes";
+import { ensureStakingPoolMeta, matchStakingContractsForPool } from "@/lib/staking/match";
 import { getPoolStaticMeta, probeMinRange } from "@/lib/v3/liquidity";
 import type { MinRangeProbeResult } from "@/lib/v3/liquidity";
 import { loadAllMappings, buildQuotesByAddr } from "@/lib/cex/binance";
@@ -84,19 +85,16 @@ export async function POST(req: Request) {
         ? dexes.find((d) => (d.factory || "").toLowerCase() === factory.toLowerCase())
         : undefined) ?? dexes[0];
 
-    const normSym = (s: string) =>
-      (s || "").toLowerCase().replace(/\.(e|b|c|m|w)$/i, "").trim();
-    const base0 = normSym(sym0);
-    const base1 = normSym(sym1);
     const allStaking = listStaking(b.chainId, true);
-    const matchedStaking = allStaking.filter((s) => {
-      const rawLabel = (s.pair_label || "").toLowerCase();
-      if (!rawLabel) return false;
-      const labelBases = rawLabel
-        .split(/[\/\s,]+/)
-        .map((t) => normSym(t))
-        .filter((t) => t && !/^\d+(\.\d+)?%?$/.test(t));
-      return labelBases.includes(base0) && labelBases.includes(base1);
+    await ensureStakingPoolMeta(client, b.chainId, allStaking);
+    const matchedStaking = matchStakingContractsForPool(allStaking, {
+      chainIdRef: b.chainId,
+      dexId: matchedDex?.id,
+      token0,
+      token1,
+      symbol0: sym0,
+      symbol1: sym1,
+      fee: Number(fee),
     });
 
     // 2. 并行执行：最小区间探针（仅 slot0 + liquidity 1 个 RTT） + CEX 报价 + （可选）钱包双币余额与授权

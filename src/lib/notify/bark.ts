@@ -20,16 +20,21 @@ export async function sendBark(n: Notification): Promise<boolean> {
   const base = server.replace(/\/$/, "");
   const pushOne = async (deviceKey: string): Promise<boolean> => {
     try {
+      const payload: Record<string, any> = {
+        title: n.title,
+        body: n.body,
+        url: n.url,
+        group: n.group || (n.urgent ? "lp-security" : "lp-monitor"),
+        sound: "alarm",
+      };
+      if (n.urgent) {
+        payload.level = "critical";
+        payload.call = "1";
+      }
       const res = await fetch(`${base}/${deviceKey}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          title: n.title,
-          body: n.body,
-          url: n.url,
-          group: "lp-monitor",
-          sound: "alarm",
-        }),
+        body: JSON.stringify(payload),
         signal: AbortSignal.timeout(10_000),
       });
       return res.ok;

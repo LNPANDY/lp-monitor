@@ -1,5 +1,6 @@
 import { getDb } from "@/lib/db";
 import { ok } from "@/lib/api";
+import { matchStakingContractsForPool } from "@/lib/staking/match";
 
 export const dynamic = "force-dynamic";
 
@@ -32,7 +33,7 @@ export async function GET(req: Request) {
   if (only === "closed") { sql += " LIMIT 60"; }
   const rows = db.prepare(sql).all(...args) as any[];
 
-  // 为未质押仓位自动匹配已配置的质押合约（按交易对币种符号或收藏池 staker_addr 匹配）
+  // 为未质押仓位自动匹配已配置的质押合约（优先按链上 poolToken0/poolToken1/poolFee 精确匹配，其次按收藏池或币对+费率匹配）
   const stakingRows = db
     .prepare("SELECT id, chain_id_ref, platform, pair_label, contract, dex_id FROM staking_contracts WHERE enabled=1")
     .all() as { id: number; chain_id_ref: number; platform: string; pair_label: string; contract: string; dex_id: number | null }[];
@@ -40,27 +41,21 @@ export async function GET(req: Request) {
     .prepare("SELECT chain_id_ref, LOWER(pool_addr) AS pool_addr, staker_addr, label FROM liquidity_favorites WHERE staker_addr != ''")
     .all() as { chain_id_ref: number; pool_addr: string; staker_addr: string; label: string }[];
 
-  const normSym = (s: string) =>
-    (s || "").toLowerCase().replace(/\.(e|b|c|m|w)$/i, "").trim();
-
   for (const r of rows) {
     if (r.staker_contract) {
       r.available_staker_contract = r.staker_contract;
       continue;
     }
-    const base0 = normSym(r.token0_symbol || "");
-    const base1 = normSym(r.token1_symbol || "");
-    const matchedStake = stakingRows.find((s) => {
-      if (s.chain_id_ref !== r.chain_id_ref) return false;
-      if (s.dex_id && r.dex_id && s.dex_id !== r.dex_id) return false;
-      const rawLabel = (s.pair_label || "").toLowerCase();
-      if (!rawLabel || !base0 || !base1) return false;
-      const labelBases = rawLabel
-        .split(/[\/\s,]+/)
-        .map((t) => normSym(t))
-        .filter((t) => t && !/^\d+(\.\d+)?%?$/.test(t));
-      return labelBases.includes(base0) && labelBases.includes(base1);
+    const matchedList = matchStakingContractsForPool(stakingRows, {
+      chainIdRef: r.chain_id_ref,
+      dexId: r.dex_id,
+      token0: r.token0,
+      token1: r.token1,
+      symbol0: r.token0_symbol,
+      symbol1: r.token1_symbol,
+      fee: Number(r.fee) || undefined,
     });
+    const matchedStake = matchedList[0];
     if (matchedStake) {
       r.available_staker_contract = matchedStake.contract;
       r.available_staker_label = matchedStake.pair_label || matchedStake.platform;

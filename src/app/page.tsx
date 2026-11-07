@@ -80,6 +80,50 @@ interface MonitorState {
   fullCron: string;
   lastCombined: any;
   lastFull: any;
+  stakingSecurity?: {
+    status: "safe" | "warn" | "danger";
+    checkedContracts: number;
+    simulatedPositions: number;
+    anomalies: {
+      id: string;
+      severity: "critical" | "warn";
+      type: string;
+      contract: string;
+      pairLabel: string;
+      chainName: string;
+      tokenId?: string;
+      title: string;
+      detail: string;
+      detectedAt: string;
+    }[];
+    contracts: {
+      id: number;
+      chainIdRef: number;
+      chainName: string;
+      platform: string;
+      pairLabel: string;
+      contract: string;
+      symbol: string;
+      poolFee: number;
+      owner: string;
+      baselineOwner: string;
+      feeRecipient: string;
+      baselineFeeRecipient: string;
+      paused: boolean;
+      withdrawPaused: boolean;
+      totalStakedCount: number;
+      totalSupply: string;
+      userStakedPositionsSimOk: number;
+      userStakedPositionsSimFailed: number;
+      status: "safe" | "warn" | "danger";
+    }[];
+    checkedAt: string;
+    durationMs: number;
+    highFreqPushActive: boolean;
+    muted: boolean;
+    pushCount: number;
+    lastPushAt: string | null;
+  } | null;
 }
 
 export default function DashboardPage() {
@@ -109,6 +153,33 @@ export default function DashboardPage() {
   const [showClosed, setShowClosed] = useState(false);
   const [showScanSettings, setShowScanSettings] = useState(false);
   const [showPortfolio, setShowPortfolio] = useState(false);
+  const [showSecurityDrawer, setShowSecurityDrawer] = useState(false);
+  const [secActionBusy, setSecActionBusy] = useState(false);
+
+  const sec: MonitorState["stakingSecurity"] =
+    mon?.stakingSecurity ?? mon?.lastCombined?.stakingSecurity ?? null;
+  const secAnomalies = sec?.anomalies ?? [];
+  const hasSecAnomaly = secAnomalies.length > 0;
+
+  async function runSecurityAction(action: "scan" | "mute" | "unmute" | "accept_baseline" | "test_alarm") {
+    setSecActionBusy(true);
+    try {
+      const r = await fetch("/api/staking-security", {
+        method: "POST",
+        headers: authHeaders({ "Content-Type": "application/json" }),
+        body: JSON.stringify({ action }),
+      });
+      const j = await r.json();
+      if (!j.ok) {
+        alert(j.error || "操作失败");
+      } else if (action === "test_alarm") {
+        alert("✅ 已向 Bark / 已配置渠道发送紧急强提醒测试消息！");
+      }
+      reloadMon();
+    } finally {
+      setSecActionBusy(false);
+    }
+  }
 
   // 从仓位卡片触发「撤池并重开」时，同步传给右侧三段式工作台并滚动过去
   const [externalPool, setExternalPool] = useState<{
@@ -150,7 +221,7 @@ export default function DashboardPage() {
 
   return (
     <div className="space-y-4">
-      {/* 顶部极速状态控制条（单一极速扫描模式） */}
+      {/* 顶部极速状态控制条（单一极速扫描模式 + 质押合约安全异动哨兵） */}
       <div className="card flex flex-wrap items-center justify-between gap-3 px-4 py-3">
         <div className="flex flex-wrap items-center gap-5">
           <Stat label="监控仓位" value={list.length} />
@@ -175,6 +246,45 @@ export default function DashboardPage() {
               </span>
             )}
           </div>
+
+          {/* 顶部质押合约安全异动小提示（绿色小圆点 = 安全；红色脉冲 = 发现异动） */}
+          <button
+            type="button"
+            onClick={() => setShowSecurityDrawer((v) => !v)}
+            className={`inline-flex items-center gap-2 rounded-full border px-3 py-1 text-xs font-medium transition ${
+              hasSecAnomaly
+                ? "border-danger bg-danger/20 text-danger animate-pulse shadow-[0_0_12px_rgba(244,63,94,0.4)]"
+                : "border-emerald-500/35 bg-emerald-500/10 text-emerald-300 hover:bg-emerald-500/15"
+            }`}
+            title="点击查看 ZIA 质押合约安全状态（提取锁死开关 / withdraw 解押静态预演 / 管理员变更 / TVL 异动）"
+          >
+            <span
+              className={`inline-block h-2.5 w-2.5 rounded-full ${
+                hasSecAnomaly
+                  ? "bg-danger shadow-[0_0_8px_#f43f5e]"
+                  : "bg-emerald-400 shadow-[0_0_8px_#34d399]"
+              }`}
+            />
+            {hasSecAnomaly ? (
+              <span>
+                🚨 质押异动报警 ({secAnomalies.length})
+                {sec?.highFreqPushActive ? " · 高频推送中" : sec?.muted ? " · 已静音" : ""}
+              </span>
+            ) : (
+              <span>
+                质押安全
+                {sec && sec.checkedContracts > 0
+                  ? ` · ${sec.checkedContracts}池正常`
+                  : ""}
+                {sec && sec.simulatedPositions > 0
+                  ? ` · ${sec.simulatedPositions}仓解押预演通过`
+                  : ""}
+              </span>
+            )}
+            <span className="text-[10px] opacity-75">
+              {showSecurityDrawer ? "▲" : "▼"}
+            </span>
+          </button>
         </div>
         <div className="flex flex-wrap items-center gap-2">
           <button
@@ -195,6 +305,219 @@ export default function DashboardPage() {
           </button>
         </div>
       </div>
+
+      {/* 当发现质押异动时自动强制展开红色异动告警面板；平时点击顶部绿色小圆点可按需展开详情 */}
+      {(hasSecAnomaly || showSecurityDrawer) && (
+        <div
+          className={`card p-4 space-y-3 border ${
+            hasSecAnomaly
+              ? "border-danger/70 bg-danger/10"
+              : "border-emerald-500/30 bg-surface-1/90"
+          }`}
+        >
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex items-center gap-2">
+              <span
+                className={`inline-block h-2.5 w-2.5 rounded-full ${
+                  hasSecAnomaly
+                    ? "bg-danger shadow-[0_0_8px_#f43f5e]"
+                    : "bg-emerald-400 shadow-[0_0_8px_#34d399]"
+                }`}
+              />
+              <span className="text-sm font-semibold text-ink">
+                {hasSecAnomaly
+                  ? `🚨 ZIA 质押合约发现 ${secAnomalies.length} 项安全异动！`
+                  : "🛡️ ZIA 质押合约安全哨兵（全部合约状态正常）"}
+              </span>
+              {sec?.checkedAt && (
+                <span className="text-xs text-ink-muted">
+                  · 检测于 {timeAgo(sec.checkedAt)} ({sec.durationMs}ms)
+                </span>
+              )}
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
+              {hasSecAnomaly && (
+                <>
+                  {sec?.muted ? (
+                    <button
+                      type="button"
+                      disabled={secActionBusy}
+                      onClick={() => runSecurityAction("unmute")}
+                      className="btn-ghost btn-xs border border-amber-400/50 text-amber-300"
+                    >
+                      🔔 恢复高频报警推送
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      disabled={secActionBusy}
+                      onClick={() => runSecurityAction("mute")}
+                      className="btn-ghost btn-xs border border-danger/60 text-danger hover:bg-danger/20"
+                    >
+                      🔕 已知晓（暂停 20s 连环推送）
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    disabled={secActionBusy}
+                    onClick={() => runSecurityAction("accept_baseline")}
+                    className="btn-ghost btn-xs"
+                    title="若确认是官方正常更换管理员或手续费地址，可点击设为新安全基线"
+                  >
+                    ✅ 设为新基线
+                  </button>
+                </>
+              )}
+              <button
+                type="button"
+                disabled={secActionBusy}
+                onClick={() => runSecurityAction("scan")}
+                className="btn-ghost btn-xs"
+              >
+                {secActionBusy ? "⏳ 检查中…" : "⚡ 立即安检"}
+              </button>
+              <button
+                type="button"
+                disabled={secActionBusy}
+                onClick={() => runSecurityAction("test_alarm")}
+                className="btn-ghost btn-xs"
+                title="向 Bark 发送一条 level=critical + call=1 紧急响铃测试"
+              >
+                🔔 测试报警推送
+              </button>
+              {!hasSecAnomaly && (
+                <button
+                  type="button"
+                  onClick={() => setShowSecurityDrawer(false)}
+                  className="btn-ghost btn-xs"
+                >
+                  收起 ▲
+                </button>
+              )}
+            </div>
+          </div>
+
+          {/* 异动详情列表 */}
+          {hasSecAnomaly && (
+            <div className="space-y-2">
+              <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-danger/40 bg-danger/15 px-3 py-2 text-xs text-danger">
+                <span>
+                  {sec?.highFreqPushActive
+                    ? `🔊 高频 Bark 强提醒推送进行中（每 20 秒 1 次，已连续推送 ${sec.pushCount} 次）`
+                    : sec?.muted
+                    ? "🔇 当前异动已手动静音，后台仍每 30 秒持续追踪链上状态"
+                    : `⚡ 已触发异动报警（已推送 ${sec?.pushCount ?? 1} 次）`}
+                </span>
+                <span className="font-mono text-[11px]">
+                  建议立即检查下方质押中仓位并尝试「仅解押到钱包」或「解押并撤池」！
+                </span>
+              </div>
+              <div className="grid grid-cols-1 gap-2 md:grid-cols-2">
+                {secAnomalies.map((a) => (
+                  <div
+                    key={a.id}
+                    className="rounded-lg border border-danger/50 bg-surface-0/90 p-3 text-xs space-y-1"
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="font-semibold text-danger">
+                        {a.severity === "critical" ? "🚨 极高危" : "⚠️ 预警"} ·{" "}
+                        {a.pairLabel}
+                      </span>
+                      <span className="font-mono text-[11px] text-ink-muted">
+                        {short(a.contract)}
+                      </span>
+                    </div>
+                    <div className="font-medium text-ink">{a.title}</div>
+                    <div className="text-ink-soft">{a.detail}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* 质押合约安全体检明细表 */}
+          {showSecurityDrawer && sec && sec.contracts.length > 0 && (
+            <div className="overflow-x-auto rounded-lg border border-border/60 bg-surface-0/60">
+              <table className="w-full text-left text-xs">
+                <thead className="border-b border-border/60 bg-surface-2/60 text-ink-muted">
+                  <tr>
+                    <th className="px-3 py-2">质押池 (费率)</th>
+                    <th className="px-3 py-2">合约 / 凭证</th>
+                    <th className="px-3 py-2">提取开关 (0x054f7d9c)</th>
+                    <th className="px-3 py-2">存入开关 (paused)</th>
+                    <th className="px-3 py-2">管理员 (owner)</th>
+                    <th className="px-3 py-2">池内质押 NFT</th>
+                    <th className="px-3 py-2">我的仓位解押预演</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-border/40">
+                  {sec.contracts.map((c) => (
+                    <tr key={c.id} className="hover:bg-surface-2/30">
+                      <td className="px-3 py-2 font-medium text-ink">
+                        {c.pairLabel}{" "}
+                        {c.poolFee ? (
+                          <span className="text-[11px] text-cyan-300">
+                            ({c.poolFee / 10000}%)
+                          </span>
+                        ) : null}
+                      </td>
+                      <td className="px-3 py-2 font-mono text-ink-soft">
+                        {short(c.contract)}{" "}
+                        <span className="text-ink-muted">({c.symbol})</span>
+                      </td>
+                      <td className="px-3 py-2">
+                        {c.withdrawPaused ? (
+                          <span className="text-danger font-semibold">
+                            🔒 禁止提取
+                          </span>
+                        ) : (
+                          <span className="text-emerald-400">🟢 正常可提</span>
+                        )}
+                      </td>
+                      <td className="px-3 py-2">
+                        {c.paused ? (
+                          <span className="text-amber-300 font-semibold">
+                            ⏸️ 暂停存入
+                          </span>
+                        ) : (
+                          <span className="text-emerald-400">🟢 正常可存</span>
+                        )}
+                      </td>
+                      <td className="px-3 py-2 font-mono">
+                        <span
+                          className={
+                            c.owner !== c.baselineOwner
+                              ? "text-danger font-semibold"
+                              : "text-ink-soft"
+                          }
+                        >
+                          {short(c.owner)}
+                        </span>
+                      </td>
+                      <td className="px-3 py-2 font-mono text-ink">
+                        {c.totalStakedCount} 个
+                      </td>
+                      <td className="px-3 py-2">
+                        {c.userStakedPositionsSimFailed > 0 ? (
+                          <span className="text-danger font-semibold">
+                            ❌ {c.userStakedPositionsSimFailed} 仓 Revert
+                          </span>
+                        ) : c.userStakedPositionsSimOk > 0 ? (
+                          <span className="text-emerald-400">
+                            ✅ {c.userStakedPositionsSimOk} 仓预演通过
+                          </span>
+                        ) : (
+                          <span className="text-ink-muted">无质押仓位</span>
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      )}
 
       {/* 扫描频率和告警阈值设置（按需展开，保持首屏紧凑） */}
       {showScanSettings && (
