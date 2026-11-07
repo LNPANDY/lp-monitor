@@ -124,6 +124,87 @@ interface MonitorState {
     pushCount: number;
     lastPushAt: string | null;
   } | null;
+  merklRewards?: MerklRewardsSummary | null;
+}
+
+interface PositionRewardEstimate {
+  positionId?: number;
+  tokenId: string;
+  pool: string;
+  vault: string;
+  pairLabel: string;
+  inRange: boolean;
+  positionUsd: number;
+  activeLShare: number;
+  token0Share: number;
+  token1Share: number;
+  rewardShare: number;
+  poolDailyW0g: number;
+  poolHourlyW0g: number;
+  hourlyW0g: number;
+  hourlyUsd: number;
+  dailyW0g: number;
+  dailyUsd: number;
+  aprPct: number;
+  potentialDailyW0g: number;
+  potentialDailyUsd: number;
+  potentialAprPct: number;
+}
+
+interface PoolRewardRadarItem {
+  key: string;
+  pairLabel: string;
+  chainIdRef: number;
+  pool: string;
+  vault: string;
+  fee: number;
+  tickSpacing: number;
+  currentTick: number;
+  tickLower: number;
+  tickUpper: number;
+  subTickMarginLowerPct: number;
+  subTickMarginUpperPct: number;
+  subTickMinMarginPct: number;
+  dailyW0g: number;
+  hourlyW0g: number;
+  dailyRewardUsd: number;
+  stakedTvlUsd: number;
+  narrowStakedTvlUsd: number;
+  narrowPositionCount: number;
+  totalStakedCount: number;
+  sim1000ActiveLShare: number;
+  sim1000RewardShare: number;
+  sim1000HourlyW0g: number;
+  sim1000HourlyUsd: number;
+  sim1000DailyW0g: number;
+  sim1000DailyUsd: number;
+  sim1000AprPct: number;
+  isHighApr: boolean;
+}
+
+interface MerklRewardsSummary {
+  checkedAt: string;
+  durationMs: number;
+  chainIdRef: number | null;
+  w0gPriceUsd: number;
+  w0gPriceSource: string;
+  epochStartIso: string;
+  epochEndIso: string;
+  epochRemainingHours: number;
+  totalDailyW0g: number;
+  totalDailyUsd: number;
+  userTotalStakedUsd: number;
+  userTotalHourlyW0g: number;
+  userTotalHourlyUsd: number;
+  userTotalDailyW0g: number;
+  userTotalDailyUsd: number;
+  userWeightedAprPct: number;
+  positions: Record<string, PositionRewardEstimate>;
+  pools: PoolRewardRadarItem[];
+  highAprAlertEnabled: boolean;
+  highAprThresholdPct: number;
+  highAprPoolsCount: number;
+  alertsSent: number;
 }
 
 export default function DashboardPage() {
@@ -146,6 +227,11 @@ export default function DashboardPage() {
     fetcher,
     { refreshInterval: 10_000 }
   );
+  const { data: merklDirect, mutate: reloadMerkl } = useSWR<MerklRewardsSummary>(
+    "/api/merkl-rewards",
+    fetcher,
+    { refreshInterval: 30_000 }
+  );
 
   const list = positions ?? [];
   const outOfRange = list.filter((p) => p.last_in_range === 0);
@@ -155,11 +241,47 @@ export default function DashboardPage() {
   const [showPortfolio, setShowPortfolio] = useState(false);
   const [showSecurityDrawer, setShowSecurityDrawer] = useState(false);
   const [secActionBusy, setSecActionBusy] = useState(false);
+  const [showMerklDrawer, setShowMerklDrawer] = useState(false);
+  const [merklBusy, setMerklBusy] = useState(false);
+  const [aprThreshInput, setAprThreshInput] = useState<string>("");
 
   const sec: MonitorState["stakingSecurity"] =
     mon?.stakingSecurity ?? mon?.lastCombined?.stakingSecurity ?? null;
   const secAnomalies = sec?.anomalies ?? [];
   const hasSecAnomaly = secAnomalies.length > 0;
+
+  const merkl: MerklRewardsSummary | null =
+    merklDirect ?? mon?.merklRewards ?? mon?.lastCombined?.merklRewards ?? null;
+
+  useEffect(() => {
+    if (merkl && !aprThreshInput) {
+      setAprThreshInput(String(merkl.highAprThresholdPct || 800));
+    }
+  }, [merkl, aprThreshInput]);
+
+  async function runMerklAction(
+    action: "scan" | "update_settings" | "test_alert",
+    payload?: { highAprAlertEnabled?: boolean; highAprThresholdPct?: number }
+  ) {
+    setMerklBusy(true);
+    try {
+      const r = await fetch("/api/merkl-rewards", {
+        method: "POST",
+        headers: authHeaders({ "Content-Type": "application/json" }),
+        body: JSON.stringify({ action, ...payload }),
+      });
+      const j = await r.json();
+      if (!j.ok) {
+        alert(j.error || "操作失败");
+      } else if (action === "test_alert") {
+        alert("✅ 已向 Bark / 已配置渠道发送高 APR 机会测试推送！");
+      }
+      reloadMerkl();
+      reloadMon();
+    } finally {
+      setMerklBusy(false);
+    }
+  }
 
   async function runSecurityAction(action: "scan" | "mute" | "unmute" | "accept_baseline" | "test_alarm") {
     setSecActionBusy(true);
@@ -204,13 +326,16 @@ export default function DashboardPage() {
     if (!j.ok) alert(j.error);
     reloadPos();
     reloadMon();
+    reloadMerkl();
     setTimeout(() => {
       reloadPos();
       reloadMon();
+      reloadMerkl();
     }, 3_000);
     setTimeout(() => {
       reloadPos();
       reloadMon();
+      reloadMerkl();
     }, 8_000);
   }
 
@@ -221,9 +346,9 @@ export default function DashboardPage() {
 
   return (
     <div className="space-y-4">
-      {/* 顶部极速状态控制条（单一极速扫描模式 + 质押合约安全异动哨兵） */}
+      {/* 顶部极速状态控制条（单一极速扫描模式 + 质押合约安全异动哨兵 + Merkl 奖励与高 APR 雷达） */}
       <div className="card flex flex-wrap items-center justify-between gap-3 px-4 py-3">
-        <div className="flex flex-wrap items-center gap-5">
+        <div className="flex flex-wrap items-center gap-4">
           <Stat label="监控仓位" value={list.length} />
           <Stat
             label="越界"
@@ -283,6 +408,39 @@ export default function DashboardPage() {
             )}
             <span className="text-[10px] opacity-75">
               {showSecurityDrawer ? "▲" : "▼"}
+            </span>
+          </button>
+
+          {/* 顶部 Merkl 质押总奖励 & 高 APR 猎手雷达胶囊 */}
+          <button
+            type="button"
+            onClick={() => setShowMerklDrawer((v) => !v)}
+            className={`inline-flex items-center gap-2 rounded-full border px-3 py-1 text-xs font-medium transition ${
+              merkl && merkl.highAprPoolsCount > 0
+                ? "border-amber-400/50 bg-amber-500/15 text-amber-200 hover:bg-amber-500/25 shadow-[0_0_10px_rgba(245,158,11,0.2)]"
+                : "border-cyan-500/35 bg-cyan-500/10 text-cyan-200 hover:bg-cyan-500/20"
+            }`}
+            title="点击展开 ZIA Merkl 质押奖励实时精算 & 全池高 APR 机会猎手雷达"
+          >
+            <span>
+              🎁 质押产出:{" "}
+              {merkl ? (
+                <span className="font-mono font-semibold text-white">
+                  ${merkl.userTotalHourlyUsd.toFixed(2)}/h · $
+                  {merkl.userTotalDailyUsd.toFixed(1)}/d ({merkl.userTotalDailyW0g.toFixed(0)} W0G)
+                </span>
+              ) : (
+                "测算中…"
+              )}
+            </span>
+            {merkl && merkl.pools.length > 0 && (
+              <span className="rounded bg-amber-500/25 px-1.5 py-0.5 font-mono text-[11px] text-amber-200 border border-amber-400/30">
+                🔥 最高池 {merkl.pools[0].pairLabel.split(" ")[0]}{" "}
+                {merkl.pools[0].sim1000AprPct.toFixed(0)}% APR
+              </span>
+            )}
+            <span className="text-[10px] opacity-75">
+              {showMerklDrawer ? "▲" : "▼"}
             </span>
           </button>
         </div>
@@ -519,6 +677,238 @@ export default function DashboardPage() {
         </div>
       )}
 
+      {/* Merkl 质押奖励精算 & 全池高 APR 机会猎手抽屉（点击顶部「🎁 质押产出」胶囊展开） */}
+      {showMerklDrawer && (
+        <div className="card p-4 space-y-3 border border-cyan-500/35 bg-surface-1/95">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="text-sm font-semibold text-ink">
+                🎯 ZIA Merkl 质押奖励精算 & 高 APR 机会猎手（50% 活跃L + 25% Token0 + 25% Token1）
+              </span>
+              {merkl && (
+                <span className="text-xs font-mono text-cyan-300">
+                  · 0G 实时价 ${merkl.w0gPriceUsd.toFixed(4)} ({merkl.w0gPriceSource})
+                </span>
+              )}
+              {merkl?.checkedAt && (
+                <span className="text-xs text-ink-muted">
+                  · 更新于 {timeAgo(merkl.checkedAt)} ({merkl.durationMs}ms)
+                </span>
+              )}
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
+              <label className="inline-flex items-center gap-1.5 text-xs text-ink-soft">
+                <input
+                  type="checkbox"
+                  checked={merkl?.highAprAlertEnabled ?? true}
+                  disabled={merklBusy}
+                  onChange={(e) =>
+                    runMerklAction("update_settings", {
+                      highAprAlertEnabled: e.target.checked,
+                    })
+                  }
+                />
+                <span>高APR推送提醒</span>
+              </label>
+              <div className="inline-flex items-center gap-1 text-xs">
+                <span className="text-ink-soft">阈值 ≥</span>
+                <input
+                  type="number"
+                  className="input w-20 px-2 py-0.5 text-xs font-mono"
+                  value={aprThreshInput}
+                  onChange={(e) => setAprThreshInput(e.target.value)}
+                />
+                <span className="text-ink-soft">%</span>
+                <button
+                  type="button"
+                  disabled={merklBusy}
+                  onClick={() =>
+                    runMerklAction("update_settings", {
+                      highAprThresholdPct: Number(aprThreshInput) || 800,
+                    })
+                  }
+                  className="btn-ghost btn-xs"
+                >
+                  保存
+                </button>
+              </div>
+              <button
+                type="button"
+                disabled={merklBusy}
+                onClick={() => runMerklAction("scan")}
+                className="btn-ghost btn-xs"
+              >
+                {merklBusy ? "⏳ 测算中…" : "⚡ 刷新测算"}
+              </button>
+              <button
+                type="button"
+                disabled={merklBusy}
+                onClick={() => runMerklAction("test_alert")}
+                className="btn-ghost btn-xs"
+                title="向 Bark 发送当前榜首高 APR 池的实时测算提醒"
+              >
+                🔔 测试高APR推送
+              </button>
+              <button
+                type="button"
+                onClick={() => setShowMerklDrawer(false)}
+                className="btn-ghost btn-xs"
+              >
+                收起 ▲
+              </button>
+            </div>
+          </div>
+
+          {/* 我的质押总收益概览条 */}
+          {merkl && (
+            <div className="grid grid-cols-2 gap-2.5 sm:grid-cols-4 rounded-lg border border-cyan-500/25 bg-cyan-500/5 p-3 text-xs">
+              <div>
+                <div className="text-ink-soft">我的已质押总本金</div>
+                <div className="mt-0.5 font-mono text-base font-bold text-ink">
+                  ${merkl.userTotalStakedUsd.toFixed(1)}
+                </div>
+              </div>
+              <div>
+                <div className="text-ink-soft">预计每小时总奖励</div>
+                <div className="mt-0.5 font-mono text-base font-bold text-emerald-300">
+                  {merkl.userTotalHourlyW0g.toFixed(2)} W0G{" "}
+                  <span className="text-xs font-normal text-emerald-200">
+                    (${merkl.userTotalHourlyUsd.toFixed(2)}/h)
+                  </span>
+                </div>
+              </div>
+              <div>
+                <div className="text-ink-soft">预计每天总奖励</div>
+                <div className="mt-0.5 font-mono text-base font-bold text-emerald-300">
+                  {merkl.userTotalDailyW0g.toFixed(1)} W0G{" "}
+                  <span className="text-xs font-normal text-emerald-200">
+                    (${merkl.userTotalDailyUsd.toFixed(2)}/d)
+                  </span>
+                </div>
+              </div>
+              <div>
+                <div className="text-ink-soft">我的质押综合 APR</div>
+                <div className="mt-0.5 font-mono text-base font-bold text-amber-300">
+                  {merkl.userWeightedAprPct.toFixed(1)}%{" "}
+                  <span className="text-[11px] font-normal text-ink-muted">
+                    (本周期剩 {(merkl.epochRemainingHours / 24).toFixed(1)} 天)
+                  </span>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* 6 大 ZIA 激励池实时高 APR 猎手排行榜 */}
+          {merkl && merkl.pools.length > 0 && (
+            <div className="overflow-x-auto rounded-lg border border-border/60 bg-surface-0/60">
+              <table className="w-full text-left text-xs">
+                <thead className="border-b border-border/60 bg-surface-2/60 text-ink-muted">
+                  <tr>
+                    <th className="px-3 py-2">激励池 (费率)</th>
+                    <th className="px-3 py-2">池日产预算</th>
+                    <th className="px-3 py-2">池内窄幅竞争 vs 总质押TVL</th>
+                    <th className="px-3 py-2">现价距单格边界</th>
+                    <th className="px-3 py-2">投 $1,000 单格稀释后占比</th>
+                    <th className="px-3 py-2">投 $1,000 预计每时 / 每天</th>
+                    <th className="px-3 py-2">千刀单格真实 APR</th>
+                    <th className="px-3 py-2">操作</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-border/40">
+                  {merkl.pools.map((p, idx) => (
+                    <tr
+                      key={p.key}
+                      className={
+                        p.isHighApr
+                          ? "bg-amber-500/10 hover:bg-amber-500/15"
+                          : "hover:bg-surface-2/30"
+                      }
+                    >
+                      <td className="px-3 py-2 font-medium text-ink">
+                        <span className="mr-1.5 font-mono text-ink-muted">
+                          #{idx + 1}
+                        </span>
+                        {p.pairLabel}
+                      </td>
+                      <td className="px-3 py-2 font-mono text-ink">
+                        {p.dailyW0g.toFixed(0)} W0G/d{" "}
+                        <span className="text-ink-soft">
+                          (${p.dailyRewardUsd.toFixed(0)})
+                        </span>
+                      </td>
+                      <td className="px-3 py-2 font-mono">
+                        <span
+                          className={
+                            p.narrowStakedTvlUsd < 500
+                              ? "text-emerald-300 font-semibold"
+                              : "text-amber-200"
+                          }
+                          title="当前池内宽度 ≤ 4 格的在位窄区间竞争资金（决定抢 50% 活跃 L 奖池的难易度）"
+                        >
+                          窄幅 ${p.narrowStakedTvlUsd.toFixed(0)} ({p.narrowPositionCount}仓)
+                        </span>{" "}
+                        <span className="text-ink-muted">
+                          / 总 ${p.stakedTvlUsd.toFixed(0)}
+                        </span>
+                      </td>
+                      <td className="px-3 py-2 font-mono">
+                        <span
+                          className={
+                            p.subTickMinMarginPct < 15
+                              ? "text-warn font-semibold"
+                              : "text-emerald-300"
+                          }
+                          title={`当前单格 [${p.tickLower}, ${p.tickUpper}]：距下界 ${p.subTickMarginLowerPct.toFixed(0)}% / 距上界 ${p.subTickMarginUpperPct.toFixed(0)}%`}
+                        >
+                          {p.subTickMinMarginPct < 15 ? "⚠️ 贴边 " : "🟢 居中 "}
+                          {p.subTickMarginLowerPct.toFixed(0)}% /{" "}
+                          {p.subTickMarginUpperPct.toFixed(0)}%
+                        </span>
+                      </td>
+                      <td className="px-3 py-2 font-mono text-cyan-300">
+                        活跃L {(p.sim1000ActiveLShare * 100).toFixed(1)}%{" "}
+                        <span className="text-ink-muted">
+                          (综合 {(p.sim1000RewardShare * 100).toFixed(1)}%)
+                        </span>
+                      </td>
+                      <td className="px-3 py-2 font-mono text-emerald-300">
+                        <div>
+                          ${p.sim1000HourlyUsd.toFixed(2)}/h ({p.sim1000HourlyW0g.toFixed(1)} W0G)
+                        </div>
+                        <div className="text-[11px] text-emerald-200/80">
+                          ${p.sim1000DailyUsd.toFixed(1)}/d ({p.sim1000DailyW0g.toFixed(0)} W0G)
+                        </div>
+                      </td>
+                      <td className="px-3 py-2 font-mono">
+                        <span
+                          className={`rounded px-1.5 py-0.5 font-bold ${
+                            p.isHighApr
+                              ? "bg-amber-500/25 text-amber-200 border border-amber-400/40"
+                              : "text-ink"
+                          }`}
+                        >
+                          {p.isHighApr ? "🔥 " : ""}
+                          {p.sim1000AprPct.toFixed(0)}%
+                        </span>
+                      </td>
+                      <td className="px-3 py-2">
+                        <button
+                          type="button"
+                          onClick={() => handleReopenPool(p.chainIdRef, p.pool)}
+                          className="btn-ghost btn-xs border border-cyan-500/35 text-cyan-200 hover:bg-cyan-500/20"
+                        >
+                          🎯 探针/建仓
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      )}
+
       {/* 扫描频率和告警阈值设置（按需展开，保持首屏紧凑） */}
       {showScanSettings && (
         <ScanIntervalAndAlerts
@@ -570,6 +960,11 @@ export default function DashboardPage() {
                   <PositionCard
                     key={p.id}
                     p={p}
+                    rewardEst={
+                      merkl?.positions?.[String(p.token_id)] ??
+                      merkl?.positions?.[`id:${p.id}`]
+                    }
+                    w0gPriceUsd={merkl?.w0gPriceUsd}
                     highlight
                     onFlipped={reloadPos}
                     onReopenPool={handleReopenPool}
@@ -592,6 +987,11 @@ export default function DashboardPage() {
                   <PositionCard
                     key={p.id}
                     p={p}
+                    rewardEst={
+                      merkl?.positions?.[String(p.token_id)] ??
+                      merkl?.positions?.[`id:${p.id}`]
+                    }
+                    w0gPriceUsd={merkl?.w0gPriceUsd}
                     onFlipped={reloadPos}
                     onReopenPool={handleReopenPool}
                   />
@@ -1404,12 +1804,16 @@ function CexAlertMuteButton({
 
 function PositionCard({
   p,
+  rewardEst,
+  w0gPriceUsd,
   highlight,
   closed,
   onFlipped,
   onReopenPool,
 }: {
   p: Position;
+  rewardEst?: PositionRewardEstimate;
+  w0gPriceUsd?: number;
   highlight?: boolean;
   closed?: boolean;
   onFlipped?: () => void;
@@ -1594,6 +1998,75 @@ function PositionCard({
             <span>距上界 {marginUpper.toFixed(1)}%</span>
           </div>
         </div>
+
+        {/* 已质押仓位：实时每小时 / 每日 Merkl 奖励估算（按 CEX 实时 0G 价格折算 USD） */}
+        {!closed && p.source === "staking" && rewardEst && (
+          <div
+            className={`my-2 rounded-lg border p-2.5 text-xs space-y-1.5 ${
+              rewardEst.inRange
+                ? "border-emerald-500/35 bg-emerald-500/10"
+                : "border-amber-500/40 bg-amber-500/10"
+            }`}
+          >
+            <div className="flex flex-wrap items-center justify-between gap-1">
+              <span className="font-semibold text-ink">
+                🎁 质押奖励估算{" "}
+                <span className="font-normal text-ink-soft">
+                  (0G=${(w0gPriceUsd ?? 0).toFixed(4)})
+                </span>
+              </span>
+              <span
+                className={`rounded px-1.5 py-0.5 font-mono font-bold ${
+                  rewardEst.inRange
+                    ? "bg-emerald-500/25 text-emerald-200 border border-emerald-400/30"
+                    : "bg-amber-500/25 text-amber-200 border border-amber-400/30"
+                }`}
+              >
+                APR {rewardEst.aprPct.toFixed(1)}%
+              </span>
+            </div>
+
+            <div className="grid grid-cols-2 gap-2 pt-0.5 font-mono">
+              <div className="rounded bg-surface-0/60 px-2 py-1">
+                <div className="text-[10px] font-sans text-ink-soft">⏱ 每小时奖励</div>
+                <div className="text-emerald-300 font-semibold">
+                  ${rewardEst.hourlyUsd.toFixed(2)}/h
+                </div>
+                <div className="text-[11px] text-ink-soft">
+                  {rewardEst.hourlyW0g.toFixed(2)} W0G/h
+                </div>
+              </div>
+              <div className="rounded bg-surface-0/60 px-2 py-1">
+                <div className="text-[10px] font-sans text-ink-soft">📅 每天奖励</div>
+                <div className="text-emerald-300 font-semibold">
+                  ${rewardEst.dailyUsd.toFixed(2)}/d
+                </div>
+                <div className="text-[11px] text-ink-soft">
+                  {rewardEst.dailyW0g.toFixed(1)} W0G/d
+                </div>
+              </div>
+            </div>
+
+            <div className="flex flex-wrap items-center justify-between gap-1 text-[11px] font-mono text-ink-soft">
+              <span>本金 ≈ ${rewardEst.positionUsd.toFixed(0)}</span>
+              <span>
+                活跃L占比 {(rewardEst.activeLShare * 100).toFixed(1)}% · 综合分{" "}
+                {(rewardEst.rewardShare * 100).toFixed(1)}%
+              </span>
+            </div>
+
+            {!rewardEst.inRange && rewardEst.potentialDailyUsd > rewardEst.dailyUsd && (
+              <div className="rounded border border-amber-400/30 bg-amber-500/15 px-2 py-1 text-[11px] text-amber-200">
+                ⚠️ 当前已越界，50% 活跃L奖励暂停！重开回区间预计可恢复至{" "}
+                <span className="font-mono font-semibold">
+                  {rewardEst.potentialDailyW0g.toFixed(1)} W0G/d ($
+                  {rewardEst.potentialDailyUsd.toFixed(2)}/d · APR{" "}
+                  {rewardEst.potentialAprPct.toFixed(0)}%)
+                </span>
+              </div>
+            )}
+          </div>
+        )}
 
         <Row label={p.source === "staking" ? "质押钱包" : "持仓钱包"}>
           <span

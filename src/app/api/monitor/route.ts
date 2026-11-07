@@ -14,6 +14,10 @@ import {
   getLastStakingSecuritySummary,
   scanStakingSecurity,
 } from "@/lib/monitor/staking-security";
+import {
+  getLastMerklRewardsSummary,
+  scanMerklRewardsAndApr,
+} from "@/lib/monitor/merkl-rewards";
 import { ok, fail, getBody } from "@/lib/api";
 
 export const dynamic = "force-dynamic";
@@ -26,6 +30,10 @@ export async function GET() {
     // 首次启动时尚未完成首轮扫描，异步触发一次快速质押安全检查
     scanStakingSecurity().catch(() => {});
   }
+  let merklRewards = getLastMerklRewardsSummary();
+  if (!merklRewards) {
+    scanMerklRewardsAndApr().catch(() => {});
+  }
   return ok({
     combinedRunning: isCombinedRunning(),
     fullRunning: isFullRunning(),
@@ -34,6 +42,7 @@ export async function GET() {
     lastCombined: lastCombinedSummary(),
     lastFull: lastFullScanSummary(),
     stakingSecurity,
+    merklRewards,
   });
 }
 

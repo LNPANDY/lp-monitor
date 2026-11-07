@@ -24,6 +24,11 @@ import {
   getLastStakingSecuritySummary,
   type StakingSecuritySummary,
 } from "./staking-security";
+import {
+  scanMerklRewardsAndApr,
+  getLastMerklRewardsSummary,
+  type MerklRewardsSummary,
+} from "./merkl-rewards";
 import { getScanCron } from "../db/settings";
 import { getSetting, setSetting } from "../db/settings";
 
@@ -32,6 +37,7 @@ export interface CombinedScanSummary {
   fast: FastDiscoverSummary | null;  // 可能因 fast 内部异常而 null
   favPools?: FavPoolScanSummary;      // 收藏池监控（Step 1.5，失败时缺省）
   stakingSecurity?: StakingSecuritySummary; // 质押合约安全哨兵（Step 1.8）
+  merklRewards?: MerklRewardsSummary; // Merkl 质押奖励与高 APR 猎手（Step 1.9）
   known: KnownPositionsSummary | null; // 同上
   startedAt: string;
   durationMs: number;
@@ -219,6 +225,7 @@ async function runCombinedScanWrapper(opts?: { forceFullInventory?: boolean }) {
   let fastSummary: FastDiscoverSummary | null = null;
   let favPoolsSummary: FavPoolScanSummary | null = null;
   let stakingSecSummary: StakingSecuritySummary | null = null;
+  let merklRewardsSummary: MerklRewardsSummary | null = null;
   let knownSummary: KnownPositionsSummary | null = null;
   let combinedError: string | undefined;
 
@@ -257,6 +264,14 @@ async function runCombinedScanWrapper(opts?: { forceFullInventory?: boolean }) {
     const tKnown0 = Date.now();
     knownSummary = await scanKnownPositions();
     console.log(`[scheduler-enhanced] known scan done: ${knownSummary.positions} positions, ${knownSummary.active} active, ${knownSummary.alertsSent} alerts, (${Date.now()-tKnown0}ms)`);
+
+    // ===== Step 2.5: Merkl 质押奖励估算 & 高 APR 机会猎手（在 known scan 更新完仓位后执行）=====
+    try {
+      merklRewardsSummary = await scanMerklRewardsAndApr();
+      console.log(`[scheduler-enhanced] merkl rewards done: userDaily=${merklRewardsSummary.userTotalDailyW0g.toFixed(1)}W0G ($${merklRewardsSummary.userTotalDailyUsd.toFixed(2)}) highAprPools=${merklRewardsSummary.highAprPoolsCount} (${merklRewardsSummary.durationMs}ms)`);
+    } catch (e) {
+      console.error("[scheduler-enhanced] merkl rewards scan failed:", e);
+    }
   } catch (e: any) {
     combinedError = e?.message ?? String(e);
     console.error("[scheduler-enhanced] unified scan failed:", e);
@@ -269,6 +284,7 @@ async function runCombinedScanWrapper(opts?: { forceFullInventory?: boolean }) {
     fast: fastSummary,
     favPools: favPoolsSummary ?? undefined,
     stakingSecurity: stakingSecSummary ?? getLastStakingSecuritySummary() ?? undefined,
+    merklRewards: merklRewardsSummary ?? getLastMerklRewardsSummary() ?? undefined,
     known: knownSummary,
     startedAt: new Date(startedAt).toISOString(),
     durationMs: Date.now() - startedAt,
