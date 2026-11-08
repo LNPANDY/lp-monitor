@@ -15,6 +15,8 @@ import {
   verifyNftPoolMatch,
   extractMintedTokenIdFromReceipt,
   waitForTxReceipt,
+  sendTxWithCancelRetry,
+  readNftOnChainStatus,
 } from "@/lib/wallet/use-wallet";
 import {
   buildApproveCalldata,
@@ -64,7 +66,6 @@ export function MintPositionPanel({
     chainId: walletChainId,
     connect,
     switchChain,
-    sendTx,
   } = useWallet();
   const { data: chains } = useSWR<any[]>("/api/chains", fetcher);
 
@@ -90,6 +91,19 @@ export function MintPositionPanel({
   const [busy, setBusy] = useState(false);
   const [togglingAllApprove, setTogglingAllApprove] = useState(false);
   const [msg, setMsg] = useState("");
+
+  // 当 Mint 已成功但质押步骤在钱包中被取消/中断时，保留待质押 NFT 信息供一键断点重试
+  const [pendingStakeInfo, setPendingStakeInfo] = useState<{
+    tokenId: string;
+    npm: string;
+    staker: string;
+    stakerLabel: string;
+    nftApproved: boolean;
+  } | null>(null);
+  const [canRetryExecute, setCanRetryExecute] = useState(false);
+  const [failedToggleApprove, setFailedToggleApprove] = useState<
+    boolean | null
+  >(null);
 
   // 记录已初始化默认方向的池，首次加载或翻转变化时自动将投入币种设为主币
   const initializedPoolRef = useRef<string>("");
@@ -390,10 +404,11 @@ export function MintPositionPanel({
     }
   }
 
-  /** 开启/关闭 Staker 的 setApprovalForAll（免每次建仓后的单 NFT 授权签名） */
+  /** 开启/关闭 Staker 的 setApprovalForAll（免每次建仓后的单 NFT 授权签名，支持取消后重试） */
   async function handleToggleApprovalForAll(approve: boolean) {
     if (!data?.dex || !data?.matchedStaking?.[0]) return;
     setTogglingAllApprove(true);
+    setFailedToggleApprove(null);
     setMsg("");
     try {
       let currentAddr = address;
@@ -406,7 +421,10 @@ export function MintPositionPanel({
       }
       const staker = data.matchedStaking[0].contract;
       const tx = buildSetApprovalForAllCalldata(data.dex.npm, staker, approve);
-      await sendTx(tx);
+      await sendTxWithCancelRetry(
+        tx,
+        approve ? "开启 NFT 免签质押授权" : "撤销 NFT 免签质押授权"
+      );
       await new Promise((r) => setTimeout(r, 1500));
       await fetchPool({ withCompute: !!amount, withWallet: true });
       setMsg(
@@ -415,13 +433,109 @@ export function MintPositionPanel({
           : "✅ 已撤销 NFT 免签质押授权"
       );
     } catch (e: any) {
-      setMsg(`❌ 授权操作失败：${e?.message ?? e}`);
+      setFailedToggleApprove(approve);
+      setMsg(`❌ 授权操作已取消或未完成：${e?.message ?? e}`);
     } finally {
       setTogglingAllApprove(false);
     }
   }
 
-  /** 执行创建流程 */
+  /**
+   * 针对「仓位已创建 (Mint 已成功)，但质押步骤在钱包中被取消/中断」的独立一键断点重试函数
+   */
+  async function handleRetryPendingStake() {
+    if (!pendingStakeInfo) return;
+    setBusy(true);
+    setMsg("");
+    const { tokenId, npm, staker } = pendingStakeInfo;
+    const tokenIdBig = BigInt(tokenId);
+
+    const setStep = (i: number, patch: Partial<(typeof steps)[0]>) =>
+      setSteps((prev) =>
+        prev.map((s, idx) => (idx === i ? { ...s, ...patch } : s))
+      );
+
+    try {
+      let currentAddr = address;
+      if (!currentAddr) {
+        currentAddr = await connect();
+        if (!currentAddr) throw new Error("请先连接钱包");
+      }
+      if (data?.chain?.chain_id && walletChainId !== data.chain.chain_id) {
+        await switchChain(data.chain.chain_id);
+      }
+
+      if (steps.length >= 4) {
+        setStep(3, { status: "loading" });
+      }
+
+      const onChain = await readNftOnChainStatus(
+        npm,
+        tokenIdBig,
+        currentAddr,
+        staker
+      );
+
+      if (onChain.isStakedOnChain === true) {
+        if (steps.length >= 4) setStep(3, { status: "done" });
+        setPendingStakeInfo(null);
+        setMsg(`✅ 仓位 #${tokenId} 已在质押合约中，状态已同步！`);
+        fetch("/api/monitor", {
+          method: "POST",
+          headers: authHeaders({ "Content-Type": "application/json" }),
+          body: JSON.stringify({ mode: "combined" }),
+        }).catch(() => {});
+        onCreated?.();
+        return;
+      }
+
+      const alreadyApproved =
+        pendingStakeInfo.nftApproved ||
+        onChain.approvedForAllToStaker ||
+        onChain.singleApprovedToStaker;
+
+      if (!alreadyApproved) {
+        const approveNft = buildNftApproveCalldata(npm, staker, tokenIdBig);
+        const ha = await sendTxWithCancelRetry(
+          { ...approveNft, gas: 100000n },
+          `授权 NFT #${tokenId} 给质押合约`
+        );
+        await waitForTxReceipt(ha, 15000);
+        setPendingStakeInfo((prev) =>
+          prev ? { ...prev, nftApproved: true } : null
+        );
+      }
+
+      const dep = buildStakeDepositCalldata(staker, tokenIdBig);
+      const hd = await sendTxWithCancelRetry(
+        { ...dep, gas: 350000n },
+        `质押 #${tokenId}`
+      );
+      await waitForTxReceipt(hd, 15000);
+      if (steps.length >= 4) {
+        setStep(3, { status: "done", hash: hd });
+      }
+      setPendingStakeInfo(null);
+      setMsg(`✅ #${tokenId} 重试质押成功！`);
+      fetch("/api/monitor", {
+        method: "POST",
+        headers: authHeaders({ "Content-Type": "application/json" }),
+        body: JSON.stringify({ mode: "combined" }),
+      }).catch(() => {});
+      onCreated?.();
+    } catch (e: any) {
+      if (steps.length >= 4) {
+        setStep(3, { status: "error" });
+      }
+      setMsg(
+        `⚠️ 仓位 #${tokenId} 质押仍未完成：${e?.message ?? e}（可再次点击下方「🔄 重试质押」按钮继续）`
+      );
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  /** 执行创建流程（每步均支持钱包取消后立即重试 + 页面内联断点重试） */
   async function execute() {
     if (!address) {
       await connect();
@@ -437,9 +551,15 @@ export function MintPositionPanel({
     }
 
     setBusy(true);
+    setCanRetryExecute(false);
+    setPendingStakeInfo(null);
     setMsg("");
     const npm = data.dex.npm;
     const staker = data.matchedStaking?.[0]?.contract ?? "";
+    const stakerLabel =
+      data.matchedStaking?.[0]?.pair_label ||
+      data.matchedStaking?.[0]?.platform ||
+      "质押合约";
     const need0 = BigInt(data.compute.amount0);
     const need1 = BigInt(data.compute.amount1);
     const appr = data.approvals;
@@ -461,10 +581,9 @@ export function MintPositionPanel({
       ...(staker
         ? [
             {
-              label: `质押到 ${
-                data.matchedStaking[0].pair_label ||
-                data.matchedStaking[0].platform
-              }${nftApprovedAll ? "（已免签 NFT 授权）" : ""}`,
+              label: `质押到 ${stakerLabel}${
+                nftApprovedAll ? "（已免签 NFT 授权）" : ""
+              }`,
               status: "pending" as const,
             },
           ]
@@ -477,23 +596,11 @@ export function MintPositionPanel({
         prev.map((s, idx) => (idx === i ? { ...s, ...patch } : s))
       );
 
-    const sendWithRetry = async (
+    // 使用统一的带「钱包取消/拒绝后询问立即重试」的发送器
+    const sendWithRetry = (
       tx: { to: string; data: string; gas?: bigint },
       label: string
-    ): Promise<string> => {
-      for (let attempt = 1; attempt <= 3; attempt++) {
-        try {
-          return await sendTx(tx);
-        } catch (e: any) {
-          if (attempt === 3 || e?.message?.includes("拒绝")) throw e;
-          const shouldRetry = confirm(
-            `${label} 失败：${e?.message ?? e}\n\n是否重试（第 ${attempt + 1}/3 次）？`
-          );
-          if (!shouldRetry) throw e;
-        }
-      }
-      throw new Error("unreachable");
-    };
+    ): Promise<string> => sendTxWithCancelRetry(tx, label);
 
     try {
       // 仅当当前链不一致时才调用 switchChain，省去一次钱包扩展 IPC 往返
@@ -557,6 +664,14 @@ export function MintPositionPanel({
           setStep(3, { status: "error" });
           setMsg(`✅ 仓位已创建（未能解析 tokenId，请手动质押）`);
         } else {
+          // 立即登记待质押 NFT，若用户在后续 NFT 授权或质押签名时取消，界面可一键断点重试质押
+          setPendingStakeInfo({
+            tokenId,
+            npm,
+            staker,
+            stakerLabel,
+            nftApproved: nftApprovedAll,
+          });
           setStep(3, { status: "loading" });
           try {
             // 仅当 tokenId 来自兜底查询（而非刚才这笔 mint 交易自身的 Receipt）时，才需额外链上校验币种
@@ -580,24 +695,32 @@ export function MintPositionPanel({
               const approveNft = buildNftApproveCalldata(npm, staker, tokenIdBig);
               const ha = await sendWithRetry(
                 { ...approveNft, gas: 100000n },
-                "授权 NFT 给质押合约"
+                `授权 NFT #${tokenId} 给质押合约`
               );
               await waitForTxReceipt(ha, 15000);
+              setPendingStakeInfo({
+                tokenId,
+                npm,
+                staker,
+                stakerLabel,
+                nftApproved: true,
+              });
             }
             const dep = buildStakeDepositCalldata(staker, tokenIdBig);
             // 预设 gas limit，避免钱包节点尚未同步最新区块时 estimateGas 卡顿
             const hd = await sendWithRetry(
               { ...dep, gas: 350000n },
-              "质押"
+              `质押 #${tokenId}`
             );
             // 等待质押交易上链回执确认后再触发监控刷新，确保新仓位立即识别为质押中
             await waitForTxReceipt(hd, 15000);
             setStep(3, { status: "done", hash: hd });
+            setPendingStakeInfo(null);
             setMsg(`✅ 创建并质押成功！tokenId=#${tokenId}`);
           } catch (e: any) {
             setStep(3, { status: "error" });
             setMsg(
-              `⚠️ 仓位已创建（tokenId=#${tokenId}），质押未完成：${e?.message ?? e}`
+              `⚠️ 仓位已创建（tokenId=#${tokenId}），质押已取消或未完成：${e?.message ?? e}`
             );
           }
         }
@@ -615,6 +738,7 @@ export function MintPositionPanel({
       setSteps((prev) =>
         prev.map((s) => (s.status === "loading" ? { ...s, status: "error" } : s))
       );
+      setCanRetryExecute(true);
       setMsg(`❌ ${e?.message ?? e}`);
     } finally {
       setBusy(false);
@@ -1487,6 +1611,76 @@ export function MintPositionPanel({
                   )}
                 </div>
               ))}
+            </div>
+          )}
+
+          {/* 当 Mint 已成功但质押步骤在钱包中被取消/中断时，展示醒目的一键重试质押横幅 */}
+          {pendingStakeInfo && !busy && (
+            <div className="mt-2 flex flex-wrap items-center justify-between gap-2 rounded-lg border border-amber-500/45 bg-amber-500/15 px-3 py-2 text-xs text-amber-100">
+              <div className="space-y-0.5">
+                <div className="font-semibold text-amber-200">
+                  ⚠️ 仓位 #{pendingStakeInfo.tokenId} 已创建，但质押操作已取消/未完成
+                </div>
+                <div className="text-[11px] text-amber-200/80">
+                  {pendingStakeInfo.nftApproved
+                    ? "💡 NFT 授权已完成，点击重试将直接发起质押（无需重复建仓与授权）"
+                    : "💡 点击右侧按钮可立即重试授权与质押（无需重复建仓）"}
+                </div>
+              </div>
+              <div className="flex items-center gap-1.5">
+                <button
+                  type="button"
+                  disabled={busy}
+                  onClick={handleRetryPendingStake}
+                  className="rounded-md bg-amber-400 px-3 py-1 text-xs font-bold text-slate-950 hover:bg-amber-300 disabled:opacity-50"
+                >
+                  🔄 重试质押 #{pendingStakeInfo.tokenId}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setPendingStakeInfo(null)}
+                  className="rounded px-1.5 py-1 text-[11px] text-amber-200/70 hover:bg-white/[0.08] hover:text-white"
+                  title="关闭提示"
+                >
+                  ✕
+                </button>
+              </div>
+            </div>
+          )}
+
+          {/* 当建仓或前置授权步骤被取消时，提供一键重试按钮 */}
+          {canRetryExecute && !pendingStakeInfo && !busy && (
+            <div className="mt-2 flex flex-wrap items-center justify-between gap-2 rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-1.5 text-xs text-amber-200">
+              <span>⚠️ 上次建仓/质押操作已取消或未完成</span>
+              <button
+                type="button"
+                disabled={busy || !data.compute || !data.dex}
+                onClick={execute}
+                className="rounded-md bg-amber-400 px-2.5 py-1 text-xs font-bold text-slate-950 hover:bg-amber-300 disabled:opacity-50"
+              >
+                🔄 重新发起建仓并质押
+              </button>
+            </div>
+          )}
+
+          {/* 当免签质押授权 (setApprovalForAll) 被取消时，提供一键重试按钮 */}
+          {failedToggleApprove !== null && !togglingAllApprove && (
+            <div className="mt-2 flex flex-wrap items-center justify-between gap-2 rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-1.5 text-xs text-amber-200">
+              <span>
+                ⚠️{" "}
+                {failedToggleApprove
+                  ? "开启 NFT 免签质押授权"
+                  : "撤销 NFT 免签质押授权"}{" "}
+                已取消
+              </span>
+              <button
+                type="button"
+                disabled={togglingAllApprove}
+                onClick={() => handleToggleApprovalForAll(failedToggleApprove)}
+                className="rounded-md bg-amber-400 px-2.5 py-1 text-xs font-bold text-slate-950 hover:bg-amber-300 disabled:opacity-50"
+              >
+                🔄 重试授权
+              </button>
             </div>
           )}
         </div>

@@ -1,6 +1,10 @@
 "use client";
 import { useState, useMemo } from "react";
-import { useWallet, waitForTxReceipt } from "@/lib/wallet/use-wallet";
+import {
+  useWallet,
+  waitForTxReceipt,
+  readNftOnChainStatus,
+} from "@/lib/wallet/use-wallet";
 import {
   buildRemoveLiquidityCalldata,
   buildDecreaseLiquidityCalldata,
@@ -150,12 +154,32 @@ export function RemovePositionButton({
   const wallet = useWallet();
   const [step, setStep] = useState<string>("");
   const [busyMode, setBusyMode] = useState<
-    "" | "remove" | "reopen" | "stake" | "adjust"
+    "" | "remove" | "reopen" | "stake" | "unstake" | "adjust"
   >("");
   const [txHashes, setTxHashes] = useState<string[]>([]);
   const [explorerUrl, setExplorerUrl] = useState<string>(
     position.explorer_url || ""
   );
+
+  // 本地实时会话状态：用于在多步操作中途取消时，立即感知 NFT 是否已解押/已授权/已减仓，支持精准断点重试
+  const [localStakedOverride, setLocalStakedOverride] = useState<
+    boolean | null
+  >(null);
+  const [localNftApproved, setLocalNftApproved] = useState<boolean>(false);
+  const [localDecreasedToZero, setLocalDecreasedToZero] =
+    useState<boolean>(false);
+  const [failedAction, setFailedAction] = useState<{
+    type:
+      | "stake"
+      | "unstake"
+      | "remove"
+      | "reopen"
+      | "adjust"
+      | "restake_after_adjust";
+    failedStepLabel: string;
+    errorMessage: string;
+    stakerContract?: string;
+  } | null>(null);
 
   // 「⚖️ 增减流动性」内联抽屉状态
   const [adjustOpen, setAdjustOpen] = useState(false);
@@ -171,8 +195,10 @@ export function RemovePositionButton({
   const [decPct, setDecPct] = useState<string>("50");
   const [autoRestake, setAutoRestake] = useState(true);
 
-  const isStakedPos =
+  const rawIsStaked =
     position.source === "staking" && !!position.staker_contract;
+  const isStakedPos =
+    localStakedOverride !== null ? localStakedOverride : rawIsStaked;
   const matchedStaker =
     position.staker_contract || position.available_staker_contract || "";
 
@@ -216,7 +242,7 @@ export function RemovePositionButton({
   }
 
   /**
-   * 针对未质押仓位（或中断后留在钱包的仓位）：一键质押到已配置的质押合约
+   * 针对未质押仓位（或中断后留在钱包的仓位）：一键质押到已配置的质押合约（支持取消后重试与断点跳过已授权）
    */
   async function handleDirectStake(customStaker?: string) {
     const targetStaker = customStaker || matchedStaker;
@@ -225,8 +251,10 @@ export function RemovePositionButton({
       return;
     }
     setBusyMode("stake");
+    setFailedAction(null);
     setTxHashes([]);
     setStep("准备质押…");
+    let currentStepLabel = `质押 #${position.token_id}`;
     try {
       // 1. 拉取或复用链与授权状态
       let info = adjustData;
@@ -244,12 +272,29 @@ export function RemovePositionButton({
       }
       setExplorerUrl(info.chain.explorerUrl || "");
 
-      if (info.currentlyStakedOnChain) {
+      const walletAddr = await ensureWalletAndChain(info.chain);
+      const tokenIdBig = BigInt(info.tokenId);
+
+      // 实时向链上核对最新 ownerOf 与 approve 状态（防止上次授权成功或质押成功后重复签名）
+      const onChain = await readNftOnChainStatus(
+        info.npm,
+        tokenIdBig,
+        walletAddr,
+        targetStaker
+      );
+
+      if (
+        onChain.isStakedOnChain === true ||
+        (onChain.isStakedOnChain === null &&
+          info.currentlyStakedOnChain &&
+          localStakedOverride !== false)
+      ) {
         await fetch(`/api/positions/${position.id}/adjust`, {
           method: "POST",
           headers: authHeaders({ "Content-Type": "application/json" }),
           body: JSON.stringify({ stakerContract: targetStaker }),
         });
+        setLocalStakedOverride(true);
         toast.success(`#${position.token_id} 已在质押合约中，状态已同步`);
         setStep("");
         setBusyMode("");
@@ -257,34 +302,48 @@ export function RemovePositionButton({
         return;
       }
 
-      await ensureWalletAndChain(info.chain);
-      const tokenIdBig = BigInt(info.tokenId);
+      const alreadyApproved =
+        info.nftApprovedForAll ||
+        info.singleTokenApproved ||
+        localNftApproved ||
+        onChain.approvedForAllToStaker ||
+        onChain.singleApprovedToStaker;
 
       // 2. 若未开启全局免签且当前 tokenId 未单次授权，先授权 NFT
-      if (!info.nftApprovedForAll && !info.singleTokenApproved) {
-        setStep(`1/2 · 授权 NFT #${info.tokenId}…`);
+      if (!alreadyApproved) {
+        currentStepLabel = `授权 NFT #${info.tokenId}`;
+        setStep(`1/2 · ${currentStepLabel}…`);
         const appTx = buildNftApproveCalldata(
           info.npm,
           targetStaker,
           tokenIdBig
         );
-        const h1 = await wallet.sendTx({ ...appTx, gas: 100000n });
+        const h1 = await wallet.sendTxWithRetry(
+          { ...appTx, gas: 100000n },
+          currentStepLabel
+        );
         setTxHashes((prev) => [...prev, h1]);
         setStep("等待授权确认…");
         await waitForTxReceipt(h1, 25_000);
+        setLocalNftApproved(true);
       }
 
       // 3. 调用 staker.deposit(tokenId)
+      currentStepLabel = `质押 #${info.tokenId}`;
       setStep(
-        info.nftApprovedForAll || info.singleTokenApproved
-          ? `1/1 · 质押 #${info.tokenId}…`
-          : `2/2 · 质押 #${info.tokenId}…`
+        alreadyApproved
+          ? `1/1 · ${currentStepLabel}…`
+          : `2/2 · ${currentStepLabel}…`
       );
       const depTx = buildStakeDepositCalldata(targetStaker, tokenIdBig);
-      const h2 = await wallet.sendTx({ ...depTx, gas: 350000n });
+      const h2 = await wallet.sendTxWithRetry(
+        { ...depTx, gas: 350000n },
+        currentStepLabel
+      );
       setTxHashes((prev) => [...prev, h2]);
       setStep("等待质押确认…");
       await waitForTxReceipt(h2, 35_000);
+      setLocalStakedOverride(true);
 
       // 4. 同步数据库
       await fetch(`/api/positions/${position.id}/adjust`, {
@@ -296,12 +355,122 @@ export function RemovePositionButton({
       toast.success(`#${position.token_id} 质押成功！`);
       setStep("");
       setBusyMode("");
+      setFailedAction(null);
       if (adjustOpen) {
         loadAdjustData();
       }
       onRemoved?.();
     } catch (e: any) {
-      toast.error(e?.message || String(e));
+      const errMsg = e?.message || String(e);
+      toast.error(errMsg);
+      setFailedAction({
+        type: "stake",
+        failedStepLabel: currentStepLabel,
+        errorMessage: errMsg,
+        stakerContract: targetStaker,
+      });
+      setStep("");
+      setBusyMode("");
+    }
+  }
+
+  /**
+   * 针对已质押仓位：单独执行「🔓 仅解押到钱包」（不销毁/不移除流动性），支持取消后重试
+   */
+  async function handleUnstakeOnly() {
+    const targetStaker = position.staker_contract || matchedStaker;
+    if (!targetStaker) {
+      toast.error("未找到该仓位关联的质押合约地址");
+      return;
+    }
+    setBusyMode("unstake");
+    setFailedAction(null);
+    setTxHashes([]);
+    setStep("准备解质押…");
+    const stepLabel = `解质押 #${position.token_id}`;
+
+    try {
+      let parsedRpcUrls: string[] = [];
+      try {
+        parsedRpcUrls = position.chain_rpc_urls
+          ? JSON.parse(position.chain_rpc_urls)
+          : [];
+      } catch {
+        parsedRpcUrls = [];
+      }
+      const chainInfo = {
+        chainId: position.chain_id,
+        name: position.chain_name,
+        rpcUrls: parsedRpcUrls,
+        explorerUrl: position.explorer_url || "",
+        nativeSymbol: position.chain_symbol || "ETH",
+      };
+      setExplorerUrl(chainInfo.explorerUrl);
+
+      const walletAddr = await ensureWalletAndChain(chainInfo);
+      const tokenIdBig = BigInt(position.token_id);
+
+      if (position.dex_npm) {
+        const onChain = await readNftOnChainStatus(
+          position.dex_npm,
+          tokenIdBig,
+          walletAddr,
+          targetStaker
+        );
+        if (onChain.isStakedOnChain === false) {
+          await fetch(`/api/positions/${position.id}/adjust`, {
+            method: "POST",
+            headers: authHeaders({ "Content-Type": "application/json" }),
+            body: JSON.stringify({ stakerContract: targetStaker }),
+          });
+          setLocalStakedOverride(false);
+          toast.success(`#${position.token_id} 已解押在钱包中，状态已同步`);
+          setStep("");
+          setBusyMode("");
+          if (adjustOpen) loadAdjustData();
+          onRemoved?.();
+          return;
+        }
+      }
+
+      setStep(`1/1 · ${stepLabel}…`);
+      const withdrawData = buildWithdrawCalldata(tokenIdBig);
+      const h = await wallet.sendTxWithRetry(
+        {
+          to: targetStaker,
+          data: withdrawData,
+          gas: 280000n,
+        },
+        stepLabel
+      );
+      setTxHashes((prev) => [...prev, h]);
+      setStep("等待解质押确认…");
+      await waitForTxReceipt(h, 45_000);
+      setLocalStakedOverride(false);
+
+      await fetch(`/api/positions/${position.id}/adjust`, {
+        method: "POST",
+        headers: authHeaders({ "Content-Type": "application/json" }),
+        body: JSON.stringify({ stakerContract: targetStaker }),
+      });
+
+      toast.success(
+        `#${position.token_id} 已成功解质押到钱包！（可随时点击「🔒 一键质押」重新质押）`
+      );
+      setStep("");
+      setBusyMode("");
+      setFailedAction(null);
+      if (adjustOpen) loadAdjustData();
+      onRemoved?.();
+    } catch (e: any) {
+      const errMsg = e?.message || String(e);
+      toast.error(errMsg);
+      setFailedAction({
+        type: "unstake",
+        failedStepLabel: stepLabel,
+        errorMessage: errMsg,
+        stakerContract: targetStaker,
+      });
       setStep("");
       setBusyMode("");
     }
@@ -321,6 +490,10 @@ export function RemovePositionButton({
       if (!j.ok) throw new Error(j.error || "读取仓位参数失败");
       const d = j.data as AdjustInitData;
       setAdjustData(d);
+      setLocalStakedOverride(d.currentlyStakedOnChain);
+      if (d.singleTokenApproved || d.nftApprovedForAll) {
+        setLocalNftApproved(true);
+      }
       setExplorerUrl(d.chain.explorerUrl || "");
       setIncSide(d.pairFlip === 1 ? "token1" : "token0");
       setAutoRestake(Boolean(d.stakerContract));
@@ -418,20 +591,43 @@ export function RemovePositionButton({
   }, [adjustData, decPct]);
 
   /**
-   * 执行「解质押（如在质押中）→ 增加/减少流动性 → 重新质押」完整流水线
+   * 执行「解质押（如在质押中）→ 增加/减少流动性 → 重新质押」完整流水线（支持每步取消重试与断点续签）
    */
   async function handleExecuteAdjust() {
     if (!adjustData) return;
     setBusyMode("adjust");
+    setFailedAction(null);
     setTxHashes([]);
+    let currentStepLabel = `增减流动性 #${adjustData.tokenId}`;
+    let adjustModifiedLiquidity = false;
 
     try {
       const recipient = await ensureWalletAndChain(adjustData.chain);
       const tokenIdBig = BigInt(adjustData.tokenId);
       const npm = adjustData.npm as `0x${string}`;
       const staker = adjustData.stakerContract;
-      const needUnstake = adjustData.currentlyStakedOnChain && !!staker;
-      const needRestake = Boolean(staker && (adjustData.currentlyStakedOnChain || autoRestake));
+
+      const onChain = await readNftOnChainStatus(
+        npm,
+        tokenIdBig,
+        recipient,
+        staker
+      );
+      const isCurrentlyStaked =
+        onChain.isStakedOnChain !== null
+          ? onChain.isStakedOnChain
+          : localStakedOverride !== null
+            ? localStakedOverride
+            : adjustData.currentlyStakedOnChain;
+      const needUnstake = isCurrentlyStaked && !!staker;
+      const needRestake = Boolean(
+        staker && (isCurrentlyStaked || adjustData.currentlyStakedOnChain || autoRestake)
+      );
+      const alreadyNftApproved =
+        adjustData.nftApprovedForAll ||
+        localNftApproved ||
+        onChain.approvedForAllToStaker ||
+        onChain.singleApprovedToStaker;
 
       if (adjustTab === "increase") {
         if (!increasePreview || increasePreview.deltaLiquidity <= 0n) {
@@ -444,70 +640,98 @@ export function RemovePositionButton({
 
         // Step 1: 若当前链上处于质押中，先解质押（若上次已解押在钱包，自动跳过！）
         if (needUnstake) {
-          setStep(`1 · 解质押 #${adjustData.tokenId}…`);
+          currentStepLabel = `解质押 #${adjustData.tokenId}`;
+          setStep(`1 · ${currentStepLabel}…`);
           const wData = buildWithdrawCalldata(tokenIdBig);
-          const hw = await wallet.sendTx({
-            to: staker,
-            data: wData,
-            gas: 280000n,
-          });
+          const hw = await wallet.sendTxWithRetry(
+            {
+              to: staker,
+              data: wData,
+              gas: 280000n,
+            },
+            currentStepLabel
+          );
           setTxHashes((prev) => [...prev, hw]);
           setStep("等待解质押确认…");
           await waitForTxReceipt(hw, 35_000);
+          setLocalStakedOverride(false);
         }
 
         // Step 2: 检查并补充 ERC20 授权
         if (need0 > 0n && allow0 < need0) {
-          setStep(`授权 ${adjustData.token0.symbol}…`);
+          currentStepLabel = `授权 ${adjustData.token0.symbol}`;
+          setStep(`${currentStepLabel}…`);
           const a0 = buildApproveCalldata(
             adjustData.token0.address,
             npm,
             MAX_UINT256
           );
-          const h0 = await wallet.sendTx({ ...a0, gas: 80000n });
+          const h0 = await wallet.sendTxWithRetry(
+            { ...a0, gas: 80000n },
+            currentStepLabel
+          );
           setTxHashes((prev) => [...prev, h0]);
           await waitForTxReceipt(h0, 20_000);
         }
         if (need1 > 0n && allow1 < need1) {
-          setStep(`授权 ${adjustData.token1.symbol}…`);
+          currentStepLabel = `授权 ${adjustData.token1.symbol}`;
+          setStep(`${currentStepLabel}…`);
           const a1 = buildApproveCalldata(
             adjustData.token1.address,
             npm,
             MAX_UINT256
           );
-          const h1 = await wallet.sendTx({ ...a1, gas: 80000n });
+          const h1 = await wallet.sendTxWithRetry(
+            { ...a1, gas: 80000n },
+            currentStepLabel
+          );
           setTxHashes((prev) => [...prev, h1]);
           await waitForTxReceipt(h1, 20_000);
         }
 
         // Step 3: 调用 NPM.increaseLiquidity
-        setStep(`2 · 增加流动性 #${adjustData.tokenId}…`);
+        currentStepLabel = `增加流动性 #${adjustData.tokenId}`;
+        setStep(`2 · ${currentStepLabel}…`);
         const incTx = buildIncreaseLiquidityCalldata(npm, {
           tokenId: tokenIdBig,
           amount0Desired: need0,
           amount1Desired: need1,
           slippagePct: 0.5,
         });
-        const hi = await wallet.sendTx({ ...incTx, gas: 380000n });
+        const hi = await wallet.sendTxWithRetry(
+          { ...incTx, gas: 380000n },
+          currentStepLabel
+        );
         setTxHashes((prev) => [...prev, hi]);
         setStep("等待加仓确认…");
         await waitForTxReceipt(hi, 35_000);
+        adjustModifiedLiquidity = true;
 
         // Step 4: 重新质押回 Staker（保证质押合约按新流动性重新计息）
         if (needRestake && staker) {
-          if (!adjustData.nftApprovedForAll) {
-            setStep(`3 · 授权 NFT #${adjustData.tokenId}…`);
+          if (!alreadyNftApproved) {
+            currentStepLabel = `授权 NFT #${adjustData.tokenId}`;
+            setStep(`3 · ${currentStepLabel}…`);
             const appNft = buildNftApproveCalldata(npm, staker, tokenIdBig);
-            const ha = await wallet.sendTx({ ...appNft, gas: 100000n });
+            const ha = await wallet.sendTxWithRetry(
+              { ...appNft, gas: 100000n },
+              currentStepLabel
+            );
             setTxHashes((prev) => [...prev, ha]);
             await waitForTxReceipt(ha, 20_000);
+            setLocalNftApproved(true);
           }
-          setStep(`3 · 重新质押 #${adjustData.tokenId}…`);
+          currentStepLabel = `重新质押 #${adjustData.tokenId}`;
+          setStep(`3 · ${currentStepLabel}…`);
           const depTx = buildStakeDepositCalldata(staker, tokenIdBig);
-          const hd = await wallet.sendTx({ ...depTx, gas: 350000n });
+          const hd = await wallet.sendTxWithRetry(
+            { ...depTx, gas: 350000n },
+            currentStepLabel
+          );
           setTxHashes((prev) => [...prev, hd]);
           setStep("等待重新质押确认…");
           await waitForTxReceipt(hd, 35_000);
+          setLocalStakedOverride(true);
         }
       } else {
         // ==================== ➖ 减少部分流动性 ====================
@@ -518,16 +742,21 @@ export function RemovePositionButton({
 
         // Step 1: 若链上处于质押中，先解质押
         if (needUnstake) {
-          setStep(`1 · 解质押 #${adjustData.tokenId}…`);
+          currentStepLabel = `解质押 #${adjustData.tokenId}`;
+          setStep(`1 · ${currentStepLabel}…`);
           const wData = buildWithdrawCalldata(tokenIdBig);
-          const hw = await wallet.sendTx({
-            to: staker,
-            data: wData,
-            gas: 280000n,
-          });
+          const hw = await wallet.sendTxWithRetry(
+            {
+              to: staker,
+              data: wData,
+              gas: 280000n,
+            },
+            currentStepLabel
+          );
           setTxHashes((prev) => [...prev, hw]);
           setStep("等待解质押确认…");
           await waitForTxReceipt(hw, 35_000);
+          setLocalStakedOverride(false);
         }
 
         // Step 2: 减少部分流动性 + 领取本金与累积手续费（不销毁 NFT）
@@ -535,32 +764,46 @@ export function RemovePositionButton({
           .toUpperCase()
           .includes("ZIA");
         if (!isZia) {
-          setStep(`2 · 减仓 ${decreasePreview.pctNum}% 并领币…`);
+          currentStepLabel = `减仓 ${decreasePreview.pctNum}% 并领币 #${adjustData.tokenId}`;
+          setStep(`2 · ${currentStepLabel}…`);
           const mcTx = buildPartialDecreaseMulticallCalldata(
             npm,
             tokenIdBig,
             deltaLiq,
             recipient
           );
-          const hm = await wallet.sendTx({ ...mcTx, gas: 380000n });
+          const hm = await wallet.sendTxWithRetry(
+            { ...mcTx, gas: 380000n },
+            currentStepLabel
+          );
           setTxHashes((prev) => [...prev, hm]);
           setStep("等待减仓确认…");
           await waitForTxReceipt(hm, 35_000);
+          adjustModifiedLiquidity = true;
         } else {
-          setStep(`2/4 · 减少 ${decreasePreview.pctNum}% 流动性…`);
+          currentStepLabel = `减少 ${decreasePreview.pctNum}% 流动性 #${adjustData.tokenId}`;
+          setStep(`2/4 · ${currentStepLabel}…`);
           const decTx = buildDecreaseLiquidityCalldata(
             npm,
             tokenIdBig,
             deltaLiq
           );
-          const hd1 = await wallet.sendTx({ ...decTx, gas: 280000n });
+          const hd1 = await wallet.sendTxWithRetry(
+            { ...decTx, gas: 280000n },
+            currentStepLabel
+          );
           setTxHashes((prev) => [...prev, hd1]);
           setStep("等待减仓确认…");
           await waitForTxReceipt(hd1, 35_000);
+          adjustModifiedLiquidity = true;
 
-          setStep(`3/4 · 提取本金与手续费到钱包…`);
+          currentStepLabel = `提取本金与手续费 #${adjustData.tokenId}`;
+          setStep(`3/4 · ${currentStepLabel}…`);
           const colTx = buildCollectCalldata(npm, tokenIdBig, recipient);
-          const hc = await wallet.sendTx({ ...colTx, gas: 250000n });
+          const hc = await wallet.sendTxWithRetry(
+            { ...colTx, gas: 250000n },
+            currentStepLabel
+          );
           setTxHashes((prev) => [...prev, hc]);
           setStep("等待提取确认…");
           await waitForTxReceipt(hc, 35_000);
@@ -568,19 +811,29 @@ export function RemovePositionButton({
 
         // Step 3: 将剩余流动性的 NFT 重新质押回 Staker
         if (needRestake && staker) {
-          if (!adjustData.nftApprovedForAll) {
-            setStep(`授权 NFT #${adjustData.tokenId}…`);
+          if (!alreadyNftApproved) {
+            currentStepLabel = `授权 NFT #${adjustData.tokenId}`;
+            setStep(`${currentStepLabel}…`);
             const appNft = buildNftApproveCalldata(npm, staker, tokenIdBig);
-            const ha = await wallet.sendTx({ ...appNft, gas: 100000n });
+            const ha = await wallet.sendTxWithRetry(
+              { ...appNft, gas: 100000n },
+              currentStepLabel
+            );
             setTxHashes((prev) => [...prev, ha]);
             await waitForTxReceipt(ha, 20_000);
+            setLocalNftApproved(true);
           }
-          setStep(`重新质押 #${adjustData.tokenId}…`);
+          currentStepLabel = `重新质押 #${adjustData.tokenId}`;
+          setStep(`${currentStepLabel}…`);
           const depTx = buildStakeDepositCalldata(staker, tokenIdBig);
-          const hd2 = await wallet.sendTx({ ...depTx, gas: 350000n });
+          const hd2 = await wallet.sendTxWithRetry(
+            { ...depTx, gas: 350000n },
+            currentStepLabel
+          );
           setTxHashes((prev) => [...prev, hd2]);
           setStep("等待重新质押确认…");
           await waitForTxReceipt(hd2, 35_000);
+          setLocalStakedOverride(true);
         }
       }
 
@@ -599,10 +852,18 @@ export function RemovePositionButton({
       setIncAmount("");
       setStep("");
       setBusyMode("");
+      setFailedAction(null);
       await loadAdjustData();
       onRemoved?.();
     } catch (e: any) {
-      toast.error(e?.message || String(e));
+      const errMsg = e?.message || String(e);
+      toast.error(errMsg);
+      setFailedAction({
+        type: adjustModifiedLiquidity ? "restake_after_adjust" : "adjust",
+        failedStepLabel: currentStepLabel,
+        errorMessage: errMsg,
+        stakerContract: adjustData.stakerContract || matchedStaker,
+      });
       setStep("");
       setBusyMode("");
       // 若中途取消（如已解质押但未完成后续步骤），刷新一次链上 ownerOf 以便下次断点续签
@@ -613,11 +874,13 @@ export function RemovePositionButton({
 
   /**
    * 一键执行「解质押（如质押中）→ 撤池 → 领币」完整流水线，无需二次点击确认。
-   * 若 andReopen=true，同时将该池子载入右侧建仓面板以便立即按新区间重开。
+   * 支持钱包取消时立即重弹确认 + 页面内联断点重试（已解押自动跳过解质押，已减仓自动跳到领币）。
    */
   async function handleQuickRemove(andReopen: boolean) {
     setBusyMode(andReopen ? "reopen" : "remove");
+    setFailedAction(null);
     setTxHashes([]);
+    let currentStepLabel = `移除仓位 #${position.token_id}`;
 
     try {
       // 若点了「撤池重开」，立刻先把左侧建仓面板切到当前池子，零延迟并发准备
@@ -651,7 +914,7 @@ export function RemovePositionButton({
           pool: position.pool,
           chainIdRef: position.chain_id_ref,
           pairFlip: position.pair_flip ?? 0,
-          stakerContract: position.staker_contract || "",
+          stakerContract: position.staker_contract || matchedStaker || "",
           source: position.source || "direct",
           liquidity: position.last_liquidity || "0",
           realLiquidity: position.last_liquidity || "0",
@@ -675,12 +938,33 @@ export function RemovePositionButton({
       }
       setExplorerUrl(params.chain?.explorerUrl || "");
 
-      const liq = BigInt(params.realLiquidity || params.liquidity || "0");
-      const isStaked =
-        params.source === "staking" && !!params.stakerContract;
+      const recipient = await ensureWalletAndChain(params.chain);
+      const tokenId = BigInt(params.tokenId);
+      const npm = params.npm as `0x${string}`;
 
-      if (liq === 0n && !isStaked) {
-        // 链上已无流动性且未质押，直接同步数据库关闭
+      // 实时向链上核对 NFT 当前是否仍在质押合约、剩余流动性及是否有待领代币（实现 100% 精准断点续签）
+      const onChain = await readNftOnChainStatus(
+        npm,
+        tokenId,
+        recipient,
+        params.stakerContract
+      );
+
+      const propStaked =
+        params.source === "staking" && !!params.stakerContract;
+      const isStaked =
+        onChain.isStakedOnChain !== null
+          ? onChain.isStakedOnChain
+          : localStakedOverride !== null
+            ? localStakedOverride
+            : propStaked;
+      const liq =
+        onChain.liquidity !== null
+          ? onChain.liquidity
+          : BigInt(params.realLiquidity || params.liquidity || "0");
+
+      if (liq === 0n && !isStaked && !onChain.hasTokensOwed && !localDecreasedToZero) {
+        // 链上已无流动性、无待领代币且未质押，直接同步数据库关闭
         await fetch(`/api/positions/${position.id}/remove-params`, {
           method: "POST",
           headers: authHeaders(),
@@ -694,22 +978,29 @@ export function RemovePositionButton({
         return;
       }
 
-      const recipient = await ensureWalletAndChain(params.chain);
-      const tokenId = BigInt(params.tokenId);
-      const npm = params.npm as `0x${string}`;
-
       // 5. 若质押中，先调 Staker.withdraw(tokenId)
       if (isStaked && params.stakerContract) {
-        setStep(`1/3 · 解质押 #${params.tokenId}…`);
+        currentStepLabel = `解质押 #${params.tokenId}`;
+        setStep(`1/3 · ${currentStepLabel}…`);
         const withdrawData = buildWithdrawCalldata(tokenId);
-        const h1 = await wallet.sendTx({
-          to: params.stakerContract,
-          data: withdrawData,
-          gas: 280000n,
-        });
+        const h1 = await wallet.sendTxWithRetry(
+          {
+            to: params.stakerContract,
+            data: withdrawData,
+            gas: 280000n,
+          },
+          currentStepLabel
+        );
         setTxHashes((prev) => [...prev, h1]);
         setStep(`等待解质押确认…`);
         await waitForTxReceipt(h1, 45_000);
+        setLocalStakedOverride(false);
+        // 异步同步数据库已解押状态，防止用户在后续步骤取消后状态不一致
+        fetch(`/api/positions/${position.id}/adjust`, {
+          method: "POST",
+          headers: authHeaders({ "Content-Type": "application/json" }),
+          body: JSON.stringify({ stakerContract: params.stakerContract }),
+        }).catch(() => {});
       }
 
       // 6. 判断是否支持 multicall（ZIA DEX 直接跳过探测走分步连签，节省一次 RPC 往返）
@@ -718,7 +1009,7 @@ export function RemovePositionButton({
         .toUpperCase()
         .includes("ZIA");
       let supportsMulticall = false;
-      if (!isZia) {
+      if (!isZia && liq > 0n) {
         if (multicallSupportCache.has(cacheKey)) {
           supportsMulticall = multicallSupportCache.get(cacheKey)!;
         } else {
@@ -732,36 +1023,53 @@ export function RemovePositionButton({
         }
       }
 
-      if (supportsMulticall) {
-        setStep("2/2 · 合并撤池 + 领币 (multicall)…");
+      if (supportsMulticall && liq > 0n) {
+        currentStepLabel = `合并撤池 + 领币 #${params.tokenId}`;
+        setStep(`2/2 · ${currentStepLabel}…`);
         const removeTx = buildRemoveLiquidityCalldata(
           npm,
           tokenId,
           liq,
           recipient
         );
-        const h2 = await wallet.sendTx({ ...removeTx, gas: 400000n });
+        const h2 = await wallet.sendTxWithRetry(
+          { ...removeTx, gas: 400000n },
+          currentStepLabel
+        );
         setTxHashes((prev) => [...prev, h2]);
         setStep("等待撤池确认…");
         await waitForTxReceipt(h2, 45_000);
       } else {
         // ZIA DEX 等无 multicall 的 NPM：先 decreaseLiquidity，确认后立即自动弹 collect
-        if (liq > 0n) {
+        if (liq > 0n && !localDecreasedToZero) {
+          currentStepLabel = `移除全部流动性 #${params.tokenId}`;
           setStep(
-            isStaked ? "2/3 · 移除全部流动性…" : "1/2 · 移除全部流动性…"
+            isStaked
+              ? `2/3 · ${currentStepLabel}…`
+              : `1/2 · ${currentStepLabel}…`
           );
           const decTx = buildDecreaseLiquidityCalldata(npm, tokenId, liq);
-          const h2 = await wallet.sendTx({ ...decTx, gas: 280000n });
+          const h2 = await wallet.sendTxWithRetry(
+            { ...decTx, gas: 280000n },
+            currentStepLabel
+          );
           setTxHashes((prev) => [...prev, h2]);
           setStep("等待移除确认…");
           await waitForTxReceipt(h2, 45_000);
+          setLocalDecreasedToZero(true);
         }
 
+        currentStepLabel = `提取本金与手续费 #${params.tokenId}`;
         setStep(
-          isStaked ? "3/3 · 提取本金与手续费…" : "2/2 · 提取本金与手续费…"
+          isStaked
+            ? `3/3 · ${currentStepLabel}…`
+            : `2/2 · ${currentStepLabel}…`
         );
         const colTx = buildCollectCalldata(npm, tokenId, recipient);
-        const h3 = await wallet.sendTx({ ...colTx, gas: 250000n });
+        const h3 = await wallet.sendTxWithRetry(
+          { ...colTx, gas: 250000n },
+          currentStepLabel
+        );
         setTxHashes((prev) => [...prev, h3]);
         setStep("等待提取确认…");
         await waitForTxReceipt(h3, 45_000);
@@ -785,11 +1093,43 @@ export function RemovePositionButton({
       );
       setStep("");
       setBusyMode("");
+      setFailedAction(null);
       onRemoved?.();
     } catch (e: any) {
-      toast.error(e.message || String(e));
+      const errMsg = e?.message || String(e);
+      toast.error(errMsg);
+      setFailedAction({
+        type: andReopen ? "reopen" : "remove",
+        failedStepLabel: currentStepLabel,
+        errorMessage: errMsg,
+        stakerContract: position.staker_contract || matchedStaker,
+      });
       setStep("");
       setBusyMode("");
+    }
+  }
+
+  /** 点击内联「🔄 重试」横幅时，根据上次中断的操作类型精准断点重试 */
+  function handleRetryFailedAction() {
+    if (!failedAction) return;
+    switch (failedAction.type) {
+      case "stake":
+      case "restake_after_adjust":
+        handleDirectStake(failedAction.stakerContract || matchedStaker);
+        break;
+      case "unstake":
+        handleUnstakeOnly();
+        break;
+      case "remove":
+        handleQuickRemove(false);
+        break;
+      case "reopen":
+        handleQuickRemove(true);
+        break;
+      case "adjust":
+        if (!adjustOpen) setAdjustOpen(true);
+        handleExecuteAdjust();
+        break;
     }
   }
 
@@ -831,6 +1171,19 @@ export function RemovePositionButton({
             }
           >
             {busyMode === "stake" ? step || "质押中…" : "🔒 一键质押"}
+          </button>
+        )}
+
+        {/* 1b. 已质押时，提供「🔓 仅解押」按钮（只取回 NFT 到钱包，不移除流动性） */}
+        {isStakedPos && (position.staker_contract || matchedStaker) && (
+          <button
+            type="button"
+            onClick={handleUnstakeOnly}
+            disabled={!!busyMode || isWrongWallet}
+            className="btn-secondary text-xs"
+            title="仅将 LP NFT 从质押合约解押取回钱包（保留流动性不撤池，取消后可随时重试）"
+          >
+            {busyMode === "unstake" ? step || "解押中…" : "🔓 仅解押"}
           </button>
         )}
 
@@ -916,6 +1269,62 @@ export function RemovePositionButton({
         )}
       </div>
 
+      {/* ==================== ⚠️ 钱包取消/操作中断后的一键断点重试横幅 ==================== */}
+      {failedAction && !busyMode && (
+        <div className="mt-2 flex flex-wrap items-center justify-between gap-2 rounded-lg border border-amber-500/45 bg-amber-500/15 px-2.5 py-2 text-xs text-amber-100">
+          <div className="space-y-0.5">
+            <div className="font-semibold text-amber-200">
+              ⚠️ 「{failedAction.failedStepLabel}」已取消或未完成：
+              <span className="font-normal text-amber-100/90">
+                {" "}
+                {failedAction.errorMessage}
+              </span>
+            </div>
+            <div className="text-[11px] text-amber-200/80">
+              {localStakedOverride === false && rawIsStaked
+                ? "💡 NFT 已解质押在您的钱包中，点击重试将自动跳过解质押直接继续后续步骤，或可重新质押回合约。"
+                : "💡 点击右侧按钮可立即重新发起该步骤（已完成的步骤会自动跳过）。"}
+            </div>
+          </div>
+          <div className="flex flex-wrap items-center gap-1.5">
+            <button
+              type="button"
+              onClick={handleRetryFailedAction}
+              disabled={!!busyMode || isWrongWallet}
+              className="rounded-md bg-amber-400 px-2.5 py-1 text-xs font-bold text-slate-950 hover:bg-amber-300 disabled:opacity-50"
+            >
+              🔄 重试「{failedAction.failedStepLabel}」
+            </button>
+            {localStakedOverride === false &&
+              !localDecreasedToZero &&
+              failedAction.type !== "stake" &&
+              failedAction.type !== "restake_after_adjust" &&
+              (failedAction.stakerContract || matchedStaker) && (
+                <button
+                  type="button"
+                  onClick={() =>
+                    handleDirectStake(
+                      failedAction.stakerContract || matchedStaker
+                    )
+                  }
+                  disabled={!!busyMode || isWrongWallet}
+                  className="rounded-md border border-cyan-400/50 bg-cyan-500/20 px-2.5 py-1 text-xs font-semibold text-cyan-200 hover:bg-cyan-500/35 disabled:opacity-50"
+                >
+                  🔒 重新质押回合约
+                </button>
+              )}
+            <button
+              type="button"
+              onClick={() => setFailedAction(null)}
+              className="rounded px-1.5 py-1 text-[11px] text-amber-200/70 hover:bg-white/[0.08] hover:text-white"
+              title="关闭提示"
+            >
+              ✕
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* ==================== ⚖️ 增减流动性内联操作抽屉 ==================== */}
       {adjustOpen && (
         <div className="mt-2.5 rounded-lg border border-cyan-500/30 bg-surface-raised p-3 text-xs space-y-2.5">
@@ -926,7 +1335,8 @@ export function RemovePositionButton({
           ) : adjustData ? (
             <>
               {/* 断点续签提示：若 NFT 已解质押在钱包但配置了质押合约 */}
-              {!adjustData.currentlyStakedOnChain &&
+              {(!adjustData.currentlyStakedOnChain ||
+                localStakedOverride === false) &&
                 adjustData.stakerContract && (
                   <div className="flex flex-wrap items-center justify-between gap-2 rounded border border-amber-500/40 bg-amber-500/10 px-2.5 py-1.5 text-[11px] text-amber-200">
                     <span>

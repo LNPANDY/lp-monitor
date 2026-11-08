@@ -226,6 +226,183 @@ async function sendTx(opts: {
 }
 
 /**
+ * 带「钱包取消/失败后立即重试确认」的交易发送器。
+ * 当用户在钱包弹窗中点击“取消/拒绝”或遇到临时 RPC 错误时，弹窗询问是否立即重发当前步骤；
+ * 若用户选择“确定”则直接重弹钱包签名，无需从头重走已完成的步骤。
+ */
+export async function sendTxWithCancelRetry(
+  opts: {
+    to: string;
+    data: string;
+    value?: bigint;
+    gas?: bigint;
+  },
+  stepLabel: string
+): Promise<string> {
+  while (true) {
+    try {
+      return await sendTx(opts);
+    } catch (e: any) {
+      const msg = e?.message || String(e);
+      const isUserCancel =
+        e?.code === 4001 ||
+        /拒绝|取消|rejected|denied|canceled|cancelled/i.test(msg);
+      const confirmText = isUserCancel
+        ? `⚠️ 您在钱包中取消了「${stepLabel}」操作。\n\n是否立即重新弹出钱包重试「${stepLabel}」？\n\n• 点击「确定」：立即重弹钱包继续当前步骤\n• 点击「取消」：暂停操作（您仍可点击页面上的「🔄 重试」按钮继续）`
+        : `⚠️ 「${stepLabel}」未完成：${msg}\n\n是否立即重试「${stepLabel}」？`;
+      const shouldRetry =
+        typeof window !== "undefined" ? window.confirm(confirmText) : false;
+      if (!shouldRetry) {
+        throw e;
+      }
+    }
+  }
+}
+
+/**
+ * 极速读取链上 NFT 的实时归属（ownerOf）、单次/全局授权状态及当前剩余流动性与待领代币，
+ * 用于在「取消后重试 / 断点续签」时精准跳过已完成的解质押、NFT 授权或减仓步骤。
+ */
+export async function readNftOnChainStatus(
+  npm: string,
+  tokenId: bigint,
+  walletAddr?: string,
+  stakerAddr?: string
+): Promise<{
+  owner: string | null;
+  isStakedOnChain: boolean | null;
+  singleApprovedToStaker: boolean;
+  approvedForAllToStaker: boolean;
+  liquidity: bigint | null;
+  hasTokensOwed: boolean;
+}> {
+  const p = provider || getInjectedProvider();
+  if (!p || !npm) {
+    return {
+      owner: null,
+      isStakedOnChain: null,
+      singleApprovedToStaker: false,
+      approvedForAllToStaker: false,
+      liquidity: null,
+      hasTokensOwed: false,
+    };
+  }
+  const tokenHex = tokenId.toString(16).padStart(64, "0");
+  const stakerLower = (stakerAddr || "").toLowerCase();
+  const walletLower = (walletAddr || "").toLowerCase();
+
+  try {
+    const ownerCall = p
+      .request({
+        method: "eth_call",
+        params: [{ to: npm, data: `0x6352211e${tokenHex}` }, "latest"],
+      })
+      .catch(() => null) as Promise<string | null>;
+
+    const approvedCall = stakerLower
+      ? (p
+          .request({
+            method: "eth_call",
+            params: [{ to: npm, data: `0x081812fc${tokenHex}` }, "latest"],
+          })
+          .catch(() => null) as Promise<string | null>)
+      : Promise.resolve(null);
+
+    const approvedForAllCall =
+      stakerLower && walletLower
+        ? (p
+            .request({
+              method: "eth_call",
+              params: [
+                {
+                  to: npm,
+                  data: `0xe985e9c5${walletLower
+                    .replace(/^0x/, "")
+                    .padStart(64, "0")}${stakerLower
+                    .replace(/^0x/, "")
+                    .padStart(64, "0")}`,
+                },
+                "latest",
+              ],
+            })
+            .catch(() => null) as Promise<string | null>)
+        : Promise.resolve(null);
+
+    const posCall = p
+      .request({
+        method: "eth_call",
+        params: [{ to: npm, data: `0x99fbab88${tokenHex}` }, "latest"],
+      })
+      .catch(() => null) as Promise<string | null>;
+
+    const [ownerRaw, approvedRaw, allRaw, posRaw] = await Promise.all([
+      ownerCall,
+      approvedCall,
+      approvedForAllCall,
+      posCall,
+    ]);
+
+    let owner: string | null = null;
+    if (ownerRaw && ownerRaw.length >= 66) {
+      owner = ("0x" + ownerRaw.slice(-40)).toLowerCase();
+    }
+
+    let isStakedOnChain: boolean | null = null;
+    if (owner) {
+      if (stakerLower && owner === stakerLower) {
+        isStakedOnChain = true;
+      } else if (walletLower && owner === walletLower) {
+        isStakedOnChain = false;
+      }
+    }
+
+    let singleApprovedToStaker = false;
+    if (approvedRaw && approvedRaw.length >= 66 && stakerLower) {
+      const apprAddr = ("0x" + approvedRaw.slice(-40)).toLowerCase();
+      singleApprovedToStaker = apprAddr === stakerLower;
+    }
+
+    let approvedForAllToStaker = false;
+    if (allRaw && allRaw.length >= 66) {
+      approvedForAllToStaker = allRaw.slice(-1) === "1";
+    }
+
+    let liquidity: bigint | null = null;
+    let hasTokensOwed = false;
+    if (posRaw && posRaw.length >= 2 + 64 * 12) {
+      const clean = posRaw.replace(/^0x/, "");
+      const liqWord = clean.slice(64 * 7, 64 * 8);
+      const owed0Word = clean.slice(64 * 10, 64 * 11);
+      const owed1Word = clean.slice(64 * 11, 64 * 12);
+      try {
+        liquidity = BigInt("0x" + liqWord);
+        const owed0 = BigInt("0x" + owed0Word);
+        const owed1 = BigInt("0x" + owed1Word);
+        hasTokensOwed = owed0 > 0n || owed1 > 0n;
+      } catch {}
+    }
+
+    return {
+      owner,
+      isStakedOnChain,
+      singleApprovedToStaker,
+      approvedForAllToStaker,
+      liquidity,
+      hasTokensOwed,
+    };
+  } catch {
+    return {
+      owner: null,
+      isStakedOnChain: null,
+      singleApprovedToStaker: false,
+      approvedForAllToStaker: false,
+      liquidity: null,
+      hasTokensOwed: false,
+    };
+  }
+}
+
+/**
  * 极速轮询交易回执（350ms 间隔），一旦上链确认立即返回 receipt，避免死等固定延迟。
  */
 export async function waitForTxReceipt(txHash: string, timeoutMs = 45000): Promise<any | null> {
@@ -286,7 +463,7 @@ export async function extractMintedTokenIdFromReceipt(
 
 /**
  * 质押前强校验 NFT 的 (token0, token1, fee) 是否与当前目标池子严格一致，
- * 彻底杜绝将 A/B 交易对的 NFT 误存入 C/D 质押合约的风险。
+ * 彻底杜绝将 A/B 交易对的 NFT 存入 C/D 质押合约的风险。
  */
 export async function verifyNftPoolMatch(
   npm: string,
@@ -348,6 +525,11 @@ export function useWallet() {
     []
   );
   const doSendTx = useCallback((o: Parameters<typeof sendTx>[0]) => sendTx(o), []);
+  const doSendTxWithRetry = useCallback(
+    (o: Parameters<typeof sendTx>[0], stepLabel: string) =>
+      sendTxWithCancelRetry(o, stepLabel),
+    []
+  );
 
   return {
     address: syncState.address,
@@ -359,5 +541,6 @@ export function useWallet() {
     disconnect: doDisconnect,
     switchChain: doSwitchChain,
     sendTx: doSendTx,
+    sendTxWithRetry: doSendTxWithRetry,
   };
 }
