@@ -121,6 +121,8 @@ export function LiquidityProbe({
   const [result, setResult] = useState<ProbeResult | null>(null);
   const [loading, setLoading] = useState(false);
   const [showManualForm, setShowManualForm] = useState(false);
+  const [mintCollapsed, setMintCollapsed] = useState(false);
+  const [swapCollapsed, setSwapCollapsed] = useState(false);
 
   // 创建仓位面板选中的池子（点击收藏或探测后自动同步）
   const [mintPool, setMintPool] = useState("");
@@ -143,6 +145,7 @@ export function LiquidityProbe({
       setPool(externalPool.pool);
       setMintChainId(externalPool.chainId);
       setMintPool(externalPool.pool);
+      setMintCollapsed(false);
       probe(false, {
         chainId: cStr,
         pool: externalPool.pool,
@@ -1105,6 +1108,8 @@ export function LiquidityProbe({
         liveCex={probeLiveCex}
         w0gPriceUsd={merkl?.w0gPriceUsd}
         binanceRt={binanceRt}
+        collapsed={mintCollapsed}
+        onToggleCollapse={() => setMintCollapsed((v) => !v)}
         onCreated={() => {
           mutate("/api/positions");
           mutate("/api/merkl-rewards");
@@ -1116,7 +1121,12 @@ export function LiquidityProbe({
       />
 
       {/* ==================== 第 3 段：💱 当前池双币极速兑换 ==================== */}
-      <SwapQuoteSection externalPair={swapPair} embedded />
+      <SwapQuoteSection
+        externalPair={swapPair}
+        embedded
+        collapsed={swapCollapsed}
+        onToggleCollapse={() => setSwapCollapsed((v) => !v)}
+      />
     </div>
   );
 }

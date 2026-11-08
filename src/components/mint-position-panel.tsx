@@ -37,6 +37,8 @@ interface Props {
   liveCex?: LivePairCexAnalysis | null;
   w0gPriceUsd?: number;
   binanceRt?: UseBinanceRealtimeReturn;
+  collapsed?: boolean;
+  onToggleCollapse?: () => void;
   onClose?: () => void;
   onCreated?: () => void;
   onFlipChanged?: () => void;
@@ -51,6 +53,8 @@ export function MintPositionPanel({
   liveCex,
   w0gPriceUsd,
   binanceRt,
+  collapsed = false,
+  onToggleCollapse,
   onClose,
   onCreated,
   onFlipChanged,
@@ -867,20 +871,38 @@ export function MintPositionPanel({
   }, [data, effectiveSimUsd, computeZeroToAboveRange, simulateStrategy]);
 
   return (
-    <div className="panel-inset border-cyan-500/30 p-4 text-xs">
-      <div className="mb-2.5 flex items-center justify-between">
-        <span className="text-sm font-semibold text-ink">
-          ② ➕ 极速建仓 & 自动质押（双模式 + 实时收益模拟）
-        </span>
-        {onClose && (
-          <button className="btn-ghost btn-xs" onClick={onClose}>
-            收起
-          </button>
-        )}
+    <div className="panel-inset border-cyan-500/30 p-3.5 text-xs">
+      <div className={`flex items-center justify-between gap-2 ${collapsed ? "" : "mb-2.5"}`}>
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="text-sm font-semibold text-ink">
+            ② ➕ 极速建仓 & 自动质押（双模式 + 实时收益模拟）
+          </span>
+          {collapsed && displayPair && (
+            <span className="tag-info font-mono text-[11px]">{displayPair}</span>
+          )}
+        </div>
+        <div className="flex items-center gap-1.5">
+          {onToggleCollapse && (
+            <button
+              type="button"
+              className="btn-ghost btn-xs"
+              onClick={onToggleCollapse}
+            >
+              {collapsed ? "展开建仓 ▼" : "收起 ▲"}
+            </button>
+          )}
+          {onClose && (
+            <button className="btn-ghost btn-xs" onClick={onClose}>
+              关闭
+            </button>
+          )}
+        </div>
       </div>
 
-      {/* 未选池子时提示从上方收藏列表选择 */}
-      {!data ? (
+      {!collapsed && (
+        <>
+          {/* 未选池子时提示从上方收藏列表选择 */}
+          {!data ? (
         <div className="space-y-2">
           {initialPool ? (
             <div className="text-ink-soft">
@@ -1471,6 +1493,8 @@ export function MintPositionPanel({
       )}
 
       {msg && <p className="mt-2 text-ink">{msg}</p>}
+        </>
+      )}
     </div>
   );
 }

@@ -32,6 +32,9 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
                 <span className="hidden rounded border border-emerald-500/25 bg-emerald-500/10 px-1.5 py-0.5 font-mono text-[10px] font-medium text-emerald-300 sm:inline-block">
                   PRO V3/V4
                 </span>
+                <span className="rounded border border-cyan-400/30 bg-cyan-500/15 px-1.5 py-0.5 font-mono text-[10px] font-semibold text-cyan-200">
+                  v0.22.0
+                </span>
               </div>
             </Link>
             <nav className="flex items-center gap-1.5 text-xs text-slate-300 md:gap-2">

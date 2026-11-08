@@ -79,9 +79,13 @@ interface QuoteResult {
 export function SwapQuoteSection({
   externalPair,
   embedded = false,
+  collapsed = false,
+  onToggleCollapse,
 }: {
   externalPair?: ExternalSwapPair | null;
   embedded?: boolean;
+  collapsed?: boolean;
+  onToggleCollapse?: () => void;
 }) {
   const { data: chains } = useSWR<any[]>("/api/chains", fetcher);
   const { data: allDexes } = useSWR<DexWithQuoter[]>("/api/dexes", fetcher);
@@ -465,7 +469,7 @@ export function SwapQuoteSection({
 
   return (
     <section className={embedded ? "panel-inset p-3.5" : "card p-4"}>
-      <div className="mb-2.5 flex flex-wrap items-center justify-between gap-2">
+      <div className={`flex flex-wrap items-center justify-between gap-2 ${collapsed ? "" : "mb-2.5"}`}>
         <div className="flex flex-wrap items-center gap-1.5">
           <h2 className="text-sm font-semibold text-ink">
             {embedded ? "③ 💱 当前池双币极速兑换 (Swap)" : "💱 代币兑换 (Swap)"}
@@ -477,35 +481,50 @@ export function SwapQuoteSection({
           )}
         </div>
 
-        {/* DEX 选择（紧凑宽度） */}
+        {/* DEX 选择 + 收起展开按钮 */}
         <div className="flex items-center gap-1.5 text-xs">
-          <span className="text-ink-soft shrink-0">DEX</span>
-          {dexOptions.length === 0 ? (
-            <span className="text-warn">未配 QuoterV2</span>
-          ) : (
-            <select
-              className="input !w-auto max-w-[145px] py-1 pl-2 pr-5 text-xs"
-              value={dex?.id ?? ""}
-              onChange={(e) => {
-                setDexId(e.target.value ? Number(e.target.value) : "");
-                setInSym("");
-                setOutSym("");
-                setQuote(null);
-              }}
+          {!collapsed && (
+            <>
+              <span className="text-ink-soft shrink-0">DEX</span>
+              {dexOptions.length === 0 ? (
+                <span className="text-warn">未配 QuoterV2</span>
+              ) : (
+                <select
+                  className="input !w-auto max-w-[145px] py-1 pl-2 pr-5 text-xs"
+                  value={dex?.id ?? ""}
+                  onChange={(e) => {
+                    setDexId(e.target.value ? Number(e.target.value) : "");
+                    setInSym("");
+                    setOutSym("");
+                    setQuote(null);
+                  }}
+                >
+                  {dexOptions.map((d) => (
+                    <option key={d.id} value={d.id}>
+                      {(chains ?? []).find((c: any) => c.id === d.chain_id_ref)
+                        ?.name ?? d.chain_id_ref}
+                      -{d.name}
+                    </option>
+                  ))}
+                </select>
+              )}
+            </>
+          )}
+          {onToggleCollapse && (
+            <button
+              type="button"
+              className="btn-ghost btn-xs"
+              onClick={onToggleCollapse}
             >
-              {dexOptions.map((d) => (
-                <option key={d.id} value={d.id}>
-                  {(chains ?? []).find((c: any) => c.id === d.chain_id_ref)
-                    ?.name ?? d.chain_id_ref}
-                  -{d.name}
-                </option>
-              ))}
-            </select>
+              {collapsed ? "展开兑换 ▼" : "收起 ▲"}
+            </button>
           )}
         </div>
       </div>
 
-      {/* 兑换输入区：左右严格等宽等高对齐 */}
+      {!collapsed && (
+        <>
+          {/* 兑换输入区：左右严格等宽等高对齐 */}
       {dex && chainTokens.length >= 2 && (
         <div className="space-y-2.5">
           <div className="grid grid-cols-1 gap-2 sm:grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] sm:items-stretch">
@@ -769,6 +788,8 @@ export function SwapQuoteSection({
             </span>
           </div>
         </div>
+      )}
+        </>
       )}
     </section>
   );

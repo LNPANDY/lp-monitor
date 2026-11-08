@@ -378,12 +378,18 @@ export default function DashboardPage() {
     fetcher,
     { refreshInterval: 30_000 }
   );
+  const { data: topAlertData } = useSWR<any>(
+    "/api/alert-settings",
+    fetcher,
+    { refreshInterval: 30_000 }
+  );
 
   const list = positions ?? [];
   const outOfRange = list.filter((p) => p.last_in_range === 0);
   const closed = closedPositions ?? [];
   const [showClosed, setShowClosed] = useState(false);
   const [showScanSettings, setShowScanSettings] = useState(false);
+  const [showSleepBar, setShowSleepBar] = useState(true);
   const [showPortfolio, setShowPortfolio] = useState(false);
   const [showSecurityDrawer, setShowSecurityDrawer] = useState(false);
   const [secActionBusy, setSecActionBusy] = useState(false);
@@ -591,6 +597,27 @@ export default function DashboardPage() {
           </button>
         </div>
         <div className="flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            onClick={() => setShowSleepBar((v) => !v)}
+            className={`inline-flex items-center gap-1.5 rounded-lg border px-2.5 py-1.5 text-xs font-medium transition ${
+              topAlertData?.night_mode_active_now
+                ? "border-indigo-400/60 bg-indigo-500/25 text-indigo-100 shadow-[0_0_12px_rgba(99,102,241,0.3)]"
+                : "border-indigo-400/30 bg-indigo-500/10 text-indigo-200 hover:bg-indigo-500/20"
+            }`}
+            title="点击展开或收起手动睡眠低频推送控制台"
+          >
+            <span>
+              {topAlertData?.night_mode_active_now
+                ? topAlertData?.night_mode_remaining_minutes === -1
+                  ? "🌙 睡眠中(持续)"
+                  : `🌙 睡眠中 · 剩 ${Math.floor((topAlertData?.night_mode_remaining_minutes ?? 0) / 60)}h${(topAlertData?.night_mode_remaining_minutes ?? 0) % 60}m`
+                : "🌙 睡眠模式"}
+            </span>
+            <span className="text-[10px] opacity-75">
+              {showSleepBar ? "▲" : "▼"}
+            </span>
+          </button>
           <button
             type="button"
             className="btn-ghost text-xs"
@@ -1053,6 +1080,11 @@ export default function DashboardPage() {
             </div>
           )}
         </div>
+      )}
+
+      {/* 🌙 手动睡眠低频推送控制台（首屏默认展示，也可通过顶部「🌙 睡眠模式」胶囊收起/展开） */}
+      {showSleepBar && (
+        <SleepModeControlBar onClose={() => setShowSleepBar(false)} />
       )}
 
       {/* 扫描频率和告警阈值设置（按需展开，保持首屏紧凑） */}
@@ -1862,186 +1894,246 @@ function ScanIntervalAndAlerts({
         </div>
       </div>
 
-      {/* 🌙 手动睡眠/低频推送模式（按小时倒计时自动恢复） */}
-      <div
-        className={`rounded-xl border px-3.5 py-2.5 transition-colors ${
-          nightActiveNow
-            ? "border-indigo-400/50 bg-indigo-500/15"
-            : "border-white/[0.08] bg-white/[0.02]"
-        }`}
-      >
-        <div className="flex flex-wrap items-center justify-between gap-3">
-          <div className="flex flex-wrap items-center gap-2.5">
-            <span className="text-xs font-semibold text-indigo-200 flex items-center gap-1.5">
-              🌙 睡眠低频模式
-              <span
-                className={`rounded-full px-2.5 py-0.5 text-[11px] font-medium ${
-                  nightActiveNow
-                    ? "bg-indigo-500/35 text-indigo-100 border border-indigo-400/50"
-                    : "bg-white/10 text-ink-soft"
-                }`}
-              >
-                {nightActiveNow
-                  ? nightRemainingMin === -1
-                    ? "🌙 睡眠降频生效中 · 持续开启（至手动关闭）"
-                    : `🌙 睡眠降频生效中 · 剩余 ${formatRemaining(nightRemainingMin)}（至北京时间 ${nightExpiresBeijing} 自动恢复）`
-                  : "☀️ 当前未开启（正常频率推送中）"}
-              </span>
+      {msg && <div className="mt-2 text-xs">{msg}</div>}
+    </div>
+  );
+}
+
+function SleepModeControlBar({ onClose }: { onClose?: () => void }) {
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState("");
+  const { data: alertData, mutate: mutateAlerts } = useSWR<any>(
+    "/api/alert-settings",
+    fetcher,
+    { refreshInterval: 30_000 }
+  );
+
+  async function updateNightMode(patch: Record<string, any>, label?: string) {
+    setBusy(true);
+    setMsg("");
+    try {
+      const r = await fetch("/api/alert-settings", {
+        method: "PUT",
+        headers: authHeaders({ "Content-Type": "application/json" }),
+        body: JSON.stringify(patch),
+      });
+      const j = await r.json();
+      if (!j.ok) throw new Error(j.error);
+      setMsg(`✅ ${label || "睡眠模式策略已更新"}`);
+      mutateAlerts();
+    } catch (e: any) {
+      setMsg(`❌ ${e.message}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const nightActiveNow = alertData?.night_mode_active_now ?? false;
+  const nightDefaultHours = alertData?.night_mode_default_hours ?? 8;
+  const nightRemainingMin = alertData?.night_mode_remaining_minutes ?? 0;
+  const nightExpiresBeijing = alertData?.night_mode_expires_beijing ?? "";
+  const nightOorCooldown = alertData?.night_cooldown_out_of_range ?? 60;
+  const nightMuteNoise = alertData?.night_mute_noise ?? true;
+
+  const formatRemaining = (mins: number) => {
+    if (mins === -1) return "持续生效（直到手动关闭）";
+    if (mins <= 0) return "";
+    const h = Math.floor(mins / 60);
+    const m = mins % 60;
+    return h > 0 ? `${h}小时${m > 0 ? `${m}分` : ""}` : `${m}分钟`;
+  };
+
+  return (
+    <div
+      className={`card px-4 py-3 transition-colors border ${
+        nightActiveNow
+          ? "border-indigo-400/50 bg-indigo-500/15"
+          : "border-indigo-400/25 bg-surface-1/90"
+      }`}
+    >
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="flex flex-wrap items-center gap-2.5">
+          <span className="text-xs font-semibold text-indigo-200 flex items-center gap-1.5">
+            🌙 睡眠低频模式
+            <span
+              className={`rounded-full px-2.5 py-0.5 text-[11px] font-medium ${
+                nightActiveNow
+                  ? "bg-indigo-500/35 text-indigo-100 border border-indigo-400/50"
+                  : "bg-white/10 text-ink-soft"
+              }`}
+            >
+              {nightActiveNow
+                ? nightRemainingMin === -1
+                  ? "🌙 睡眠降频生效中 · 持续开启（至手动关闭）"
+                  : `🌙 睡眠降频生效中 · 剩余 ${formatRemaining(nightRemainingMin)}（至北京时间 ${nightExpiresBeijing} 自动恢复）`
+                : "☀️ 当前未开启（正常频率推送中）"}
             </span>
+          </span>
 
-            {!nightActiveNow ? (
-              <>
-                <label className="flex items-center gap-1.5 text-xs">
-                  <span className="text-ink-soft">设定时长</span>
-                  <select
-                    className="input max-w-[130px] text-xs py-1"
-                    value={nightDefaultHours}
-                    disabled={busy}
-                    onChange={(e) =>
-                      updateNightMode(
-                        { night_mode_default_hours: Number(e.target.value) },
-                        Number(e.target.value) === -1
-                          ? "默认时长已设为持续开启"
-                          : `默认开启时长已设为 ${e.target.value} 小时`
-                      )
-                    }
-                  >
-                    {[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12].map((h) => (
-                      <option key={h} value={h}>
-                        {h} 小时
-                      </option>
-                    ))}
-                    <option value={-1}>持续开启(手动关)</option>
-                  </select>
-                </label>
-
-                <button
-                  className="btn-primary text-xs py-1 px-3 font-medium"
+          {!nightActiveNow ? (
+            <>
+              <label className="flex items-center gap-1.5 text-xs">
+                <span className="text-ink-soft">设定时长</span>
+                <select
+                  className="input max-w-[130px] text-xs py-1"
+                  value={nightDefaultHours}
                   disabled={busy}
-                  onClick={() =>
+                  onChange={(e) =>
                     updateNightMode(
-                      { night_action: "start", night_hours: nightDefaultHours },
-                      nightDefaultHours === -1
-                        ? "🌙 已开启睡眠低频模式（持续至手动关闭）"
-                        : `🌙 已开启睡眠低频模式（持续 ${nightDefaultHours} 小时，到期自动恢复）`
+                      { night_mode_default_hours: Number(e.target.value) },
+                      Number(e.target.value) === -1
+                        ? "默认时长已设为持续开启"
+                        : `默认开启时长已设为 ${e.target.value} 小时`
                     )
                   }
                 >
-                  🌙 开启睡眠模式 (
-                  {nightDefaultHours === -1 ? "持续" : `${nightDefaultHours}小时`})
-                </button>
-
-                <div className="flex items-center gap-1">
-                  {[4, 6, 8, 10].map((h) => (
-                    <button
-                      key={h}
-                      className="btn-ghost text-[11px] py-0.5 px-2"
-                      disabled={busy}
-                      onClick={() =>
-                        updateNightMode(
-                          { night_action: "start", night_hours: h },
-                          `🌙 已开启睡眠低频模式 ${h} 小时`
-                        )
-                      }
-                    >
-                      睡{h}h
-                    </button>
+                  {[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12].map((h) => (
+                    <option key={h} value={h}>
+                      {h} 小时
+                    </option>
                   ))}
-                </div>
-              </>
-            ) : (
-              <>
-                <button
-                  className="btn-primary bg-amber-500/80 hover:bg-amber-500 text-slate-950 font-semibold text-xs py-1 px-3"
-                  disabled={busy}
-                  onClick={() =>
-                    updateNightMode(
-                      { night_action: "stop" },
-                      "☀️ 已关闭睡眠模式，恢复正常频率推送"
-                    )
-                  }
-                >
-                  ☀️ 我醒了 (立即关闭)
-                </button>
+                  <option value={-1}>持续开启(手动关)</option>
+                </select>
+              </label>
 
-                <button
-                  className="btn-secondary text-xs py-1 px-2.5"
-                  disabled={busy}
-                  onClick={() =>
-                    updateNightMode(
-                      { night_action: "extend", night_hours: 1 },
-                      "🌙 已延长睡眠模式 +1 小时"
-                    )
-                  }
-                >
-                  +1小时
-                </button>
-                <button
-                  className="btn-secondary text-xs py-1 px-2.5"
-                  disabled={busy}
-                  onClick={() =>
-                    updateNightMode(
-                      { night_action: "extend", night_hours: 2 },
-                      "🌙 已延长睡眠模式 +2 小时"
-                    )
-                  }
-                >
-                  +2小时
-                </button>
-              </>
-            )}
-
-            <span className="text-white/20">|</span>
-
-            <label className="flex items-center gap-1.5 text-xs">
-              <span className="text-ink-soft">越界重复间隔</span>
-              <select
-                className="input max-w-[155px] text-xs py-1"
-                value={nightOorCooldown}
+              <button
+                className="btn-primary text-xs py-1 px-3 font-medium"
                 disabled={busy}
-                onChange={(e) =>
+                onClick={() =>
                   updateNightMode(
-                    { night_cooldown_out_of_range: Number(e.target.value) },
-                    Number(e.target.value) === -1
-                      ? "睡眠模式已设为仅首次越界推送（回区间仍推1次）"
-                      : `睡眠模式越界重复提醒已设为 ${e.target.value} 分钟`
+                    { night_action: "start", night_hours: nightDefaultHours },
+                    nightDefaultHours === -1
+                      ? "🌙 已开启睡眠低频模式（持续至手动关闭）"
+                      : `🌙 已开启睡眠低频模式（持续 ${nightDefaultHours} 小时，到期自动恢复）`
                   )
                 }
               >
-                <option value={60}>60分钟 (至少1小时)</option>
-                <option value={90}>90分钟 (1.5小时)</option>
-                <option value={120}>120分钟 (2小时)</option>
-                <option value={180}>180分钟 (3小时)</option>
-                <option value={-1}>仅推首次越界 (不重复)</option>
-              </select>
-            </label>
+                🌙 开启睡眠模式 (
+                {nightDefaultHours === -1 ? "持续" : `${nightDefaultHours}小时`})
+              </button>
 
-            <button
-              className={
-                nightMuteNoise
-                  ? "btn-secondary text-xs py-1 px-2.5"
-                  : "btn-ghost text-xs py-1 px-2.5"
-              }
+              <div className="flex items-center gap-1">
+                {[4, 6, 8, 10].map((h) => (
+                  <button
+                    key={h}
+                    className="btn-ghost text-[11px] py-0.5 px-2"
+                    disabled={busy}
+                    onClick={() =>
+                      updateNightMode(
+                        { night_action: "start", night_hours: h },
+                        `🌙 已开启睡眠低频模式 ${h} 小时`
+                      )
+                    }
+                  >
+                    睡{h}h
+                  </button>
+                ))}
+              </div>
+            </>
+          ) : (
+            <>
+              <button
+                className="btn-primary bg-amber-500/80 hover:bg-amber-500 text-slate-950 font-semibold text-xs py-1 px-3"
+                disabled={busy}
+                onClick={() =>
+                  updateNightMode(
+                    { night_action: "stop" },
+                    "☀️ 已关闭睡眠模式，恢复正常频率推送"
+                  )
+                }
+              >
+                ☀️ 我醒了 (立即关闭)
+              </button>
+
+              <button
+                className="btn-secondary text-xs py-1 px-2.5"
+                disabled={busy}
+                onClick={() =>
+                  updateNightMode(
+                    { night_action: "extend", night_hours: 1 },
+                    "🌙 已延长睡眠模式 +1 小时"
+                  )
+                }
+              >
+                +1小时
+              </button>
+              <button
+                className="btn-secondary text-xs py-1 px-2.5"
+                disabled={busy}
+                onClick={() =>
+                  updateNightMode(
+                    { night_action: "extend", night_hours: 2 },
+                    "🌙 已延长睡眠模式 +2 小时"
+                  )
+                }
+              >
+                +2小时
+              </button>
+            </>
+          )}
+
+          <span className="text-white/20">|</span>
+
+          <label className="flex items-center gap-1.5 text-xs">
+            <span className="text-ink-soft">越界重复间隔</span>
+            <select
+              className="input max-w-[155px] text-xs py-1"
+              value={nightOorCooldown}
               disabled={busy}
-              onClick={() =>
+              onChange={(e) =>
                 updateNightMode(
-                  { night_mute_noise: nightMuteNoise ? "0" : "1" },
-                  nightMuteNoise
-                    ? "已关闭睡眠降噪"
-                    : "已开启睡眠降噪（静默区间内波动与高APR猎手）"
+                  { night_cooldown_out_of_range: Number(e.target.value) },
+                  Number(e.target.value) === -1
+                    ? "睡眠模式已设为仅首次越界推送（回区间仍推1次）"
+                    : `睡眠模式越界重复提醒已设为 ${e.target.value} 分钟`
                 )
               }
             >
-              {nightMuteNoise ? "🔕 睡眠降噪：开" : "🔔 睡眠降噪：关"}
-            </button>
-          </div>
+              <option value={60}>60分钟 (至少1小时)</option>
+              <option value={90}>90分钟 (1.5小时)</option>
+              <option value={120}>120分钟 (2小时)</option>
+              <option value={180}>180分钟 (3小时)</option>
+              <option value={-1}>仅推首次越界 (不重复)</option>
+            </select>
+          </label>
 
-          <div className="text-[11px] text-ink-soft">
+          <button
+            className={
+              nightMuteNoise
+                ? "btn-secondary text-xs py-1 px-2.5"
+                : "btn-ghost text-xs py-1 px-2.5"
+            }
+            disabled={busy}
+            onClick={() =>
+              updateNightMode(
+                { night_mute_noise: nightMuteNoise ? "0" : "1" },
+                nightMuteNoise
+                  ? "已关闭睡眠降噪"
+                  : "已开启睡眠降噪（静默区间内波动与高APR猎手）"
+              )
+            }
+          >
+            {nightMuteNoise ? "🔕 睡眠降噪：开" : "🔔 睡眠降噪：关"}
+          </button>
+        </div>
+
+        <div className="flex items-center gap-2 text-[11px] text-ink-soft">
+          <span>
             策略：首次越界立即推 · 持续越界{" "}
             {nightOorCooldown === -1 ? "不重复推" : `≥${nightOorCooldown}分钟重复推`} ·{" "}
             <span className="text-emerald-300 font-medium">回到区间立即推 1 次</span>
             {nightMuteNoise ? " · 静默区间波动/高APR打野" : ""}
-          </div>
+          </span>
+          {onClose && (
+            <button
+              type="button"
+              className="btn-ghost btn-xs"
+              onClick={onClose}
+              title="收起睡眠面板（可随时从上方『🌙 睡眠模式』按钮打开）"
+            >
+              收起 ▲
+            </button>
+          )}
         </div>
       </div>
 
