@@ -2315,13 +2315,30 @@ function PositionCard({
     );
     if (rt) return rt;
     if (dbCexInfo && dbCexInfo.cexRate > 0 && dbCexInfo.dexRate > 0) {
+      const feeRate = (p.fee || 3000) / 1_000_000;
+      const feeTicks = Math.max(
+        1,
+        Math.round(Math.log(1 / (1 - feeRate)) / Math.log(1.0001))
+      );
       const tickDelta = Math.round(
         Math.log(dbCexInfo.cexRate / dbCexInfo.dexRate) / Math.log(1.0001)
       );
-      const impliedTick = p.last_current_tick + tickDelta;
+      const rawImpliedTick = p.last_current_tick + tickDelta;
+      const arbTickDelta =
+        Math.abs(tickDelta) <= feeTicks
+          ? 0
+          : tickDelta > 0
+            ? tickDelta - feeTicks
+            : tickDelta + feeTicks;
+      const impliedTick = p.last_current_tick + arbTickDelta;
+      const arbBreakoutLowerTick = p.tick_lower - feeTicks;
+      const arbBreakoutUpperTick = p.tick_upper + feeTicks;
       const impliedMarginLowerPct = ((impliedTick - p.tick_lower) / span) * 100;
       const impliedMarginUpperPct = ((p.tick_upper - impliedTick) / span) * 100;
-      const feeRate = (p.fee || 3000) / 1_000_000;
+      const rawImpliedMarginLowerPct =
+        ((rawImpliedTick - p.tick_lower) / span) * 100;
+      const withinFeeDeadzone =
+        Math.abs(tickDelta) <= feeTicks && dbCexInfo.absDiff < feeRate;
       return {
         token0PriceUsd: dbCexInfo.token0Price ?? 0,
         token1PriceUsd: dbCexInfo.token1Price ?? 1,
@@ -2332,17 +2349,30 @@ function PositionCard({
         diff: dbCexInfo.diff,
         absDiff: dbCexInfo.absDiff,
         feeRate,
-        withinFeeDeadzone: dbCexInfo.absDiff < feeRate,
+        withinFeeDeadzone,
         exceedsAlertThreshold: dbCexInfo.absDiff >= feeRate * 2,
+        isArbCritical: !withinFeeDeadzone,
         impliedTick,
+        rawImpliedTick,
         tickDelta,
+        arbTickDelta,
+        feeTicks,
+        arbBreakoutLowerTick,
+        arbBreakoutUpperTick,
         impliedInRange: impliedTick >= p.tick_lower && impliedTick < p.tick_upper,
+        rawImpliedInRange:
+          rawImpliedTick >= p.tick_lower && rawImpliedTick < p.tick_upper,
         impliedMarginLowerPct,
         impliedMarginUpperPct,
+        rawImpliedMarginLowerPct,
+        dexMarginLowerPct: marginLower,
+        dexMarginUpperPct: marginUpper,
+        cexMarginLowerPct: impliedMarginLowerPct,
+        cexMarginUpperPct: impliedMarginUpperPct,
       };
     }
     return null;
-  }, [binanceRt, p, sym0, sym1, dbCexInfo, span]);
+  }, [binanceRt, p, sym0, sym1, dbCexInfo, span, marginLower, marginUpper]);
 
   // 实时双币持仓拆解（Module ③）
   const holdings = useMemo(
@@ -2457,8 +2487,15 @@ function PositionCard({
           >
             {p.last_current_tick}
             {liveCex && (
-              <span className="ml-1.5 text-xs text-amber-300" title="币安实时价格对应的池内隐含目标 Tick">
-                (⚡币安Tick {liveCex.impliedTick})
+              <span
+                className="ml-1.5 text-xs text-amber-300"
+                title={`币安裸价映射 Tick ${liveCex.rawImpliedTick}，扣除 ${(liveCex.feeRate * 100).toFixed(2)}% 池费死角（${liveCex.feeTicks} tick）后真实套利目标 Tick 为 ${liveCex.impliedTick}`}
+              >
+                (⚡币安目标Tick {liveCex.impliedTick}
+                {liveCex.rawImpliedTick !== liveCex.impliedTick
+                  ? ` · 裸价${liveCex.rawImpliedTick}扣${liveCex.feeTicks}t池费`
+                  : ""}
+                )
               </span>
             )}
           </span>
@@ -2493,12 +2530,12 @@ function PositionCard({
             </span>
             <span className="ml-1.5 font-mono text-xs text-ink-soft">
               ({liveCex.tickDelta >= 0 ? "+" : ""}
-              {liveCex.tickDelta} tick)
+              {liveCex.tickDelta} tick · 死角±{liveCex.feeTicks}t)
             </span>
           </Row>
         )}
 
-        {/* ==================== Module ②：双指针区间雷达（链上 Tick + 币安隐含 Tick + 0.30% 套利死角判定） ==================== */}
+        {/* ==================== Module ②：双指针区间雷达（链上 Tick + 币安扣费目标 Tick + 0.30% 套利死角判定） ==================== */}
         <div className="pt-2 pb-1 space-y-1">
           <div className="relative h-2.5 w-full rounded bg-white/[0.1] overflow-visible">
             {/* 区间内绿底 */}
@@ -2514,7 +2551,7 @@ function PositionCard({
                 }%`,
               }}
             />
-            {/* 链上 Tick 与 币安隐含 Tick 之间的套利牵引带 */}
+            {/* 链上 Tick 与 币安扣费目标 Tick 之间的套利牵引带 */}
             {impliedClampedPct !== null && pullWidthPct > 0.5 && (
               <div
                 className="absolute inset-y-0 rounded bg-amber-400/30"
@@ -2522,7 +2559,7 @@ function PositionCard({
                   left: `${pullLeftPct}%`,
                   width: `${pullWidthPct}%`,
                 }}
-                title="链上现价与币安隐含价之间的套利牵引区"
+                title="链上现价与币安扣费目标价之间的套利牵引区"
               />
             )}
             {/* 指针 1：链上当前 Tick */}
@@ -2534,14 +2571,14 @@ function PositionCard({
               }}
               title={`链上当前 Tick: ${p.last_current_tick} (距下界 ${marginLower.toFixed(1)}%)`}
             />
-            {/* 指针 2：币安实时隐含 Tick */}
+            {/* 指针 2：币安扣费目标 Tick */}
             {impliedClampedPct !== null && liveCex && (
               <div
                 className="absolute top-1/2 h-4 w-1.5 -translate-y-1/2 rounded border border-amber-200 bg-amber-400 shadow-[0_0_8px_#f59e0b]"
                 style={{
                   left: `${impliedClampedPct}%`,
                 }}
-                title={`⚡ 币安实时隐含 Tick: ${liveCex.impliedTick} (距下界 ${liveCex.impliedMarginLowerPct.toFixed(1)}%)`}
+                title={`⚡ 币安扣费目标 Tick: ${liveCex.impliedTick} (距下界 ${liveCex.impliedMarginLowerPct.toFixed(1)}%) · 裸价 Tick: ${liveCex.rawImpliedTick}`}
               />
             )}
           </div>
@@ -2553,11 +2590,19 @@ function PositionCard({
             {liveCex && (
               <span
                 className={
-                  liveCex.impliedInRange ? "text-amber-300" : "text-rose-300 font-semibold"
+                  !liveCex.impliedInRange
+                    ? "text-rose-300 font-semibold"
+                    : liveCex.withinFeeDeadzone
+                      ? "text-emerald-300"
+                      : "text-amber-300"
                 }
               >
-                ⚡ 币安位置 {liveCex.impliedMarginLowerPct.toFixed(1)}%
-                {!liveCex.impliedInRange ? " (池外)" : ""}
+                ⚡ 币安扣费目标 {liveCex.impliedMarginLowerPct.toFixed(1)}%
+                {!liveCex.impliedInRange
+                  ? " (套利将越界)"
+                  : liveCex.withinFeeDeadzone
+                    ? " (死角内)"
+                    : ""}
               </span>
             )}
           </div>
@@ -2573,14 +2618,16 @@ function PositionCard({
             >
               {liveCex.withinFeeDeadzone ? (
                 <span>
-                  🛡️ 手续费死角：价差 {(liveCex.absDiff * 100).toFixed(2)}% &lt;{" "}
-                  {(liveCex.feeRate * 100).toFixed(2)}% 池费（套利不触发）
+                  🛡️ 手续费死角：价差 {(liveCex.absDiff * 100).toFixed(2)}% (
+                  {liveCex.tickDelta >= 0 ? "+" : ""}
+                  {liveCex.tickDelta}t) &le; {(liveCex.feeRate * 100).toFixed(2)}%
+                  池费 ({liveCex.feeTicks}t，套利不触发)
                 </span>
               ) : (
                 <span>
-                  ⚡ 套利临界：价差 {(liveCex.absDiff * 100).toFixed(2)}% ≥{" "}
-                  {(liveCex.feeRate * 100).toFixed(2)}% 池费 · 机器人即将把 Tick 推向{" "}
-                  {liveCex.impliedTick}
+                  ⚡ 套利临界：价差 {(liveCex.absDiff * 100).toFixed(2)}% &gt;{" "}
+                  {(liveCex.feeRate * 100).toFixed(2)}% 池费 ({liveCex.feeTicks}t) ·
+                  扣费后推向 Tick {liveCex.impliedTick}
                 </span>
               )}
             </div>

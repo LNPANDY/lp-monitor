@@ -34,23 +34,37 @@ export interface LivePairCexAnalysis {
   /** (dexRate - cexRate) / cexRate */
   diff: number;
   absDiff: number;
-  /** 币安实时汇率对应的池子投影 Tick：currentTick + ln(cexRate / dexRate) / ln(1.0001) */
+  /** 扣除池子单边 Swap 手续费死角后的真实套利目标 Tick（在手续费死角内时等于 currentTick；突破死角后等于 rawImpliedTick ∓ feeTicks） */
   impliedTick: number;
+  /** 未扣除池子手续费的币安裸价映射 Tick：currentTick + ln(cexRate / dexRate) / ln(1.0001) */
+  rawImpliedTick: number;
+  /** 币安裸价与链上现价的原始 Tick 差（rawImpliedTick - currentTick） */
   tickDelta: number;
+  /** 扣除池子单边手续费后的有效套利推格量（死角内为 0，突破死角后为 tickDelta ∓ feeTicks） */
+  arbTickDelta: number;
+  /** 池子单边手续费对应的 Tick 死角宽度（如 0.30% 池为 30 tick，0.05% 池为 5 tick） */
+  feeTicks: number;
+  /** 币安裸价触发套利推穿当前区间下界/上界的临界 Tick（[tickLower - feeTicks, tickUpper + feeTicks]） */
+  arbBreakoutLowerTick: number;
+  arbBreakoutUpperTick: number;
+  /** 扣费后的真实套利目标 Tick 是否仍在当前区间 [tickLower, tickUpper] 内 */
   impliedInRange: boolean;
+  /** 未扣费的币安裸价 Tick 是否在当前区间 [tickLower, tickUpper] 内 */
+  rawImpliedInRange: boolean;
   impliedMarginLowerPct: number;
   impliedMarginUpperPct: number;
+  rawImpliedMarginLowerPct: number;
   /** 链上当前 Tick 在区间 [tickLower, tickUpper] 内的位置百分比（0~100 为在区间内，<0 为低于下界，>100 为高于上界） */
   dexMarginLowerPct: number;
   dexMarginUpperPct: number;
-  /** 币安投影 Tick 在区间 [tickLower, tickUpper] 内的位置百分比 */
+  /** 扣费后币安套利目标 Tick 在区间 [tickLower, tickUpper] 内的位置百分比 */
   cexMarginLowerPct: number;
   cexMarginUpperPct: number;
   /** 池子单边 Swap 手续费率（如 3000 -> 0.003 即 0.30%） */
   feeRate: number;
   withinFeeDeadzone: boolean;
   exceedsAlertThreshold: boolean;
-  /** 是否已突破池子单边手续费死角（|diff| >= feeRate），达到套利机器人下场临界点 */
+  /** 是否已突破池子单边手续费死角（|tickDelta| > feeTicks），达到套利机器人下场临界点 */
   isArbCritical: boolean;
 }
 
@@ -368,22 +382,42 @@ export function useBinanceRealtime() {
       const diff = (dexRate - cexRate) / cexRate;
       const absDiff = Math.abs(diff);
 
-      // 精确对数恒等式：impliedTick = currentTick + ln(cexRate / dexRate) / ln(1.0001)
+      const feeRate = fee > 0 ? fee / 1_000_000 : 0.003;
+      const feeTicks = Math.max(
+        1,
+        Math.round(Math.log(1 / (1 - feeRate)) / Math.log(1.0001))
+      );
+
+      // 精确对数恒等式：rawImpliedTick = currentTick + ln(cexRate / dexRate) / ln(1.0001)
       const rawTickDelta = Math.log(cexRate / dexRate) / Math.log(1.0001);
       const tickDelta = Number.isFinite(rawTickDelta) ? Math.round(rawTickDelta) : 0;
-      const impliedTick = currentTick + tickDelta;
+      const rawImpliedTick = currentTick + tickDelta;
+
+      // 扣除池子单边 Swap 手续费死角（±feeTicks）后的真实套利目标 Tick：
+      // - 当 |tickDelta| <= feeTicks（处于手续费死角内，如 0.30% 池价差 27 tick < 30 tick）时，套利无法获利，池子不会被推动（arbTickDelta = 0，impliedTick = currentTick）
+      // - 当 |tickDelta| > feeTicks 时，套利机器人最多将池子 Tick 推到离币安裸价还差 feeTicks 的边界（rawImpliedTick ∓ feeTicks）
+      const arbTickDelta =
+        Math.abs(tickDelta) <= feeTicks
+          ? 0
+          : tickDelta > 0
+            ? tickDelta - feeTicks
+            : tickDelta + feeTicks;
+      const impliedTick = currentTick + arbTickDelta;
+      const arbBreakoutLowerTick = tickLower - feeTicks;
+      const arbBreakoutUpperTick = tickUpper + feeTicks;
 
       const span = Math.max(tickUpper - tickLower, 1);
       const dexMarginLowerPct = ((currentTick - tickLower) / span) * 100;
       const dexMarginUpperPct = ((tickUpper - currentTick) / span) * 100;
       const cexMarginLowerPct = ((impliedTick - tickLower) / span) * 100;
       const cexMarginUpperPct = ((tickUpper - impliedTick) / span) * 100;
+      const rawImpliedMarginLowerPct = ((rawImpliedTick - tickLower) / span) * 100;
 
-      const feeRate = fee > 0 ? fee / 1_000_000 : 0.003;
-      const isArbCritical = absDiff >= feeRate;
-      const withinFeeDeadzone = !isArbCritical;
+      const withinFeeDeadzone = Math.abs(tickDelta) <= feeTicks && absDiff < feeRate;
+      const isArbCritical = !withinFeeDeadzone;
       const exceedsAlertThreshold = absDiff >= feeRate * 2;
       const impliedInRange = impliedTick >= tickLower && impliedTick < tickUpper;
+      const rawImpliedInRange = rawImpliedTick >= tickLower && rawImpliedTick < tickUpper;
 
       return {
         token0CexSymbol: sym0Cex,
@@ -395,10 +429,17 @@ export function useBinanceRealtime() {
         diff,
         absDiff,
         impliedTick,
+        rawImpliedTick,
         tickDelta,
+        arbTickDelta,
+        feeTicks,
+        arbBreakoutLowerTick,
+        arbBreakoutUpperTick,
         impliedInRange,
+        rawImpliedInRange,
         impliedMarginLowerPct: cexMarginLowerPct,
         impliedMarginUpperPct: cexMarginUpperPct,
+        rawImpliedMarginLowerPct,
         dexMarginLowerPct,
         dexMarginUpperPct,
         cexMarginLowerPct,
