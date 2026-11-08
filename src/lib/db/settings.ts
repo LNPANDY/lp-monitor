@@ -51,24 +51,108 @@ export function getPushCooldownMinutes(): number {
 
 // ===== 按告警类型的推送冷却配置（分钟）=====
 
-/**
- * 获取指定告警类型的冷却时间（分钟）。
- * 优先级：独立配置 cooldown_<type> > 全局 push_cooldown_minutes > 默认 2。
- *
- * 说明：早期为防止历史硬编码默认值（cex_price=2, out_of_range=30, tick_move=10,
- * re_in_range=30）覆盖用户在 UI 上改的全局冷却，曾对"等于历史默认值"的独立配置
- * 做回退。但前端改全局冷却时已同步写入所有类型配置（见 alert-settings API），
- * 该回退反而导致用户想要的 30 分钟越界冷却被降级成全局的 2 分钟，
- * 故移除。现在独立配置优先，不存在才回退全局。
- */
-export function getAlertCooldownMinutes(alertType: string): number {
+export interface NightModeConfig {
+  /** 是否启用夜间模式（默认开启 "1"） */
+  enabled: boolean;
+  /** 夜间开始小时（北京时间 UTC+8，0~23，默认 23 点） */
+  startHour: number;
+  /** 夜间结束小时（北京时间 UTC+8，0~23，默认 8 点） */
+  endHour: number;
+  /** 夜间越界重复提醒间隔（分钟，默认 60 分钟，最低 60；若设为 -1 表示夜间仅首次越界推送、不重复推） */
+  outOfRangeCooldownMin: number;
+  /** 夜间是否静默非核心噪音（自动静默区间内 tick_move 波动、Merkl 高 APR 猎手，并将 CEX 价差冷却拉长至 ≥60 分钟） */
+  muteNoise: boolean;
+  /** 当前北京时间小时 (0~23) */
+  beijingHour: number;
+  /** 当前北京时间字符串 (HH:MM) */
+  beijingTimeStr: string;
+  /** 当前时刻是否处于夜间模式生效中 */
+  isActiveNow: boolean;
+}
+
+/** 获取当前北京时间 (UTC+8) 的小时与格式化时间字符串 */
+export function getBeijingTimeNow(): { hour: number; minute: number; timeStr: string } {
+  const now = new Date();
+  const hour = (now.getUTCHours() + 8) % 24;
+  const minute = now.getUTCMinutes();
+  const timeStr = `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
+  return { hour, minute, timeStr };
+}
+
+/** 判断指定小时是否落在 [startHour, endHour) 区间（支持跨零点，如 23:00 ~ 08:00） */
+export function isHourInWindow(hour: number, startHour: number, endHour: number): boolean {
+  if (startHour === endHour) return true; // 全天
+  if (startHour < endHour) {
+    return hour >= startHour && hour < endHour;
+  }
+  // 跨午夜（例如 23:00 ~ 08:00）
+  return hour >= startHour || hour < endHour;
+}
+
+/** 读取当前夜间模式配置及实时生效状态 */
+export function getNightModeConfig(): NightModeConfig {
+  const enabled = getSetting("night_mode_enabled", "1") === "1";
+  const rawStart = Number(getSetting("night_mode_start_hour", "23"));
+  const startHour = Number.isInteger(rawStart) && rawStart >= 0 && rawStart <= 23 ? rawStart : 23;
+  const rawEnd = Number(getSetting("night_mode_end_hour", "8"));
+  const endHour = Number.isInteger(rawEnd) && rawEnd >= 0 && rawEnd <= 23 ? rawEnd : 8;
+
+  const rawOor = Number(getSetting("night_cooldown_out_of_range", "60"));
+  // 支持 -1（夜间仅首次越界推、不重复推）或 >= 60 分钟（默认 60 分钟）
+  const outOfRangeCooldownMin =
+    rawOor === -1
+      ? -1
+      : Number.isFinite(rawOor) && rawOor >= 60 && rawOor <= 720
+      ? Math.round(rawOor)
+      : 60;
+
+  const muteNoise = getSetting("night_mute_noise", "1") === "1";
+  const { hour: beijingHour, timeStr: beijingTimeStr } = getBeijingTimeNow();
+  const isActiveNow = enabled && isHourInWindow(beijingHour, startHour, endHour);
+
+  return {
+    enabled,
+    startHour,
+    endHour,
+    outOfRangeCooldownMin,
+    muteNoise,
+    beijingHour,
+    beijingTimeStr,
+    isActiveNow,
+  };
+}
+
+/** 读取日间基准冷却时间（分钟，不受夜间模式动态放大影响，用于设置面板展示） */
+export function getBaseAlertCooldownMinutes(alertType: string): number {
   const globalCooldown = getPushCooldownMinutes();
   const key = `cooldown_${alertType}`;
   const v = Number(getSetting(key, ""));
-  // 独立配置为空/非法 → 回退全局
   if (!Number.isFinite(v) || v <= 0) return globalCooldown;
-  // 独立配置存在 → 采用它
   return v;
+}
+
+/**
+ * 获取指定告警类型当前实际生效的冷却时间（分钟）。
+ * - 日间模式：独立配置 cooldown_<type> > 全局 push_cooldown_minutes > 默认 2。
+ * - 夜间模式生效时：
+ *   - out_of_range / re_in_range：强制不少于 night_cooldown_out_of_range（默认 60 分钟；若为 -1 则返回 720 分钟即整晚不重复推）
+ *   - cex_price / fav_cex_price：若开启夜间降噪，冷却拉长至不少于 60 分钟
+ */
+export function getAlertCooldownMinutes(alertType: string): number {
+  const base = getBaseAlertCooldownMinutes(alertType);
+  const night = getNightModeConfig();
+  if (!night.isActiveNow) return base;
+
+  if (alertType === "out_of_range" || alertType === "re_in_range") {
+    if (night.outOfRangeCooldownMin === -1) return 720; // 12小时内不重复推（仅首次推）
+    return Math.max(base, night.outOfRangeCooldownMin, 60);
+  }
+
+  if (night.muteNoise && (alertType === "cex_price" || alertType === "fav_cex_price")) {
+    return Math.max(base, 60);
+  }
+
+  return base;
 }
 
 // ===== 快速全量扫描配置 =====

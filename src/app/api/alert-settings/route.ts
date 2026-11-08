@@ -1,11 +1,12 @@
 import { ok, fail, getBody } from "@/lib/api";
-import { setSetting, getSetting } from "@/lib/db/settings";
+import { setSetting } from "@/lib/db/settings";
 import {
   getTickMoveThreshold,
   isTickMoveEnabled,
   isCexPriceEnabled,
   getPushCooldownMinutes,
-  getAlertCooldownMinutes,
+  getBaseAlertCooldownMinutes,
+  getNightModeConfig,
 } from "@/lib/db/settings";
 
 export const dynamic = "force-dynamic";
@@ -24,27 +25,39 @@ const COOLDOWN_GROUPS = {
 
 type CooldownGroup = keyof typeof COOLDOWN_GROUPS;
 
-/** 读取三类冷却的当前生效值（取组内第一个类型的值作为代表） */
+/** 读取三类日间基准冷却的配置值 */
 function readCooldownGroups() {
   return {
-    cooldown_cex: getAlertCooldownMinutes("cex_price"),
-    cooldown_range_state: getAlertCooldownMinutes("out_of_range"),
-    cooldown_tick_move: getAlertCooldownMinutes("tick_move"),
+    cooldown_cex: getBaseAlertCooldownMinutes("cex_price"),
+    cooldown_range_state: getBaseAlertCooldownMinutes("out_of_range"),
+    cooldown_tick_move: getBaseAlertCooldownMinutes("tick_move"),
   };
 }
 
-/** GET: 读取当前告警阈值设置 */
-export async function GET() {
-  return ok({
+function buildAlertSettingsPayload() {
+  const night = getNightModeConfig();
+  return {
     tick_move_enabled: isTickMoveEnabled(),
     tick_move_threshold: getTickMoveThreshold(),
     cex_price_enabled: isCexPriceEnabled(),
     push_cooldown_minutes: getPushCooldownMinutes(),
     ...readCooldownGroups(),
-  });
+    night_mode_enabled: night.enabled,
+    night_mode_start_hour: night.startHour,
+    night_mode_end_hour: night.endHour,
+    night_cooldown_out_of_range: night.outOfRangeCooldownMin,
+    night_mute_noise: night.muteNoise,
+    night_mode_active_now: night.isActiveNow,
+    beijing_time: night.beijingTimeStr,
+  };
 }
 
-/** PUT: 更新告警阈值设置（partial，只传需要改的字段） */
+/** GET: 读取当前告警阈值与夜间模式设置 */
+export async function GET() {
+  return ok(buildAlertSettingsPayload());
+}
+
+/** PUT: 更新告警阈值或夜间模式设置（partial，只传需要改的字段） */
 export async function PUT(req: Request) {
   const body = await getBody<{
     tick_move_enabled?: string;
@@ -54,6 +67,11 @@ export async function PUT(req: Request) {
     cooldown_cex?: number;
     cooldown_range_state?: number;
     cooldown_tick_move?: number;
+    night_mode_enabled?: string | boolean;
+    night_mode_start_hour?: number;
+    night_mode_end_hour?: number;
+    night_cooldown_out_of_range?: number;
+    night_mute_noise?: string | boolean;
   }>(req);
 
   // 注意：前端传的是字符串 "0"/"1"，字符串 "0" 是 truthy，不能用 ?: 判断
@@ -85,19 +103,40 @@ export async function PUT(req: Request) {
   for (const [group, raw] of groups) {
     if (raw === undefined) continue;
     const v = Number(raw);
-    if (!Number.isFinite(v) || v < 1 || v > 60) {
-      return fail(`cooldown_${group} 须为 1~60 的数值`);
+    if (!Number.isFinite(v) || v < 0 || v > 60) {
+      return fail(`cooldown_${group} 须为 0~60 的数值`);
     }
     for (const type of COOLDOWN_GROUPS[group]) {
       setSetting(`cooldown_${type}`, String(v));
     }
   }
 
-  return ok({
-    tick_move_enabled: isTickMoveEnabled(),
-    tick_move_threshold: getTickMoveThreshold(),
-    cex_price_enabled: isCexPriceEnabled(),
-    push_cooldown_minutes: getPushCooldownMinutes(),
-    ...readCooldownGroups(),
-  });
+  // 夜间模式配置
+  if (body.night_mode_enabled !== undefined) {
+    const on = body.night_mode_enabled === true || String(body.night_mode_enabled) === "1";
+    setSetting("night_mode_enabled", on ? "1" : "0");
+  }
+  if (body.night_mode_start_hour !== undefined) {
+    const h = Number(body.night_mode_start_hour);
+    if (!Number.isInteger(h) || h < 0 || h > 23) return fail("night_mode_start_hour 须为 0~23 的整点");
+    setSetting("night_mode_start_hour", String(h));
+  }
+  if (body.night_mode_end_hour !== undefined) {
+    const h = Number(body.night_mode_end_hour);
+    if (!Number.isInteger(h) || h < 0 || h > 23) return fail("night_mode_end_hour 须为 0~23 的整点");
+    setSetting("night_mode_end_hour", String(h));
+  }
+  if (body.night_cooldown_out_of_range !== undefined) {
+    const m = Number(body.night_cooldown_out_of_range);
+    if (m !== -1 && (!Number.isFinite(m) || m < 60 || m > 720)) {
+      return fail("夜间越界重复冷却须不少于 60 分钟（或设为 -1 仅推首次）");
+    }
+    setSetting("night_cooldown_out_of_range", String(Math.round(m)));
+  }
+  if (body.night_mute_noise !== undefined) {
+    const on = body.night_mute_noise === true || String(body.night_mute_noise) === "1";
+    setSetting("night_mute_noise", on ? "1" : "0");
+  }
+
+  return ok(buildAlertSettingsPayload());
 }

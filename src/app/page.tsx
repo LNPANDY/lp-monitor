@@ -1683,7 +1683,7 @@ function ScanIntervalAndAlerts({
       });
       const j = await r.json();
       if (!j.ok) throw new Error(j.error);
-      setMsg(`✅ 冷却时间已更新为 ${minutes} 分钟`);
+      setMsg(`✅ 日间冷却时间已更新为 ${minutes} 分钟`);
       mutateAlerts();
     } catch (e: any) {
       setMsg(`❌ ${e.message}`);
@@ -1692,8 +1692,36 @@ function ScanIntervalAndAlerts({
     }
   }
 
+  async function updateNightMode(patch: Record<string, any>, label?: string) {
+    setBusy(true);
+    setMsg("");
+    try {
+      const r = await fetch("/api/alert-settings", {
+        method: "PUT",
+        headers: authHeaders({ "Content-Type": "application/json" }),
+        body: JSON.stringify(patch),
+      });
+      const j = await r.json();
+      if (!j.ok) throw new Error(j.error);
+      setMsg(`✅ ${label || "夜间模式策略已更新"}`);
+      mutateAlerts();
+    } catch (e: any) {
+      setMsg(`❌ ${e.message}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const nightEnabled = alertData?.night_mode_enabled ?? true;
+  const nightActiveNow = alertData?.night_mode_active_now ?? false;
+  const nightStart = alertData?.night_mode_start_hour ?? 23;
+  const nightEnd = alertData?.night_mode_end_hour ?? 8;
+  const nightOorCooldown = alertData?.night_cooldown_out_of_range ?? 60;
+  const nightMuteNoise = alertData?.night_mute_noise ?? true;
+  const beijingTime = alertData?.beijing_time ?? "";
+
   return (
-    <div className="card p-4">
+    <div className="card p-4 space-y-3">
       <div className="flex flex-wrap items-center gap-4">
         {/* 扫描频率 */}
         <div className="flex items-center gap-2 border-r border-white/[0.1] pr-4">
@@ -1770,9 +1798,9 @@ function ScanIntervalAndAlerts({
           <span className="text-xs text-ink-soft">超过费率 2 倍时提醒</span>
         </div>
 
-        {/* 推送冷却时间 */}
+        {/* 日间推送冷却时间 */}
         <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
-          <span className="text-sm font-medium">推送冷却：</span>
+          <span className="text-sm font-medium">日间冷却：</span>
           <label className="flex items-center gap-1.5 text-xs">
             <span className="text-ink-soft">CEX价差</span>
             <select
@@ -1824,6 +1852,140 @@ function ScanIntervalAndAlerts({
               ))}
             </select>
           </label>
+        </div>
+      </div>
+
+      {/* 🌙 夜间模式推送策略 (UTC+8 北京时间) */}
+      <div
+        className={`rounded-xl border px-3.5 py-2.5 transition-colors ${
+          nightActiveNow
+            ? "border-indigo-400/40 bg-indigo-500/10"
+            : "border-white/[0.08] bg-white/[0.02]"
+        }`}
+      >
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="flex flex-wrap items-center gap-2.5">
+            <span className="text-xs font-semibold text-indigo-200 flex items-center gap-1.5">
+              🌙 夜间低频推送策略
+              <span
+                className={`rounded-full px-2 py-0.5 text-[10px] font-medium ${
+                  nightActiveNow
+                    ? "bg-indigo-500/30 text-indigo-200 border border-indigo-400/40"
+                    : nightEnabled
+                    ? "bg-emerald-500/15 text-emerald-300 border border-emerald-500/30"
+                    : "bg-white/10 text-ink-soft"
+                }`}
+              >
+                {nightActiveNow
+                  ? `🌙 夜间降频生效中 (${beijingTime} UTC+8)`
+                  : nightEnabled
+                  ? `☀️ 当前日间模式 (${beijingTime || "UTC+8"} · 夜间自动切换)`
+                  : "已关闭"}
+              </span>
+            </span>
+
+            <button
+              className={
+                nightEnabled ? "btn-primary text-xs py-1 px-2.5" : "btn-ghost text-xs py-1 px-2.5"
+              }
+              disabled={busy}
+              onClick={() =>
+                updateNightMode(
+                  { night_mode_enabled: nightEnabled ? "0" : "1" },
+                  nightEnabled ? "已关闭夜间模式" : "已开启夜间低频模式"
+                )
+              }
+            >
+              {nightEnabled ? "夜间模式：开" : "夜间模式：关"}
+            </button>
+
+            <label className="flex items-center gap-1 text-xs">
+              <span className="text-ink-soft">生效时段(北京时间)</span>
+              <select
+                className="input max-w-[78px] text-xs py-1"
+                value={nightStart}
+                disabled={busy || !nightEnabled}
+                onChange={(e) =>
+                  updateNightMode(
+                    { night_mode_start_hour: Number(e.target.value) },
+                    `夜间开始时间已设为 ${e.target.value}:00`
+                  )
+                }
+              >
+                {Array.from({ length: 24 }, (_, h) => (
+                  <option key={h} value={h}>
+                    {String(h).padStart(2, "0")}:00
+                  </option>
+                ))}
+              </select>
+              <span className="text-ink-soft">至</span>
+              <select
+                className="input max-w-[78px] text-xs py-1"
+                value={nightEnd}
+                disabled={busy || !nightEnabled}
+                onChange={(e) =>
+                  updateNightMode(
+                    { night_mode_end_hour: Number(e.target.value) },
+                    `夜间结束时间已设为 ${e.target.value}:00`
+                  )
+                }
+              >
+                {Array.from({ length: 24 }, (_, h) => (
+                  <option key={h} value={h}>
+                    {String(h).padStart(2, "0")}:00
+                  </option>
+                ))}
+              </select>
+            </label>
+
+            <label className="flex items-center gap-1.5 text-xs">
+              <span className="text-ink-soft">越界重复推送间隔</span>
+              <select
+                className="input max-w-[155px] text-xs py-1"
+                value={nightOorCooldown}
+                disabled={busy || !nightEnabled}
+                onChange={(e) =>
+                  updateNightMode(
+                    { night_cooldown_out_of_range: Number(e.target.value) },
+                    Number(e.target.value) === -1
+                      ? "夜间已设为仅首次越界推送（回区间仍推1次）"
+                      : `夜间越界重复提醒已设为 ${e.target.value} 分钟`
+                  )
+                }
+              >
+                <option value={60}>60分钟 (至少1小时)</option>
+                <option value={90}>90分钟 (1.5小时)</option>
+                <option value={120}>120分钟 (2小时)</option>
+                <option value={180}>180分钟 (3小时)</option>
+                <option value={-1}>仅推首次越界 (不重复)</option>
+              </select>
+            </label>
+
+            <button
+              className={
+                nightMuteNoise
+                  ? "btn-secondary text-xs py-1 px-2.5"
+                  : "btn-ghost text-xs py-1 px-2.5"
+              }
+              disabled={busy || !nightEnabled}
+              onClick={() =>
+                updateNightMode(
+                  { night_mute_noise: nightMuteNoise ? "0" : "1" },
+                  nightMuteNoise
+                    ? "已关闭夜间降噪"
+                    : "已开启夜间降噪（静默区间内波动与高APR猎手）"
+                )
+              }
+            >
+              {nightMuteNoise ? "🔕 夜间降噪：开" : "🔔 夜间降噪：关"}
+            </button>
+          </div>
+
+          <div className="text-[11px] text-ink-soft">
+            规则：首次越界立即推 · 持续越界 ≥{nightOorCooldown === -1 ? "整晚不" : `${nightOorCooldown}分钟`}重复推 ·{" "}
+            <span className="text-emerald-300 font-medium">回到区间立即推 1 次</span>
+            {nightMuteNoise ? " · 自动静默区间内波动/高APR打野" : ""}
+          </div>
         </div>
       </div>
 

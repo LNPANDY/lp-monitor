@@ -13,7 +13,6 @@
  *   4. [CRITICAL] 管理员 `owner` (`0x8da5cb5b()`) 变更监控：
  *      与首次记录的安全基线比对，一旦管理员权限移交立即报警。
  *   5. [WARN]     手续费接收地址 `feeRecipient` (`0x46904840()`) 变更监控。
- *   6. [WARN]     外部质押 TVL (`totalSupply` `0x18160ddd`) 单周期暴跌 >= 35% 监控（自动剔除用户自身解押变动，防误报）。
  *
  * 高频报警推送机制：
  *   当检测到未静音的异动时，立即开启每 20 秒 1 次的高频紧急推送（Bark `level: "critical"` + `call: "1"` 持续响铃），
@@ -37,8 +36,7 @@ export interface StakingAnomalyItem {
     | "withdraw_sim_failed"
     | "owner_changed"
     | "fee_recipient_changed"
-    | "deposit_paused"
-    | "tvl_drop";
+    | "deposit_paused";
   contract: string;
   pairLabel: string;
   chainName: string;
@@ -92,10 +90,6 @@ interface SecurityGlobalState {
   pushTimer: ReturnType<typeof setInterval> | null;
   pushCount: number;
   lastPushAt: number;
-  prevExternalLiqByContract: Record<
-    string,
-    { extLiq: bigint; extCount: number }
-  >;
 }
 
 const GLOBAL_SECURITY_KEY = "__lpMonitorStakingSecurity__";
@@ -114,7 +108,6 @@ function getSecurityState(): SecurityGlobalState {
       pushTimer: null,
       pushCount: 0,
       lastPushAt: 0,
-      prevExternalLiqByContract: {},
     } as SecurityGlobalState;
   }
   return g[GLOBAL_SECURITY_KEY] as SecurityGlobalState;
@@ -301,11 +294,6 @@ export async function scanStakingSecurity(): Promise<StakingSecuritySummary> {
       wallet_address: string;
     }[];
 
-    // 读取所有启用钱包地址（用于计算用户自身在质押池中的份额，排除自身撤池导致的 TVL 误报）
-    const activeWallets = db
-      .prepare(`SELECT chain_id_ref, address FROM wallets WHERE enabled = 1`)
-      .all() as { chain_id_ref: number; address: string }[];
-
     const byChain = new Map<number, StakingRow[]>();
     for (const s of enabledStaking) {
       if (!/^0x[a-fA-F0-9]{40}$/.test(s.contract)) continue;
@@ -328,10 +316,6 @@ export async function scanStakingSecurity(): Promise<StakingSecuritySummary> {
         continue;
       }
 
-      const chainWallets = activeWallets
-        .filter((w) => w.chain_id_ref === chainIdRef)
-        .map((w) => w.address.toLowerCase() as Address);
-
       await eachLimit(rows, 6, async (s) => {
         const addr = s.contract.toLowerCase() as Address;
         const cKey = `${chainIdRef}:${addr}`;
@@ -346,7 +330,6 @@ export async function scanStakingSecurity(): Promise<StakingSecuritySummary> {
           wPausedRes,
           countRes,
           supplyRes,
-          ...walletBalRes
         ] = await Promise.all([
           rawCallHex(client, addr, "0x95d89b41"), // symbol()
           rawCallHex(client, addr, "0x089fe6aa"), // poolFee()
@@ -356,10 +339,6 @@ export async function scanStakingSecurity(): Promise<StakingSecuritySummary> {
           rawCallHex(client, addr, "0x054f7d9c"), // withdrawPaused()
           rawCallHex(client, addr, "0xff50abdc"), // totalStakedPositions()
           rawCallHex(client, addr, "0x18160ddd"), // totalSupply()
-          ...chainWallets.map((w) => {
-            const padded = w.replace(/^0x/, "").padStart(64, "0");
-            return rawCallHex(client, addr, `0x70a08231${padded}` as `0x${string}`); // balanceOf(wallet)
-          }),
         ]);
 
         // 如果连 owner() 都不支持，说明不是标准合约，跳过
@@ -456,45 +435,12 @@ export async function scanStakingSecurity(): Promise<StakingSecuritySummary> {
           });
         }
 
-        // 检测 5: 外部质押 TVL 骤降检测（剔除当前监控钱包自身的质押份额）
-        let userStakedLiq = 0n;
-        for (const r of walletBalRes) {
-          if (r.ok) userStakedLiq += decodeUint(r.data);
-        }
-        const extLiq =
-          totalSupplyBig > userStakedLiq ? totalSupplyBig - userStakedLiq : 0n;
+        // 检测 5: 对用户在该合约中质押的每个真实仓位，执行静态 eth_call 模拟 withdraw(tokenId)
         const myPosInThisVault = stakedPositions.filter(
           (p) =>
             p.chain_id_ref === chainIdRef &&
             (p.staker_contract || "").toLowerCase() === addr
         );
-        const extCount = Math.max(0, totalStakedCount - myPosInThisVault.length);
-        const prevExt = st.prevExternalLiqByContract[cKey];
-        if (
-          prevExt &&
-          prevExt.extLiq > 0n &&
-          prevExt.extCount >= 2 &&
-          extCount < prevExt.extCount
-        ) {
-          const dropBp =
-            Number(((prevExt.extLiq - extLiq) * 10000n) / prevExt.extLiq) / 100;
-          if (dropBp >= 35) {
-            anomalies.push({
-              id: `tvl_drop:${cKey}`,
-              severity: "warn",
-              type: "tvl_drop",
-              contract: s.contract,
-              pairLabel: label,
-              chainName,
-              title: `外部质押流动性骤降 ${dropBp.toFixed(1)}%`,
-              detail: `池内其它用户的质押 NFT 数量从 ${prevExt.extCount} 降至 ${extCount}，外部质押量单周期减少 ${dropBp.toFixed(1)}%，疑似大户集中撤池！`,
-              detectedAt: nowIso,
-            });
-          }
-        }
-        st.prevExternalLiqByContract[cKey] = { extLiq, extCount };
-
-        // 检测 6: 对用户在该合约中质押的每个真实仓位，执行静态 eth_call 模拟 withdraw(tokenId)
         let simOkCount = 0;
         let simFailCount = 0;
 

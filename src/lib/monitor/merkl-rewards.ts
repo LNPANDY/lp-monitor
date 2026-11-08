@@ -18,7 +18,7 @@
 import type { PublicClient } from "viem";
 import { getDb } from "../db";
 import { getClient, listChains } from "../chains";
-import { getSetting, setSetting } from "../db/settings";
+import { getSetting, setSetting, getNightModeConfig } from "../db/settings";
 import { loadAllMappings, buildQuotesByAddr, type CexQuote } from "../cex/binance";
 import { V3_NPM_ABI, V3_POOL_ABI, readPositionMeta } from "../adapters/v3-fork";
 import {
@@ -1063,8 +1063,10 @@ export async function scanMerklRewardsAndApr(opts?: {
     let alertsSent = 0;
     const highAprPools = poolsRadar.filter((p) => p.isHighApr);
     const COOLDOWN_MS = 30 * 60 * 1000; // 同池默认 30 分钟冷却；若 APR 比上次推送时再暴涨 +300% 则立即突破冷却推送
+    const night = getNightModeConfig();
+    const mutedByNightMode = night.isActiveNow && night.muteNoise;
 
-    if (highAprAlertEnabled && highAprPools.length > 0) {
+    if (highAprAlertEnabled && !mutedByNightMode && highAprPools.length > 0) {
       const triggeredPools: PoolRewardRadarItem[] = [];
       for (const hp of highAprPools) {
         const prev = st.lastPoolAlertMap[hp.key];
