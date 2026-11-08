@@ -52,53 +52,73 @@ export function getPushCooldownMinutes(): number {
 // ===== 按告警类型的推送冷却配置（分钟）=====
 
 export interface NightModeConfig {
-  /** 是否启用夜间模式（默认开启 "1"） */
+  /** 当前是否处于睡眠/夜间低频模式生效中 */
   enabled: boolean;
-  /** 夜间开始小时（北京时间 UTC+8，0~23，默认 23 点） */
-  startHour: number;
-  /** 夜间结束小时（北京时间 UTC+8，0~23，默认 8 点） */
-  endHour: number;
-  /** 夜间越界重复提醒间隔（分钟，默认 60 分钟，最低 60；若设为 -1 表示夜间仅首次越界推送、不重复推） */
+  /** 睡眠模式到期时间戳（毫秒）：0 = 已关闭；-1 = 持续开启直到手动关闭；>0 = 到期自动恢复日间模式 */
+  untilMs: number;
+  /** 默认一键开启时长（小时，默认 8 小时） */
+  defaultHours: number;
+  /** 剩余生效分钟数（0 = 未生效，-1 = 持续开启直到手动关闭） */
+  remainingMinutes: number;
+  /** 到期北京时间字符串（如 "08:30"，未生效为空） */
+  expiresAtBeijingStr: string;
+  /** 睡眠期间越界重复提醒间隔（分钟，默认 60 分钟，最低 60；若设为 -1 表示仅首次越界推送、不重复推） */
   outOfRangeCooldownMin: number;
-  /** 夜间是否静默非核心噪音（自动静默区间内 tick_move 波动、Merkl 高 APR 猎手，并将 CEX 价差冷却拉长至 ≥60 分钟） */
+  /** 睡眠期间是否静默非核心噪音（自动静默区间内 tick_move 波动、Merkl 高 APR 猎手，并将 CEX 价差冷却拉长至 ≥60 分钟） */
   muteNoise: boolean;
   /** 当前北京时间小时 (0~23) */
   beijingHour: number;
   /** 当前北京时间字符串 (HH:MM) */
   beijingTimeStr: string;
-  /** 当前时刻是否处于夜间模式生效中 */
+  /** 当前时刻是否处于睡眠/夜间模式生效中 */
   isActiveNow: boolean;
 }
 
-/** 获取当前北京时间 (UTC+8) 的小时与格式化时间字符串 */
-export function getBeijingTimeNow(): { hour: number; minute: number; timeStr: string } {
-  const now = new Date();
-  const hour = (now.getUTCHours() + 8) % 24;
-  const minute = now.getUTCMinutes();
+/** 将任意毫秒时间戳格式化为北京时间 (UTC+8) 的 HH:MM */
+export function formatBeijingTimeMs(ms: number): { hour: number; minute: number; timeStr: string } {
+  const d = new Date(ms);
+  const hour = (d.getUTCHours() + 8) % 24;
+  const minute = d.getUTCMinutes();
   const timeStr = `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
   return { hour, minute, timeStr };
 }
 
-/** 判断指定小时是否落在 [startHour, endHour) 区间（支持跨零点，如 23:00 ~ 08:00） */
-export function isHourInWindow(hour: number, startHour: number, endHour: number): boolean {
-  if (startHour === endHour) return true; // 全天
-  if (startHour < endHour) {
-    return hour >= startHour && hour < endHour;
-  }
-  // 跨午夜（例如 23:00 ~ 08:00）
-  return hour >= startHour || hour < endHour;
+/** 获取当前北京时间 (UTC+8) 的小时与格式化时间字符串 */
+export function getBeijingTimeNow(): { hour: number; minute: number; timeStr: string } {
+  return formatBeijingTimeMs(Date.now());
 }
 
-/** 读取当前夜间模式配置及实时生效状态 */
+/** 读取当前手动睡眠/夜间低频模式配置及倒计时状态 */
 export function getNightModeConfig(): NightModeConfig {
-  const enabled = getSetting("night_mode_enabled", "1") === "1";
-  const rawStart = Number(getSetting("night_mode_start_hour", "23"));
-  const startHour = Number.isInteger(rawStart) && rawStart >= 0 && rawStart <= 23 ? rawStart : 23;
-  const rawEnd = Number(getSetting("night_mode_end_hour", "8"));
-  const endHour = Number.isInteger(rawEnd) && rawEnd >= 0 && rawEnd <= 23 ? rawEnd : 8;
+  const nowMs = Date.now();
+  const rawUntil = Number(getSetting("night_mode_until_ms", "0"));
+  const untilMs = Number.isFinite(rawUntil) ? rawUntil : 0;
+
+  const rawDefaultHours = Number(getSetting("night_mode_default_hours", "8"));
+  const defaultHours =
+    rawDefaultHours === -1
+      ? -1
+      : Number.isFinite(rawDefaultHours) && rawDefaultHours >= 0.5 && rawDefaultHours <= 48
+      ? rawDefaultHours
+      : 8;
+
+  const isActiveNow = untilMs === -1 || untilMs > nowMs;
+  const remainingMinutes =
+    untilMs === -1
+      ? -1
+      : untilMs > nowMs
+      ? Math.max(1, Math.ceil((untilMs - nowMs) / 60_000))
+      : 0;
+
+  const expiresAtBeijingStr =
+    untilMs === -1
+      ? "手动关闭前持续生效"
+      : untilMs > nowMs
+      ? formatBeijingTimeMs(untilMs).timeStr
+      : "";
 
   const rawOor = Number(getSetting("night_cooldown_out_of_range", "60"));
-  // 支持 -1（夜间仅首次越界推、不重复推）或 >= 60 分钟（默认 60 分钟）
+  // 支持 -1（睡眠期间仅首次越界推、不重复推）或 >= 60 分钟（默认 60 分钟）
   const outOfRangeCooldownMin =
     rawOor === -1
       ? -1
@@ -108,12 +128,13 @@ export function getNightModeConfig(): NightModeConfig {
 
   const muteNoise = getSetting("night_mute_noise", "1") === "1";
   const { hour: beijingHour, timeStr: beijingTimeStr } = getBeijingTimeNow();
-  const isActiveNow = enabled && isHourInWindow(beijingHour, startHour, endHour);
 
   return {
-    enabled,
-    startHour,
-    endHour,
+    enabled: isActiveNow,
+    untilMs: isActiveNow ? untilMs : 0,
+    defaultHours,
+    remainingMinutes,
+    expiresAtBeijingStr,
     outOfRangeCooldownMin,
     muteNoise,
     beijingHour,

@@ -43,11 +43,13 @@ function buildAlertSettingsPayload() {
     push_cooldown_minutes: getPushCooldownMinutes(),
     ...readCooldownGroups(),
     night_mode_enabled: night.enabled,
-    night_mode_start_hour: night.startHour,
-    night_mode_end_hour: night.endHour,
+    night_mode_active_now: night.isActiveNow,
+    night_mode_until_ms: night.untilMs,
+    night_mode_default_hours: night.defaultHours,
+    night_mode_remaining_minutes: night.remainingMinutes,
+    night_mode_expires_beijing: night.expiresAtBeijingStr,
     night_cooldown_out_of_range: night.outOfRangeCooldownMin,
     night_mute_noise: night.muteNoise,
-    night_mode_active_now: night.isActiveNow,
     beijing_time: night.beijingTimeStr,
   };
 }
@@ -57,7 +59,7 @@ export async function GET() {
   return ok(buildAlertSettingsPayload());
 }
 
-/** PUT: 更新告警阈值或夜间模式设置（partial，只传需要改的字段） */
+/** PUT: 更新告警阈值或手动睡眠模式设置（partial，只传需要改的字段） */
 export async function PUT(req: Request) {
   const body = await getBody<{
     tick_move_enabled?: string;
@@ -67,9 +69,9 @@ export async function PUT(req: Request) {
     cooldown_cex?: number;
     cooldown_range_state?: number;
     cooldown_tick_move?: number;
-    night_mode_enabled?: string | boolean;
-    night_mode_start_hour?: number;
-    night_mode_end_hour?: number;
+    night_action?: "start" | "stop" | "extend";
+    night_hours?: number;
+    night_mode_default_hours?: number;
     night_cooldown_out_of_range?: number;
     night_mute_noise?: string | boolean;
   }>(req);
@@ -111,25 +113,46 @@ export async function PUT(req: Request) {
     }
   }
 
-  // 夜间模式配置
-  if (body.night_mode_enabled !== undefined) {
-    const on = body.night_mode_enabled === true || String(body.night_mode_enabled) === "1";
-    setSetting("night_mode_enabled", on ? "1" : "0");
+  // 手动睡眠/夜间模式操作
+  if (body.night_mode_default_hours !== undefined) {
+    const h = Number(body.night_mode_default_hours);
+    if (h !== -1 && (!Number.isFinite(h) || h < 0.5 || h > 48)) {
+      return fail("开启时长须为 0.5~48 小时（或 -1 持续开启）");
+    }
+    setSetting("night_mode_default_hours", String(h));
   }
-  if (body.night_mode_start_hour !== undefined) {
-    const h = Number(body.night_mode_start_hour);
-    if (!Number.isInteger(h) || h < 0 || h > 23) return fail("night_mode_start_hour 须为 0~23 的整点");
-    setSetting("night_mode_start_hour", String(h));
+
+  if (body.night_action === "stop") {
+    setSetting("night_mode_until_ms", "0");
+  } else if (body.night_action === "start") {
+    const cur = getNightModeConfig();
+    const hours =
+      body.night_hours !== undefined ? Number(body.night_hours) : cur.defaultHours;
+    if (hours === -1) {
+      setSetting("night_mode_default_hours", "-1");
+      setSetting("night_mode_until_ms", "-1");
+    } else if (Number.isFinite(hours) && hours >= 0.5 && hours <= 48) {
+      setSetting("night_mode_default_hours", String(hours));
+      const untilMs = Date.now() + Math.round(hours * 3600 * 1000);
+      setSetting("night_mode_until_ms", String(untilMs));
+    } else {
+      return fail("开启时长须为 0.5~48 小时（或 -1 持续开启）");
+    }
+  } else if (body.night_action === "extend") {
+    const cur = getNightModeConfig();
+    const addHours = Number(body.night_hours ?? 2);
+    if (!Number.isFinite(addHours) || addHours <= 0 || addHours > 24) {
+      return fail("延长时长须为 1~24 小时");
+    }
+    const baseMs = cur.untilMs > Date.now() ? cur.untilMs : Date.now();
+    const untilMs = baseMs + Math.round(addHours * 3600 * 1000);
+    setSetting("night_mode_until_ms", String(untilMs));
   }
-  if (body.night_mode_end_hour !== undefined) {
-    const h = Number(body.night_mode_end_hour);
-    if (!Number.isInteger(h) || h < 0 || h > 23) return fail("night_mode_end_hour 须为 0~23 的整点");
-    setSetting("night_mode_end_hour", String(h));
-  }
+
   if (body.night_cooldown_out_of_range !== undefined) {
     const m = Number(body.night_cooldown_out_of_range);
     if (m !== -1 && (!Number.isFinite(m) || m < 60 || m > 720)) {
-      return fail("夜间越界重复冷却须不少于 60 分钟（或设为 -1 仅推首次）");
+      return fail("睡眠模式越界重复冷却须不少于 60 分钟（或设为 -1 仅推首次）");
     }
     setSetting("night_cooldown_out_of_range", String(Math.round(m)));
   }
