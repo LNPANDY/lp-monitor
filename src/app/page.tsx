@@ -9,6 +9,14 @@ import { LiquidityProbe } from "@/components/liquidity-probe";
 import { RemovePositionButton } from "@/components/remove-position-button";
 import { Field } from "@/components/form";
 import { tickToSqrtPriceX96, getAmountsForLiquidity } from "@/lib/v3/math";
+import {
+  getOutOfRangeDisplayDirection,
+  inferDisplayTokenDecimals,
+  tickToDisplayPrice,
+  ticksToDisplayPriceRange,
+  toDisplayMarginPct,
+  toDisplayPriceDiff,
+} from "@/lib/v3/display-orientation";
 import { useBinanceRealtime, type UseBinanceRealtimeReturn } from "@/lib/cex/use-binance-ws";
 
 /** 推送冷却可选值（分钟） */
@@ -46,6 +54,8 @@ interface Position {
   token1: string;
   token0_symbol?: string;
   token1_symbol?: string;
+  token0_decimals?: number;
+  token1_decimals?: number;
   fee: number;
   pool: string;
   tick_lower: number;
@@ -1031,7 +1041,7 @@ export default function DashboardPage() {
                               ? "text-warn font-semibold"
                               : "text-emerald-300"
                           }
-                          title={`当前单格 [${p.tickLower}, ${p.tickUpper}]：距下界 ${p.subTickMarginLowerPct.toFixed(0)}% / 距上界 ${p.subTickMarginUpperPct.toFixed(0)}%`}
+                          title={`当前最小单格：距价格下界 ${p.subTickMarginLowerPct.toFixed(0)}% / 距价格上界 ${p.subTickMarginUpperPct.toFixed(0)}%（左跌右涨）`}
                         >
                           {p.subTickMinMarginPct < 15 ? "⚠️ 贴边 " : "🟢 居中 "}
                           {p.subTickMarginLowerPct.toFixed(0)}% /{" "}
@@ -2398,14 +2408,34 @@ function PositionCard({
   const flip = p.pair_flip === 1;
   const displaySym0 = flip ? sym1 : sym0;
   const displaySym1 = flip ? sym0 : sym1;
+  const dec0 = inferDisplayTokenDecimals(p.token0, sym0, p.token0_decimals);
+  const dec1 = inferDisplayTokenDecimals(p.token1, sym1, p.token1_decimals);
+  const rangePrices = ticksToDisplayPriceRange(
+    p.tick_lower,
+    p.tick_upper,
+    dec0,
+    dec1,
+    flip
+  );
+  const outDir = !inRange
+    ? getOutOfRangeDisplayDirection(
+        p.last_current_tick,
+        p.tick_lower,
+        p.tick_upper,
+        flip
+      )
+    : null;
+
   const displayPrice0 = p.last_price0
     ? fmtFull(flip ? 1 / Number(p.last_price0) : Number(p.last_price0))
     : p.last_price0;
-  const displayCexRate = liveCex
-    ? flip
-      ? 1 / liveCex.cexRate
-      : liveCex.cexRate
-    : 0;
+  const cexDiffView = liveCex
+    ? toDisplayPriceDiff(liveCex.dexRate, liveCex.cexRate, flip)
+    : null;
+  const displayCexRate = cexDiffView ? cexDiffView.displayCexRate : 0;
+  const impliedDisplayPrice = liveCex
+    ? tickToDisplayPrice(liveCex.impliedTick, dec0, dec1, flip)
+    : "";
   const displayToken0Cex = liveCex
     ? (flip ? liveCex.token1CexSymbol : liveCex.token0CexSymbol) || displaySym0
     : "";
@@ -2413,10 +2443,17 @@ function PositionCard({
     ? (flip ? liveCex.token0CexSymbol : liveCex.token1CexSymbol) || displaySym1
     : "";
 
-  const onChainClampedPct = Math.min(Math.max(marginLower, 0), 100);
-  const impliedClampedPct = liveCex
-    ? Math.min(Math.max(liveCex.impliedMarginLowerPct, 0), 100)
+  const displayMarginLower = toDisplayMarginPct(marginLower, flip);
+  const displayMarginUpper = 100 - displayMarginLower;
+  const displayImpliedMarginLower = liveCex
+    ? toDisplayMarginPct(liveCex.impliedMarginLowerPct, flip)
     : null;
+
+  const onChainClampedPct = Math.min(Math.max(displayMarginLower, 0), 100);
+  const impliedClampedPct =
+    displayImpliedMarginLower !== null
+      ? Math.min(Math.max(displayImpliedMarginLower, 0), 100)
+      : null;
   const pullLeftPct =
     impliedClampedPct !== null
       ? Math.min(onChainClampedPct, impliedClampedPct)
@@ -2425,6 +2462,37 @@ function PositionCard({
     impliedClampedPct !== null
       ? Math.abs(impliedClampedPct - onChainClampedPct)
       : 0;
+
+  const primaryHoldings = holdings
+    ? flip
+      ? {
+          sym: holdings.sym1,
+          amt: holdings.amt1,
+          usd: holdings.usd1,
+          pct: holdings.pct1,
+        }
+      : {
+          sym: holdings.sym0,
+          amt: holdings.amt0,
+          usd: holdings.usd0,
+          pct: holdings.pct0,
+        }
+    : null;
+  const secondaryHoldings = holdings
+    ? flip
+      ? {
+          sym: holdings.sym0,
+          amt: holdings.amt0,
+          usd: holdings.usd0,
+          pct: holdings.pct0,
+        }
+      : {
+          sym: holdings.sym1,
+          amt: holdings.amt1,
+          usd: holdings.usd1,
+          pct: holdings.pct1,
+        }
+    : null;
 
   const liveW0gUsd =
     binanceRt?.getTokenUsdPrice(p.chain_id_ref, "0x1cd0690ff9a693f5ef2dd976660a8dafc81a109c", "W0G") ??
@@ -2446,7 +2514,7 @@ function PositionCard({
           <div className="flex flex-wrap items-center gap-1.5">
             <span className="font-semibold text-base text-ink">{pair}</span>
             {p.pair_flip === 1 && (
-              <span className="tag-info" title="交易对已翻转">
+              <span className="tag-info" title="交易对已按 不稳定币/稳定币 翻转">
                 翻转
               </span>
             )}
@@ -2455,7 +2523,9 @@ function PositionCard({
             ) : inRange ? (
               <span className="tag-ok">在区间内</span>
             ) : (
-              <span className="tag-danger">已越界</span>
+              <span className="tag-danger">
+                {outDir?.isAboveUpper ? "📈 已涨穿上界" : "📉 已跌破下界"}
+              </span>
             )}
             {!closed && p.last_alert_type === "tick_move" && (
               <span className="tag-info">波动</span>
@@ -2476,38 +2546,29 @@ function PositionCard({
       <div className="space-y-1 text-sm">
         <Row label="交易对">
           <span title={`${p.token0} / ${p.token1}`}>
-            {pair} · fee {(p.fee / 10000).toFixed(2)}%
+            {pair} · 费率 {(p.fee / 10000).toFixed(2)}%
           </span>
         </Row>
-        <Row label="当前 tick">
+        <Row label="价格区间">
+          <span className="font-mono">
+            {rangePrices.priceLow} ~ {rangePrices.priceHigh} {displaySym1}
+          </span>
+        </Row>
+        <Row label="DEX 池价">
           <span
             className={`font-mono ${
               inRange ? "text-ink" : "text-warn font-semibold"
             }`}
           >
-            {p.last_current_tick}
-            {liveCex && (
+            1 {displaySym0} ≈ {displayPrice0} {displaySym1}
+            {liveCex && !liveCex.withinFeeDeadzone && impliedDisplayPrice && (
               <span
-                className="ml-1.5 text-xs text-amber-300"
-                title={`币安裸价映射 Tick ${liveCex.rawImpliedTick}，扣除 ${(liveCex.feeRate * 100).toFixed(2)}% 池费死角（${liveCex.feeTicks} tick）后真实套利目标 Tick 为 ${liveCex.impliedTick}`}
+                className="ml-1.5 text-xs font-normal text-amber-300"
+                title={`扣除 ${(liveCex.feeRate * 100).toFixed(2)}% 池子单边手续费后，套利机器人预计把池价推向 ${impliedDisplayPrice} ${displaySym1}`}
               >
-                (⚡币安目标Tick {liveCex.impliedTick}
-                {liveCex.rawImpliedTick !== liveCex.impliedTick
-                  ? ` · 裸价${liveCex.rawImpliedTick}扣${liveCex.feeTicks}t池费`
-                  : ""}
-                )
+                (⚡套利目标 ≈ {impliedDisplayPrice})
               </span>
             )}
-          </span>
-        </Row>
-        <Row label="区间">
-          <span className="font-mono">
-            [{p.tick_lower}, {p.tick_upper}]
-          </span>
-        </Row>
-        <Row label="DEX 池价">
-          <span className="font-mono">
-            1 {displaySym0} ≈ {displayPrice0} {displaySym1}
           </span>
         </Row>
         {liveCex && (
@@ -2517,7 +2578,7 @@ function PositionCard({
             </span>
           </Row>
         )}
-        {liveCex && (
+        {liveCex && cexDiffView && (
           <Row label="CEX 实时价差">
             <span
               className={`font-mono ${
@@ -2526,16 +2587,16 @@ function PositionCard({
                   : "text-emerald-300"
               }`}
             >
-              差 {pctSigned(liveCex.diff)}
+              差 {pctSigned(cexDiffView.displayDiff)}
             </span>
             <span className="ml-1.5 font-mono text-xs text-ink-soft">
-              ({liveCex.tickDelta >= 0 ? "+" : ""}
-              {liveCex.tickDelta} tick · 死角±{liveCex.feeTicks}t)
+              ({cexDiffView.dexHigherThanCex ? "DEX 高于币安" : "DEX 低于币安"} · 死角±
+              {(liveCex.feeRate * 100).toFixed(2)}%)
             </span>
           </Row>
         )}
 
-        {/* ==================== Module ②：双指针区间雷达（链上 Tick + 币安扣费目标 Tick + 0.30% 套利死角判定） ==================== */}
+        {/* ==================== Module ②：双指针区间雷达（左跌右涨：0%=价格下界，100%=价格上界） ==================== */}
         <div className="pt-2 pb-1 space-y-1">
           <div className="relative h-2.5 w-full rounded bg-white/[0.1] overflow-visible">
             {/* 区间内绿底 */}
@@ -2544,14 +2605,14 @@ function PositionCard({
               style={{
                 width: `${
                   inRange
-                    ? Math.min(Math.max(marginLower, 2), 98)
-                    : marginLower < 0
+                    ? Math.min(Math.max(displayMarginLower, 2), 98)
+                    : displayMarginLower < 0
                       ? 0
                       : 100
                 }%`,
               }}
             />
-            {/* 链上 Tick 与 币安扣费目标 Tick 之间的套利牵引带 */}
+            {/* 链上现价 与 币安扣费目标价 之间的套利牵引带 */}
             {impliedClampedPct !== null && pullWidthPct > 0.5 && (
               <div
                 className="absolute inset-y-0 rounded bg-amber-400/30"
@@ -2562,32 +2623,32 @@ function PositionCard({
                 title="链上现价与币安扣费目标价之间的套利牵引区"
               />
             )}
-            {/* 指针 1：链上当前 Tick */}
+            {/* 指针 1：链上当前价格位置 */}
             <div
               className="absolute top-1/2 h-4 w-1.5 -translate-y-1/2 rounded shadow"
               style={{
                 left: `${onChainClampedPct}%`,
                 background: inRange ? "#10b981" : "#f43f5e",
               }}
-              title={`链上当前 Tick: ${p.last_current_tick} (距下界 ${marginLower.toFixed(1)}%)`}
+              title={`链上现价: ${displayPrice0} ${displaySym1} (距下界 ${displayMarginLower.toFixed(1)}% / 距上界 ${displayMarginUpper.toFixed(1)}%)`}
             />
-            {/* 指针 2：币安扣费目标 Tick */}
-            {impliedClampedPct !== null && liveCex && (
+            {/* 指针 2：币安扣费目标价位置 */}
+            {impliedClampedPct !== null && liveCex && displayImpliedMarginLower !== null && (
               <div
                 className="absolute top-1/2 h-4 w-1.5 -translate-y-1/2 rounded border border-amber-200 bg-amber-400 shadow-[0_0_8px_#f59e0b]"
                 style={{
                   left: `${impliedClampedPct}%`,
                 }}
-                title={`⚡ 币安扣费目标 Tick: ${liveCex.impliedTick} (距下界 ${liveCex.impliedMarginLowerPct.toFixed(1)}%) · 裸价 Tick: ${liveCex.rawImpliedTick}`}
+                title={`⚡ 币安扣费目标价: ≈ ${impliedDisplayPrice} ${displaySym1} (距下界 ${displayImpliedMarginLower.toFixed(1)}%)`}
               />
             )}
           </div>
 
           <div className="flex flex-wrap items-center justify-between gap-1 text-[11px] font-mono text-ink-soft">
             <span>
-              🟢 链上距下界 {marginLower.toFixed(1)}% / 距上界 {marginUpper.toFixed(1)}%
+              🟢 距下界 {displayMarginLower.toFixed(1)}% / 距上界 {displayMarginUpper.toFixed(1)}%
             </span>
-            {liveCex && (
+            {liveCex && displayImpliedMarginLower !== null && (
               <span
                 className={
                   !liveCex.impliedInRange
@@ -2597,9 +2658,11 @@ function PositionCard({
                       : "text-amber-300"
                 }
               >
-                ⚡ 币安扣费目标 {liveCex.impliedMarginLowerPct.toFixed(1)}%
+                ⚡ 币安扣费目标 {displayImpliedMarginLower.toFixed(1)}%
                 {!liveCex.impliedInRange
-                  ? " (套利将越界)"
+                  ? displayImpliedMarginLower >= 100
+                    ? " (套利将涨穿上界)"
+                    : " (套利将跌破下界)"
                   : liveCex.withinFeeDeadzone
                     ? " (死角内)"
                     : ""}
@@ -2608,7 +2671,7 @@ function PositionCard({
           </div>
 
           {/* 0.30% 手续费死角 vs 套利临界状态条 */}
-          {!closed && liveCex && (
+          {!closed && liveCex && cexDiffView && (
             <div
               className={`rounded border px-2 py-1 text-[11px] font-mono flex flex-wrap items-center justify-between gap-1 ${
                 liveCex.withinFeeDeadzone
@@ -2618,24 +2681,23 @@ function PositionCard({
             >
               {liveCex.withinFeeDeadzone ? (
                 <span>
-                  🛡️ 手续费死角：价差 {(liveCex.absDiff * 100).toFixed(2)}% (
-                  {liveCex.tickDelta >= 0 ? "+" : ""}
-                  {liveCex.tickDelta}t) &le; {(liveCex.feeRate * 100).toFixed(2)}%
-                  池费 ({liveCex.feeTicks}t，套利不触发)
+                  🛡️ 手续费死角：价差 {(cexDiffView.displayAbsDiff * 100).toFixed(2)}% &le;{" "}
+                  {(liveCex.feeRate * 100).toFixed(2)}% 池费（套利不触发）
                 </span>
               ) : (
                 <span>
-                  ⚡ 套利临界：价差 {(liveCex.absDiff * 100).toFixed(2)}% &gt;{" "}
-                  {(liveCex.feeRate * 100).toFixed(2)}% 池费 ({liveCex.feeTicks}t) ·
-                  扣费后推向 Tick {liveCex.impliedTick}
+                  ⚡ 套利临界：价差 {(cexDiffView.displayAbsDiff * 100).toFixed(2)}% &gt;{" "}
+                  {(liveCex.feeRate * 100).toFixed(2)}% 池费 · 扣费后预计
+                  {cexDiffView.dexHigherThanCex ? "压低至" : "推高至"}{" "}
+                  {impliedDisplayPrice}
                 </span>
               )}
             </div>
           )}
         </div>
 
-        {/* ==================== Module ③：实时双币持仓拆解（数量 + USD + 双色比例条） ==================== */}
-        {!closed && holdings && (
+        {/* ==================== Module ③：实时双币持仓拆解（左主币 / 右计价币，对齐展示顺序） ==================== */}
+        {!closed && holdings && primaryHoldings && secondaryHoldings && (
           <div className="my-1.5 rounded-lg border border-white/[0.08] bg-surface-0/60 p-2 text-xs space-y-1.5">
             <div className="flex flex-wrap items-center justify-between gap-1">
               <span className="font-semibold text-ink">
@@ -2646,7 +2708,7 @@ function PositionCard({
               </span>
               {holdings.isSingleSided && (
                 <span className="rounded bg-amber-500/20 px-1.5 py-0.5 font-mono text-[10px] font-semibold text-amber-200 border border-amber-400/35">
-                  ⚠️ 100% 单边 ({holdings.amt0 > holdings.amt1 ? holdings.sym0 : holdings.sym1})
+                  ⚠️ 100% 单边 ({primaryHoldings.amt > 1e-9 ? primaryHoldings.sym : secondaryHoldings.sym})
                 </span>
               )}
             </div>
@@ -2654,29 +2716,29 @@ function PositionCard({
             <div className="flex h-1.5 w-full overflow-hidden rounded bg-white/[0.08]">
               <div
                 className="bg-emerald-400 transition-all"
-                style={{ width: `${Math.min(Math.max(holdings.pct0, 0), 100)}%` }}
+                style={{ width: `${Math.min(Math.max(primaryHoldings.pct, 0), 100)}%` }}
               />
               <div
                 className="bg-cyan-400 transition-all"
-                style={{ width: `${Math.min(Math.max(holdings.pct1, 0), 100)}%` }}
+                style={{ width: `${Math.min(Math.max(secondaryHoldings.pct, 0), 100)}%` }}
               />
             </div>
             <div className="grid grid-cols-2 gap-1.5 font-mono text-[11px]">
               <div className="flex items-center justify-between rounded bg-white/[0.03] px-1.5 py-0.5">
-                <span className="text-emerald-300 font-semibold">{holdings.sym0}</span>
+                <span className="text-emerald-300 font-semibold">{primaryHoldings.sym}</span>
                 <span className="text-ink">
-                  {fmtTokenAmount(holdings.amt0)}{" "}
+                  {fmtTokenAmount(primaryHoldings.amt)}{" "}
                   <span className="text-ink-soft">
-                    (${holdings.usd0.toFixed(0)} · {holdings.pct0.toFixed(0)}%)
+                    (${primaryHoldings.usd.toFixed(0)} · {primaryHoldings.pct.toFixed(0)}%)
                   </span>
                 </span>
               </div>
               <div className="flex items-center justify-between rounded bg-white/[0.03] px-1.5 py-0.5">
-                <span className="text-cyan-300 font-semibold">{holdings.sym1}</span>
+                <span className="text-cyan-300 font-semibold">{secondaryHoldings.sym}</span>
                 <span className="text-ink">
-                  {fmtTokenAmount(holdings.amt1)}{" "}
+                  {fmtTokenAmount(secondaryHoldings.amt)}{" "}
                   <span className="text-ink-soft">
-                    (${holdings.usd1.toFixed(0)} · {holdings.pct1.toFixed(0)}%)
+                    (${secondaryHoldings.usd.toFixed(0)} · {secondaryHoldings.pct.toFixed(0)}%)
                   </span>
                 </span>
               </div>

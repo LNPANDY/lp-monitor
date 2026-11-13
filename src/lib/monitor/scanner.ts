@@ -13,6 +13,13 @@ import { resolveTokens } from "../chains/tokens";
 import { listDexes, listStaking, type DexRow, type StakingRow } from "../chains/dexes";
 import { getAdapter } from "../adapters";
 import {
+  getOutOfRangeDisplayDirection,
+  inferDisplayTokenDecimals,
+  ticksToDisplayPriceRange,
+  toDisplayMarginUnit,
+  toDisplayPriceDiff,
+} from "../v3/display-orientation";
+import {
   getTickMoveThreshold,
   isTickMoveEnabled,
   isCexPriceEnabled,
@@ -248,7 +255,7 @@ async function processPosition(ctx: ScanCtx, dp: DiscoveredPosition): Promise<Sc
     );
 
     // upsert 仓位最新状态（pair_flip 从 prev 或全局 pair_flips 恢复）
-    const prevPairFlip = (prev?.pair_flip === 1 || isPairFlipped(w.chain_id_ref, r.token0, r.token1)) ? 1 : 0;
+    const prevPairFlip = (prev?.pair_flip === 1 || isPairFlipped(w.chain_id_ref, r.token0, r.token1, sym0, sym1)) ? 1 : 0;
     db.prepare(
       `INSERT INTO positions
         (wallet_id, chain_id_ref, dex_id, dex_name, token_id, token0, token1, token0_symbol, token1_symbol, fee, pool,
@@ -326,7 +333,7 @@ async function processPosition(ctx: ScanCtx, dp: DiscoveredPosition): Promise<Sc
     if (rangeTrigger) {
       const alertType = !inRange ? "out_of_range" : "re_in_range";
       if (shouldPush(positionRow.id, alertType, alertType)) {
-        const n = buildNotification(w, chain.name, dex.name, dp, r, sym0, sym1, positionRow.pair_flip, price0Human);
+        const n = buildNotification(w, chain.name, dex.name, dp, r, sym0, sym1, positionRow.pair_flip, price0Human, alertType, dec0, dec1);
         const sendRes = await notifyAll(n);
         alertsSent++;
 
@@ -346,7 +353,7 @@ async function processPosition(ctx: ScanCtx, dp: DiscoveredPosition): Promise<Sc
         const n = buildTickMoveNotification(
           w, chain.name, dex.name, dp, r, sym0, sym1,
           prev.last_margin_lower, currMarginLower,
-          tickMoveDelta, tickMoveDirection, positionRow.pair_flip, price0Human
+          tickMoveDelta, tickMoveDirection, positionRow.pair_flip, price0Human, dec0, dec1
         );
         const sendRes = await notifyAll(n);
         alertsSent++;
@@ -373,7 +380,7 @@ async function processPosition(ctx: ScanCtx, dp: DiscoveredPosition): Promise<Sc
       if (shouldPush(positionRow.id, "cex_price", "exceeds_threshold")) {
         const n = buildCexPriceNotification(
           w, chain.name, dex.name, dp, r, sym0, sym1,
-          cexPriceInfo.payload, positionRow.pair_flip
+          cexPriceInfo.payload, positionRow.pair_flip, dec0, dec1
         );
         const sendRes = await notifyAll(n);
         alertsSent++;
@@ -502,42 +509,60 @@ export function buildNotification(
   sym0: string,
   sym1: string,
   pair_flip?: number,
-  price0Human: string = ""
+  price0Human: string = "",
+  alertType: "out_of_range" | "re_in_range" = "out_of_range",
+  dec0?: number,
+  dec1?: number
 ) {
   const tag = w.label ? `[${w.label}]` : "";
-  // token 对标签：优先用 symbol，没有则回退到地址缩写
   const short = (a: string) => `${a.slice(0, 6)}…${a.slice(-4)}`;
 
-  // 处理交易对翻转：翻转后展示口径变为「1 token1 = ? token0」
-  // price0Human 是整币单位「1 token0 = ? token1」（已按 decimals 换算），翻转时取倒数
   const flip = pair_flip === 1;
   const baseLabel0 = sym0 || short(r.token0);
   const baseLabel1 = sym1 || short(r.token1);
   const displayLabel0 = flip ? baseLabel1 : baseLabel0;
   const displayLabel1 = flip ? baseLabel0 : baseLabel1;
   const displayPair = `${displayLabel0}/${displayLabel1}`;
-  // 翻转时汇率取倒数；空值兜底显示原字符串
   const displayPrice = price0Human
     ? flip
       ? fmt(1 / Number(price0Human))
       : price0Human
     : "";
 
-  const title = `⚠️ LP 越界 ${tag} ${displayPair} · ${chainName}/${dexName}`;
-  const dir = r.status.currentTick < r.tickLower ? "低于下界" : "高于上界";
+  const d0 = inferDisplayTokenDecimals(r.token0, sym0, dec0);
+  const d1 = inferDisplayTokenDecimals(r.token1, sym1, dec1);
+  const range = ticksToDisplayPriceRange(r.tickLower, r.tickUpper, d0, d1, flip);
+
+  const isReInRange = alertType === "re_in_range" || !!r.status?.inRange;
+  if (isReInRange) {
+    const title = `✅ LP 回到区间 ${tag} ${displayPair} · ${chainName}/${dexName}`;
+    const body =
+      `仓位 #${dp.tokenId}（${displayPair}）已回到价格区间内！\n` +
+      `当前价格: 1 ${displayLabel0} ≈ ${displayPrice} ${displayLabel1}\n` +
+      `价格区间: ${range.priceLow} ~ ${range.priceHigh} ${displayLabel1}\n` +
+      (dp.source === "staking" ? `来源: 质押 @ ${short(dp.stakerContract ?? "")}\n` : `来源: 直接持有\n`) +
+      `钱包: ${w.address}`;
+    return { title, body };
+  }
+
+  const outDir = getOutOfRangeDisplayDirection(
+    r.status.currentTick,
+    r.tickLower,
+    r.tickUpper,
+    flip
+  );
+  const dirIcon = outDir.isAboveUpper ? "📈" : "📉";
+  const title = `⚠️ LP 越界 (${outDir.actionLabel}) ${tag} ${displayPair} · ${chainName}/${dexName}`;
   const body =
-    `仓位 #${dp.tokenId}（${displayPair}）已 ${dir}！\n` +
-    `token0: ${displayLabel0} (${flip ? short(r.token1) : short(r.token0)})\n` +
-    `token1: ${displayLabel1} (${flip ? short(r.token0) : short(r.token1)})\n` +
-    `当前 tick: ${r.status.currentTick}\n` +
-    `区间: [${r.tickLower}, ${r.tickUpper}]\n` +
-    `价格(1 ${displayLabel0} ≈ x ${displayLabel1}): ${displayPrice}\n` +
+    `${dirIcon} 仓位 #${dp.tokenId}（${displayPair}）已${outDir.actionLabel}（${outDir.boundLabel}）！\n` +
+    `当前价格: 1 ${displayLabel0} ≈ ${displayPrice} ${displayLabel1}\n` +
+    `价格区间: ${range.priceLow} ~ ${range.priceHigh} ${displayLabel1}\n` +
     (dp.source === "staking" ? `来源: 质押 @ ${short(dp.stakerContract ?? "")}\n` : `来源: 直接持有\n`) +
     `钱包: ${w.address}`;
   return { title, body };
 }
 
-/** tick 波动告警文案。margin 用 0~1 的相对位置，展示时转成百分比。 */
+/** 区间波动告警文案。margin 统一转换到展示坐标系（0%=价格下界，100%=价格上界，涨右跌左）。 */
 export function buildTickMoveNotification(
   w: WalletRow,
   chainName: string,
@@ -549,15 +574,15 @@ export function buildTickMoveNotification(
   prevMarginLower: number,
   currMarginLower: number,
   delta: number,
-  direction: string,
+  _direction: string,
   pair_flip?: number,
-  price0Human: string = ""
+  price0Human: string = "",
+  dec0?: number,
+  dec1?: number
 ) {
   const tag = w.label ? `[${w.label}]` : "";
   const short = (a: string) => `${a.slice(0, 6)}…${a.slice(-4)}`;
 
-  // 处理交易对翻转：翻转后展示口径变为「1 token1 = ? token0」
-  // price0Human 是整币单位「1 token0 = ? token1」（已按 decimals 换算），翻转时取倒数
   const flip = pair_flip === 1;
   const baseLabel0 = sym0 || short(r.token0);
   const baseLabel1 = sym1 || short(r.token1);
@@ -570,18 +595,21 @@ export function buildTickMoveNotification(
       : price0Human
     : "";
 
+  const d0 = inferDisplayTokenDecimals(r.token0, sym0, dec0);
+  const d1 = inferDisplayTokenDecimals(r.token1, sym1, dec1);
+  const range = ticksToDisplayPriceRange(r.tickLower, r.tickUpper, d0, d1, flip);
+
   const pct = (x: number) => `${(x * 100).toFixed(1)}%`;
-  // 涨跌判定（考虑翻转）：tick 上移 → 原始价格（1 token0=? token1）上涨
-  //   未翻转：展示口径 = 原始价格 → tick 上移 = 上涨
-  //   已翻转：展示口径 = 1/原始价格 → tick 上移 = 下跌
-  const tickUp = currMarginLower > prevMarginLower;
-  const displayDirection = tickUp === !flip ? "上涨" : "下跌";
-  const title = `📈 LP 波动 ${tag} ${displayPair} · ${chainName}/${dexName}`;
+  const dispPrev = toDisplayMarginUnit(prevMarginLower, flip);
+  const dispCurr = toDisplayMarginUnit(currMarginLower, flip);
+  const isPriceUp = dispCurr >= dispPrev;
+  const displayDirection = isPriceUp ? "上涨 · 靠近上界" : "下跌 · 靠近下界";
+  const icon = isPriceUp ? "📈" : "📉";
+  const title = `${icon} LP 波动 ${tag} ${displayPair} · ${chainName}/${dexName}`;
   const body =
-    `仓位 #${dp.tokenId} 区间内位置: ${pct(prevMarginLower)} → ${pct(currMarginLower)}（变动 ${pct(delta)}，${displayDirection}）\n` +
-    `当前 tick: ${r.status.currentTick}\n` +
-    `区间: [${r.tickLower}, ${r.tickUpper}]\n` +
-    `价格(1 ${displayLabel0} ≈ x ${displayLabel1}): ${displayPrice}\n` +
+    `仓位 #${dp.tokenId} 区间位置: ${pct(dispPrev)} → ${pct(dispCurr)}（变动 ${pct(delta)}，${displayDirection}）\n` +
+    `当前价格: 1 ${displayLabel0} ≈ ${displayPrice} ${displayLabel1}\n` +
+    `价格区间: ${range.priceLow} ~ ${range.priceHigh} ${displayLabel1}\n` +
     (dp.source === "staking" ? `来源: 质押 @ ${short(dp.stakerContract ?? "")}\n` : `来源: 直接持有\n`) +
     `钱包: ${w.address}`;
   return { title, body };
@@ -712,32 +740,36 @@ export function buildCexPriceNotification(
   sym0: string,
   sym1: string,
   p: CexPricePayload,
-  pair_flip?: number
+  pair_flip?: number,
+  dec0?: number,
+  dec1?: number
 ) {
   const tag = w.label ? `[${w.label}]` : "";
   const short = (a: string) => `${a.slice(0, 6)}…${a.slice(-4)}`;
   const flip = pair_flip === 1;
 
-  // 翻转后展示口径变为「1 token1 = ? token0」：汇率取倒数，符号/标签交换
   const baseLabel0 = sym0 || short(r.token0);
   const baseLabel1 = sym1 || short(r.token1);
   const label0 = flip ? baseLabel1 : baseLabel0;
   const label1 = flip ? baseLabel0 : baseLabel1;
   const pairLabel = `${label0}/${label1}`;
-  const dexRate = flip ? 1 / p.dexRate : p.dexRate;
-  const cexRate = flip ? 1 / p.cexRate : p.cexRate;
+  const { displayDexRate, displayCexRate, displayDiff, dexHigherThanCex } =
+    toDisplayPriceDiff(p.dexRate, p.cexRate, flip);
   const token0CexSymbol = flip ? p.token1CexSymbol : p.token0CexSymbol;
   const token1CexSymbol = flip ? p.token0CexSymbol : p.token1CexSymbol;
+  const d0 = inferDisplayTokenDecimals(r.token0, sym0, dec0);
+  const d1 = inferDisplayTokenDecimals(r.token1, sym1, dec1);
+  const range = ticksToDisplayPriceRange(r.tickLower, r.tickUpper, d0, d1, flip);
+  const dirLabel = dexHigherThanCex ? "DEX 高于 CEX" : "DEX 低于 CEX";
 
   const pctSigned = (x: number) => `${x >= 0 ? "+" : ""}${(x * 100).toFixed(2)}%`;
   const title = `💱 CEX 价差 ${tag} ${pairLabel} · ${chainName}/${dexName}`;
   const body =
-    `仓位 #${dp.tokenId}（${pairLabel}）DEX 池价与 CEX 汇率偏差较大\n` +
-    `DEX 池价: 1 ${label0} = ${fmt(dexRate)} ${label1}\n` +
-    `CEX 汇率: 1 ${label0} = ${fmt(cexRate)} ${label1}（${token0CexSymbol} ÷ ${token1CexSymbol}，均以 ${p.quote} 计价）\n` +
-    `价差: ${pctSigned(p.diff)}（阈值 ${(Math.abs(p.absDiff) * 100).toFixed(2)}%）\n` +
-    `当前 tick: ${r.status.currentTick}\n` +
-    `区间: [${r.tickLower}, ${r.tickUpper}]\n` +
+    `仓位 #${dp.tokenId}（${pairLabel}）DEX 池价与 CEX 汇率偏差较大（${dirLabel}）\n` +
+    `DEX 池价: 1 ${label0} = ${fmt(displayDexRate)} ${label1}\n` +
+    `CEX 汇率: 1 ${label0} = ${fmt(displayCexRate)} ${label1}（${token0CexSymbol} ÷ ${token1CexSymbol}，均以 ${p.quote} 计价）\n` +
+    `价差: ${pctSigned(displayDiff)}\n` +
+    `价格区间: ${range.priceLow} ~ ${range.priceHigh} ${label1}\n` +
     (dp.source === "staking" ? `来源: 质押 @ ${short(dp.stakerContract ?? "")}\n` : `来源: 直接持有\n`) +
     `钱包: ${w.address}`;
   return { title, body };

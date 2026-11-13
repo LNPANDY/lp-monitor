@@ -14,6 +14,7 @@ export async function GET(req: Request) {
                     c.name AS chain_name, c.key AS chain_key, c.explorer_url, c.chain_id AS chain_id,
                     c.rpc_urls AS chain_rpc_urls, c.symbol AS chain_symbol,
                     d.name AS dex_display_name, d.npm AS dex_npm,
+                    t0.decimals AS token0_decimals, t1.decimals AS token1_decimals,
                     (SELECT a.type FROM alerts a WHERE a.position_id=p.id ORDER BY a.sent_at DESC LIMIT 1) AS last_alert_type,
                     (SELECT CASE WHEN m.id IS NOT NULL THEN 1 ELSE 0 END
                        FROM cex_alert_mutes m
@@ -25,6 +26,8 @@ export async function GET(req: Request) {
              JOIN wallets w ON w.id=p.wallet_id
              JOIN chains c ON c.id=p.chain_id_ref
              LEFT JOIN dexes d ON d.id=p.dex_id
+             LEFT JOIN tokens t0 ON t0.chain_id_ref=p.chain_id_ref AND LOWER(t0.address)=LOWER(p.token0)
+             LEFT JOIN tokens t1 ON t1.chain_id_ref=p.chain_id_ref AND LOWER(t1.address)=LOWER(p.token1)
              WHERE 1=1`;
   const args: any[] = [];
   if (only) { sql += " AND p.notify_state=?"; args.push(only); }

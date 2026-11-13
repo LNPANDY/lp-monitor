@@ -58,7 +58,7 @@ export default function AlertsPage() {
               { key: "all" as AlertFilter, label: "全部" },
               { key: "out_of_range" as AlertFilter, label: "🚨 越界告警" },
               { key: "cex_price" as AlertFilter, label: "📊 CEX 价差" },
-              { key: "tick_move" as AlertFilter, label: "📈 Tick 波动" },
+              { key: "tick_move" as AlertFilter, label: "📈 区间波动" },
               { key: "back_in_range" as AlertFilter, label: "✅ 回到区间" },
             ] as const
           ).map((t) => (
@@ -96,7 +96,7 @@ export default function AlertsPage() {
 
       {filtered.length === 0 ? (
         <div className="card p-8 text-center text-sm text-ink-soft">
-          暂无匹配的告警记录。当仓位越界、回到区间、Tick 波动或 CEX 差价超限时会实时记录。
+          暂无匹配的告警记录。当仓位越界、回到区间、区间波动或 CEX 差价超限时会实时记录。
         </div>
       ) : (
         <div className="card divide-y divide-white/[0.06]">

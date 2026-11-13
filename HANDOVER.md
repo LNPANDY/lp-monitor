@@ -1,8 +1,8 @@
 # LP Monitor 项目交接与实施蓝图（HANDOVER.md）
 
-> **当前系统版本**：`v0.22.2`（Commit: `c75ba60`，已推送到 GitHub `main` 分支）  
+> **当前系统版本**：`v0.22.3`（已推送到 GitHub `main` 分支）  
 > **代码仓库**：`LNPANDY/lp-monitor`  
-> **更新时间**：2026-11-12  
+> **更新时间**：2026-11-13  
 
 ---
 
@@ -10,6 +10,9 @@
 
 ### 1. 核心架构与功能矩阵
 - **多链 V3 集中流动性监控**：实时追踪 Uniswap V3 及分叉 DEX（0G Zia 等）仓位状态（In-range / Out-of-range）。
+- **全站「不稳定币 / 稳定币」方向统一与去 Tick 化展示（v0.22.3 交付）**：
+  - 自动将稳定币在前的交易对默认翻转为 `不稳定币/稳定币`（左跌右涨），统一仓位卡片、双指针、探针、建仓面板、Merkl 雷达及所有告警推送的正负号与涨跌/上下界描述。
+  - 全面移除界面与告警中的原始 Tick 刻度展示，替换为人类可读的实际价格区间（`priceLow ~ priceHigh`）与套利目标价。
 - **Zia 质押溯源与收益雷达（Module ⑦）**：
   - 自动穿透 ZiaVault 托管池，精准统计窄幅对手盘 TVL 与真实竞争仓位数。
   - Merkl 激励透视：实时拆解三桶权重（`60% 活跃 L 桶 + 20% Token0 + 20% Token1`），计算投入 \$1,000 的单格年化（APR）与各代币被动持币桶年化。
@@ -94,3 +97,14 @@
 2. 创建后端签名器安全模块：`src/lib/wallet/custody-signer.ts`（实现 AES-256 解密、交易白名单、主钱包硬锁定）。
 3. 开发前端托管钱包控制栏：集成在主控台顶栏或独立浮窗中（提供口令解锁、锁定、一键归集、余额查看）。
 4. 对接 Mint/Staking/Swap 模块的托管代理调用端点。
+
+---
+
+## 六、 待办事项（TODO）
+
+- [x] **全站涨跌与上下界口径统一 + 移除界面原始 Tick 展示**：基于 `pair_flip` 与「不稳定币 / 稳定币」计价口径（新增 [`display-orientation.ts`](src/lib/v3/display-orientation.ts)），全面统一仓位卡片、双指针进度条、探针、建仓面板、Merkl 雷达及全部告警推送的正负号与涨跌/上下界描述，并将界面及推送中的原始 Tick 数值全部替换为换算后的实际价格展示。
+- [ ] **安装 `modern-web-guidance` Skill + `lp-monitor` UI 整体重塑**：
+  1. 稍后安装接入 [`GoogleChrome/modern-web-guidance`](https://github.com/GoogleChrome/modern-web-guidance) Skill（现代原生 `<dialog>` / Popover、过渡动画、容器查询、`content-visibility` 等规范）。
+  2. **先产出 UI 重塑效果图供确认**，待视觉方案敲定后再对主控台、仓位卡片、探针与建仓/Swap 面板进行整体改版落地。
+- [ ] **小资金安全托管钱包体系（方案 B）**：按第三章蓝图实施 AES-256-GCM 托管子钱包、主钱包死锁归集与交易白名单防火墙。
+

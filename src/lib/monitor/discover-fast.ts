@@ -352,7 +352,7 @@ export async function runFastDiscover(opts: {
             const marginLower = (r.status.currentTick - r.tickLower) / span;
             const marginUpper = (r.tickUpper - r.status.currentTick) / span;
             const price0HumanStr = rawToHumanPrice(r.status.price, dec0, dec1);
-            const prevPairFlip = isPairFlipped(chainIdRef, r.token0, r.token1)
+            const prevPairFlip = isPairFlipped(chainIdRef, r.token0, r.token1, sym0, sym1)
               ? 1
               : 0;
 

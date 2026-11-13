@@ -27,6 +27,7 @@ import {
   sqrtPriceX96ToHumanPrice,
   FEE_TO_TICK_SPACING,
 } from "../v3/math";
+import { shouldAutoFlipPair, toDisplayMarginPct } from "../v3/display-orientation";
 import { notifyAll } from "../notify";
 
 export const OG_MAINNET_CHAIN_ID = 16661;
@@ -114,7 +115,7 @@ export const ZIA_INCENTIVIZED_POOLS: ZiaIncentivizedPoolDef[] = [
   },
   {
     key: "usdc-sol-3000",
-    pairLabel: "USDC.e/SOL 0.3%",
+    pairLabel: "SOL/USDC.e 0.3%",
     pool: "0x422b1fde29a7560ab3a35248b3a23ae675f5e10f",
     vault: "0x6265a754bfd1f21408202d70d926cc3fc094cf39",
     token0: "0x1f3aa82227281ca364bfb3d253b0f1af1da6473e",
@@ -936,12 +937,14 @@ export async function scanMerklRewardsAndApr(opts?: {
             }
           }
 
-          // 计算当前最小单格 [tickLower, tickUpper] 及子 Tick 边界安全距离
+          // 计算当前最小单格 [tickLower, tickUpper] 及价格上下界安全距离（统一为 不稳定币/稳定币 方向：左跌右涨）
           const tickSpacing = poolDef.tickSpacing || FEE_TO_TICK_SPACING[poolDef.fee] || 60;
           const tickLower = Math.floor(currentTick / tickSpacing) * tickSpacing;
           const tickUpper = tickLower + tickSpacing;
-          const subTickMarginLowerPct = ((currentTick - tickLower) / tickSpacing) * 100;
-          const subTickMarginUpperPct = ((tickUpper - currentTick) / tickSpacing) * 100;
+          const rawSubLowerPct = ((currentTick - tickLower) / tickSpacing) * 100;
+          const poolAutoFlip = shouldAutoFlipPair(poolDef.symbol0, poolDef.symbol1);
+          const subTickMarginLowerPct = toDisplayMarginPct(rawSubLowerPct, poolAutoFlip);
+          const subTickMarginUpperPct = 100 - subTickMarginLowerPct;
           const subTickMinMarginPct = Math.min(subTickMarginLowerPct, subTickMarginUpperPct);
 
           // 模拟投入 $1,000 压单格（含自身稀释效应）

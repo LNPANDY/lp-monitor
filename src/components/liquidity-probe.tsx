@@ -7,6 +7,13 @@ import { SwapQuoteSection, type ExternalSwapPair } from "./swap-quote-section";
 import { useWallet } from "@/lib/wallet/use-wallet";
 import type { UseBinanceRealtimeReturn } from "@/lib/cex/use-binance-ws";
 import type { MerklRewardsSummary, PoolRewardRadarItem } from "@/lib/monitor/merkl-rewards";
+import {
+  inferDisplayTokenDecimals,
+  tickToDisplayPrice,
+  ticksToDisplayPriceRange,
+  toDisplayMarginPct,
+  toDisplayPriceDiff,
+} from "@/lib/v3/display-orientation";
 
 /**
  * 最小区间探针结果（场景C），与后端 MinRangeProbeResult 对齐。
@@ -505,11 +512,34 @@ export function LiquidityProbe({
         flip ? 1 / Number(result.priceCurrent) : Number(result.priceCurrent)
       )
     : "";
-  const displayCexRate = probeLiveCex
-    ? flip
-      ? 1 / probeLiveCex.cexRate
-      : probeLiveCex.cexRate
-    : 0;
+  const probeDec0 = result
+    ? inferDisplayTokenDecimals(result.token0, result.token0Symbol, result.token0Decimals)
+    : 18;
+  const probeDec1 = result
+    ? inferDisplayTokenDecimals(result.token1, result.token1Symbol, result.token1Decimals)
+    : 6;
+  const probeCexDiffView = probeLiveCex
+    ? toDisplayPriceDiff(probeLiveCex.dexRate, probeLiveCex.cexRate, flip)
+    : null;
+  const displayCexRate = probeCexDiffView ? probeCexDiffView.displayCexRate : 0;
+  const probeImpliedDisplayPrice =
+    probeLiveCex && result
+      ? tickToDisplayPrice(probeLiveCex.impliedTick, probeDec0, probeDec1, flip)
+      : "";
+  const probeRawImpliedDisplayPrice =
+    probeLiveCex && result
+      ? tickToDisplayPrice(probeLiveCex.rawImpliedTick, probeDec0, probeDec1, flip)
+      : "";
+  const probeBreakoutRange =
+    probeLiveCex && result
+      ? ticksToDisplayPriceRange(
+          probeLiveCex.arbBreakoutLowerTick,
+          probeLiveCex.arbBreakoutUpperTick,
+          probeDec0,
+          probeDec1,
+          flip
+        )
+      : null;
   const displayToken0Cex = probeLiveCex
     ? (flip ? probeLiveCex.token1CexSymbol : probeLiveCex.token0CexSymbol) || displaySym0
     : "";
@@ -551,13 +581,18 @@ export function LiquidityProbe({
   const probeSpan = result
     ? Math.max(result.tickUpper - result.tickLower, 1)
     : 60;
-  const probeOnChainPct = result
+  const rawProbeOnChainPct = result
     ? ((result.currentTick - result.tickLower) / probeSpan) * 100
     : 50;
-  const probeOnChainClamped = Math.min(Math.max(probeOnChainPct, 0), 100);
-  const probeImpliedClamped = probeLiveCex
-    ? Math.min(Math.max(probeLiveCex.impliedMarginLowerPct, 0), 100)
+  const probeOnChainPct = toDisplayMarginPct(rawProbeOnChainPct, flip);
+  const probeImpliedPct = probeLiveCex
+    ? toDisplayMarginPct(probeLiveCex.impliedMarginLowerPct, flip)
     : null;
+  const probeOnChainClamped = Math.min(Math.max(probeOnChainPct, 0), 100);
+  const probeImpliedClamped =
+    probeImpliedPct !== null
+      ? Math.min(Math.max(probeImpliedPct, 0), 100)
+      : null;
   const probePullLeft =
     probeImpliedClamped !== null
       ? Math.min(probeOnChainClamped, probeImpliedClamped)
@@ -838,23 +873,6 @@ export function LiquidityProbe({
           </div>
 
           <div className="space-y-1">
-            <PRow label="当前 tick / 最小窗口">
-              <span className="font-mono">
-                {result.currentTick} [{result.tickLower}, {result.tickUpper}]
-                {probeLiveCex && (
-                  <span
-                    className="ml-1.5 text-amber-300"
-                    title={`币安裸价映射 Tick ${probeLiveCex.rawImpliedTick}，扣除 ${(probeLiveCex.feeRate * 100).toFixed(2)}% 池费死角（${probeLiveCex.feeTicks} tick）后真实套利目标 Tick 为 ${probeLiveCex.impliedTick}`}
-                  >
-                    (⚡币安目标Tick {probeLiveCex.impliedTick}
-                    {probeLiveCex.rawImpliedTick !== probeLiveCex.impliedTick
-                      ? ` · 裸价${probeLiveCex.rawImpliedTick}扣${probeLiveCex.feeTicks}t池费`
-                      : ""}
-                    )
-                  </span>
-                )}
-              </span>
-            </PRow>
             {result.stakedLiquidity && (
               <PRow label="窗口质押流动性">
                 <span className="font-mono font-medium text-cyan-300">
@@ -884,6 +902,16 @@ export function LiquidityProbe({
             <PRow label="DEX 当前池价">
               <span className="font-mono">
                 1 {displaySym0} ≈ {displayPriceCurrent} {displaySym1}
+                {probeLiveCex &&
+                  !probeLiveCex.withinFeeDeadzone &&
+                  probeImpliedDisplayPrice && (
+                    <span
+                      className="ml-1.5 text-amber-300"
+                      title={`扣除 ${(probeLiveCex.feeRate * 100).toFixed(2)}% 池子单边手续费后，套利机器人预计将池价推向 ${probeImpliedDisplayPrice} ${displaySym1}`}
+                    >
+                      (⚡套利目标 ≈ {probeImpliedDisplayPrice})
+                    </span>
+                  )}
               </span>
             </PRow>
             <PRow label="最小窗口价格区间">
@@ -913,7 +941,7 @@ export function LiquidityProbe({
                 </span>
               </PRow>
             )}
-            {probeLiveCex && (
+            {probeLiveCex && probeCexDiffView && (
               <PRow label="CEX 实时对比">
                 <span className="font-mono text-ink">
                   CEX {fmtFull(displayCexRate)} · DEX {displayPriceCurrent} ·{" "}
@@ -924,10 +952,11 @@ export function LiquidityProbe({
                         : "text-emerald-300"
                     }
                   >
-                    {pctSigned(probeLiveCex.diff)} (
-                    {probeLiveCex.tickDelta >= 0 ? "+" : ""}
-                    {probeLiveCex.tickDelta} tick · 池费死角±
-                    {probeLiveCex.feeTicks}t)
+                    {pctSigned(probeCexDiffView.displayDiff)} (
+                    {probeCexDiffView.dexHigherThanCex
+                      ? "DEX 高于币安"
+                      : "DEX 低于币安"}{" "}
+                    · 池费死角±{(probeLiveCex.feeRate * 100).toFixed(2)}%)
                   </span>
                 </span>
               </PRow>
@@ -941,11 +970,11 @@ export function LiquidityProbe({
           <div className="rounded-lg border border-white/[0.08] bg-surface-0/60 p-2.5 space-y-1.5">
             <div className="flex flex-wrap items-center justify-between gap-1 text-[11px]">
               <span className="font-semibold text-ink">
-                🧭 最小单格双指针安全雷达 [{result.tickLower}, {result.tickUpper}]
+                🧭 最小单格双指针安全雷达 ({displayPriceLow} ~ {displayPriceHigh})
               </span>
               <span className="font-mono text-ink-soft">
-                建仓配比 ≈ {(100 - probeOnChainClamped).toFixed(0)}% {result.token0Symbol} :{" "}
-                {probeOnChainClamped.toFixed(0)}% {result.token1Symbol}
+                建仓配比 ≈ {(100 - probeOnChainClamped).toFixed(0)}% {displaySym0} :{" "}
+                {probeOnChainClamped.toFixed(0)}% {displaySym1}
               </span>
             </div>
 
@@ -960,28 +989,30 @@ export function LiquidityProbe({
                   }}
                 />
               )}
-              {/* 链上当前 Tick */}
+              {/* 链上当前价格位置 */}
               <div
                 className="absolute top-1/2 h-4 w-1.5 -translate-y-1/2 rounded bg-cyan-400 shadow-[0_0_8px_rgba(34,211,238,0.8)]"
                 style={{ left: `${probeOnChainClamped}%` }}
-                title={`链上当前 Tick: ${result.currentTick} (${probeOnChainPct.toFixed(1)}%)`}
+                title={`链上现价: ${displayPriceCurrent} ${displaySym1} (距下界 ${probeOnChainPct.toFixed(1)}%)`}
               />
-              {/* 币安扣费后真实套利目标 Tick */}
-              {probeImpliedClamped !== null && probeLiveCex && (
-                <div
-                  className="absolute top-1/2 h-4 w-1.5 -translate-y-1/2 rounded border border-amber-200 bg-amber-400 shadow-[0_0_8px_#f59e0b]"
-                  style={{ left: `${probeImpliedClamped}%` }}
-                  title={`⚡ 币安扣费目标 Tick: ${probeLiveCex.impliedTick} (${probeLiveCex.impliedMarginLowerPct.toFixed(1)}%) · 裸价 Tick: ${probeLiveCex.rawImpliedTick}`}
-                />
-              )}
+              {/* 币安扣费后真实套利目标位置 */}
+              {probeImpliedClamped !== null &&
+                probeLiveCex &&
+                probeImpliedPct !== null && (
+                  <div
+                    className="absolute top-1/2 h-4 w-1.5 -translate-y-1/2 rounded border border-amber-200 bg-amber-400 shadow-[0_0_8px_#f59e0b]"
+                    style={{ left: `${probeImpliedClamped}%` }}
+                    title={`⚡ 币安扣费目标价: ≈ ${probeImpliedDisplayPrice} ${displaySym1} (距下界 ${probeImpliedPct.toFixed(1)}%)`}
+                  />
+                )}
             </div>
 
             <div className="flex flex-wrap items-center justify-between gap-1 font-mono text-[11px] text-ink-soft">
               <span>
-                🔵 链上位于单格 {probeOnChainPct.toFixed(1)}% (距最近边界{" "}
-                {Math.min(probeOnChainPct, 100 - probeOnChainPct).toFixed(1)}%)
+                🔵 距下界 {probeOnChainPct.toFixed(1)}% / 距上界{" "}
+                {(100 - probeOnChainPct).toFixed(1)}%
               </span>
-              {probeLiveCex && (
+              {probeLiveCex && probeImpliedPct !== null && (
                 <span
                   className={
                     !probeLiveCex.impliedInRange
@@ -991,9 +1022,11 @@ export function LiquidityProbe({
                         : "text-amber-300"
                   }
                 >
-                  ⚡ 币安扣费目标 {probeLiveCex.impliedMarginLowerPct.toFixed(1)}%
+                  ⚡ 币安扣费目标 {probeImpliedPct.toFixed(1)}%
                   {!probeLiveCex.impliedInRange
-                    ? " (套利将出格!)"
+                    ? probeImpliedPct >= 100
+                      ? " (套利将涨穿上界!)"
+                      : " (套利将跌破下界!)"
                     : probeLiveCex.withinFeeDeadzone
                       ? ` (在格内 · 死角保护)`
                       : " (在格内)"}
@@ -1002,7 +1035,7 @@ export function LiquidityProbe({
             </div>
 
             {/* 最小窗口开仓智能诊断 */}
-            {probeLiveCex && (
+            {probeLiveCex && probeCexDiffView && (
               <div
                 className={`rounded border px-2 py-1 text-[11px] ${
                   !probeLiveCex.impliedInRange
@@ -1019,46 +1052,46 @@ export function LiquidityProbe({
                 {!probeLiveCex.impliedInRange ? (
                   <span>
                     🚨 <strong>开仓预警</strong>：扣除{" "}
-                    {(probeLiveCex.feeRate * 100).toFixed(2)}% (
-                    {probeLiveCex.feeTicks} tick) 池费后，币安套利目标 Tick (
-                    {probeLiveCex.impliedTick}，裸价 Tick{" "}
-                    {probeLiveCex.rawImpliedTick}) 仍超出当前最小格 [
-                    {result.tickLower}, {result.tickUpper}
-                    ]！套利推平后可能越界，建议点下方「⚡ 按币安实时价单格」或使用「🛡️ 0 ~ 现价略高」模式。
+                    {(probeLiveCex.feeRate * 100).toFixed(2)}% 池费后，币安套利目标价（≈{" "}
+                    {probeImpliedDisplayPrice}）仍
+                    {probeImpliedPct !== null && probeImpliedPct >= 100
+                      ? "高于当前最小格上界"
+                      : "低于当前最小格下界"}{" "}
+                    [{displayPriceLow} ~ {displayPriceHigh}]！套利推平后可能越界，建议点下方「⚡ 按币安目标价单格」或使用「🛡️ 0 ~ 现价略高」模式。
                   </span>
                 ) : !probeLiveCex.withinFeeDeadzone ? (
                   <span>
                     ⚠️ <strong>套利临界（仍在格内）</strong>：当前价差{" "}
-                    {(probeLiveCex.absDiff * 100).toFixed(2)}% ≥ 池费{" "}
-                    {(probeLiveCex.feeRate * 100).toFixed(2)}% (
-                    {probeLiveCex.feeTicks} tick)，扣费后机器人预计把 Tick 推向{" "}
-                    {probeLiveCex.impliedTick}（仍在当前格{" "}
-                    {probeLiveCex.impliedMarginLowerPct.toFixed(0)}% 处，未出格）。
+                    {(probeCexDiffView.displayAbsDiff * 100).toFixed(2)}% ≥ 池费{" "}
+                    {(probeLiveCex.feeRate * 100).toFixed(2)}%，扣费后机器人预计把价格
+                    {probeCexDiffView.dexHigherThanCex ? "压低至" : "推高至"} ≈{" "}
+                    {probeImpliedDisplayPrice}（位于当前格{" "}
+                    {(probeImpliedPct ?? 50).toFixed(0)}% 处，未出格）。
                   </span>
                 ) : !probeLiveCex.rawImpliedInRange ? (
                   <span>
-                    🛡️ <strong>死角保护中（币安未出格）</strong>：币安裸价 Tick (
-                    {probeLiveCex.rawImpliedTick}，差{" "}
-                    {probeLiveCex.tickDelta >= 0 ? "+" : ""}
-                    {probeLiveCex.tickDelta} tick) 虽超出格线，但小于{" "}
-                    {(probeLiveCex.feeRate * 100).toFixed(2)}% 池子手续费死角（
-                    {probeLiveCex.feeTicks} tick），套利无法推动池子（扣费目标仍为{" "}
-                    {probeLiveCex.impliedTick} 在格内，需币安裸价突破 [
-                    {probeLiveCex.arbBreakoutLowerTick},{" "}
-                    {probeLiveCex.arbBreakoutUpperTick}] 才会触发套利出格）。
+                    🛡️ <strong>死角保护中（币安未出格）</strong>：币安现价（≈{" "}
+                    {probeRawImpliedDisplayPrice}，差{" "}
+                    {pctSigned(probeCexDiffView.displayDiff)}）虽超出格线，但小于{" "}
+                    {(probeLiveCex.feeRate * 100).toFixed(2)}% 池子手续费死角，套利无法推动池子（扣费目标仍为{" "}
+                    {probeImpliedDisplayPrice} 在格内
+                    {probeBreakoutRange
+                      ? `，需币安突破 ${probeBreakoutRange.priceLow} ~ ${probeBreakoutRange.priceHigh} 才会触发套利出格`
+                      : ""}
+                    ）。
                   </span>
                 ) : Math.min(probeOnChainPct, 100 - probeOnChainPct) < 15 ? (
                   <span>
-                    ⚠️ <strong>贴边提醒</strong>：链上 Tick 距当前格边界仅{" "}
+                    ⚠️ <strong>贴边提醒</strong>：链上现价距当前格
+                    {probeOnChainPct < 50 ? "下界" : "上界"}仅{" "}
                     {Math.min(probeOnChainPct, 100 - probeOnChainPct).toFixed(0)}
-                    %（币安价差处于 ±{probeLiveCex.feeTicks} tick 池费死角内），若防波动越界可考虑「🛡️ 0 ~ 现价略高」模式。
+                    %（价差处于 ±{(probeLiveCex.feeRate * 100).toFixed(2)}% 池费死角内），若防波动越界可考虑「🛡️ 0 ~ 现价略高」模式。
                   </span>
                 ) : (
                   <span>
                     🟢 <strong>最小格安全</strong>：链上与币安扣费目标均在格内安全区，且价差{" "}
-                    {(probeLiveCex.absDiff * 100).toFixed(2)}% 处于{" "}
-                    {(probeLiveCex.feeRate * 100).toFixed(2)}%（±
-                    {probeLiveCex.feeTicks} tick）手续费死角内。
+                    {(probeCexDiffView.displayAbsDiff * 100).toFixed(2)}% 处于 ±
+                    {(probeLiveCex.feeRate * 100).toFixed(2)}% 手续费死角内。
                   </span>
                 )}
               </div>

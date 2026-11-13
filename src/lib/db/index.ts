@@ -1,5 +1,6 @@
 import Database from "better-sqlite3";
 import { appEnv, dbPath } from "./config";
+import { shouldAutoFlipPair } from "../v3/display-orientation";
 
 export type DB = Database.Database;
 
@@ -326,9 +327,16 @@ function migrate(db: DB) {
 
 /**
  * 统一查询交易对是否已翻转（按 chain_id_ref + token0 + token1 跨模块全局一致）。
- * 同时检查 pair_flips 表与 positions 表，确保旧数据也能无缝兼容。
+ * 同时检查 pair_flips 表与 positions 表；若该交易对从未出现过且底层是「稳定币/不稳定币」（如 USDC.e/WETH），
+ * 则自动初始化为翻转状态（统一为「不稳定币/稳定币」口径），同时完全保留后续手动切换翻转的能力。
  */
-export function isPairFlipped(chainIdRef: number, token0: string, token1: string): boolean {
+export function isPairFlipped(
+  chainIdRef: number,
+  token0: string,
+  token1: string,
+  sym0?: string,
+  sym1?: string
+): boolean {
   if (!chainIdRef || !token0 || !token1) return false;
   const db = getDb();
   const t0 = token0.trim().toLowerCase();
@@ -337,10 +345,31 @@ export function isPairFlipped(chainIdRef: number, token0: string, token1: string
     .prepare("SELECT 1 FROM pair_flips WHERE chain_id_ref=? AND LOWER(token0)=? AND LOWER(token1)=? LIMIT 1")
     .get(chainIdRef, t0, t1);
   if (row) return true;
-  const posRow = db
-    .prepare("SELECT 1 FROM positions WHERE chain_id_ref=? AND LOWER(token0)=? AND LOWER(token1)=? AND pair_flip=1 LIMIT 1")
-    .get(chainIdRef, t0, t1);
-  return !!posRow;
+  const anyPos = db
+    .prepare("SELECT pair_flip FROM positions WHERE chain_id_ref=? AND LOWER(token0)=? AND LOWER(token1)=? ORDER BY id DESC LIMIT 1")
+    .get(chainIdRef, t0, t1) as { pair_flip: number } | undefined;
+  if (anyPos) return anyPos.pair_flip === 1;
+
+  // 首次遇到的新池：若底层 token0 为稳定币且 token1 为不稳定币，默认自动翻转为「不稳定币/稳定币」
+  const s0 =
+    sym0 ||
+    (db
+      .prepare("SELECT symbol FROM tokens WHERE chain_id_ref=? AND LOWER(address)=? LIMIT 1")
+      .get(chainIdRef, t0) as { symbol?: string } | undefined)?.symbol ||
+    "";
+  const s1 =
+    sym1 ||
+    (db
+      .prepare("SELECT symbol FROM tokens WHERE chain_id_ref=? AND LOWER(address)=? LIMIT 1")
+      .get(chainIdRef, t1) as { symbol?: string } | undefined)?.symbol ||
+    "";
+  if (shouldAutoFlipPair(s0, s1)) {
+    db.prepare(
+      "INSERT OR IGNORE INTO pair_flips (chain_id_ref, dex_name, token0, token1) VALUES (?,?,?,?)"
+    ).run(chainIdRef, "", t0, t1);
+    return true;
+  }
+  return false;
 }
 
 /**

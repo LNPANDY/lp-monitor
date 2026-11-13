@@ -340,7 +340,7 @@ async function processSinglePosition(
     if (shouldPush(position.id, alertType, alertType)) {
       const dp = makeDp(position);
       const w = makeWalletRow(position);
-      const n = buildNotification(w, chain.name, dexes.find(d => d.id === position.dex_id)?.name ?? "", dp, makeReadResult(position, status), position.token0_symbol, position.token1_symbol, effectiveFlip, status.price0Human);
+      const n = buildNotification(w, chain.name, dexes.find(d => d.id === position.dex_id)?.name ?? "", dp, makeReadResult(position, status), position.token0_symbol, position.token1_symbol, effectiveFlip, status.price0Human, alertType);
       await sendAndRecord(position, chain, dexes, alertType, n, summary, status.currentTick, alertType);
     }
   }

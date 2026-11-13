@@ -89,10 +89,11 @@ function buildFavCexNotification(opts: {
   const name = label || pairLabel;
   const dexRate = flipped ? 1 / payload.dexRate : payload.dexRate;
   const cexRate = flipped ? 1 / payload.cexRate : payload.cexRate;
+  const displayDiff = cexRate > 0 ? (dexRate - cexRate) / cexRate : payload.diff;
   const cexSym0 = flipped ? payload.token1CexSymbol : payload.token0CexSymbol;
   const cexSym1 = flipped ? payload.token0CexSymbol : payload.token1CexSymbol;
-  const pct = (payload.absDiff * 100).toFixed(2);
-  const direction = payload.diff > 0 ? "DEX 高于 CEX" : "DEX 低于 CEX";
+  const pct = (Math.abs(displayDiff) * 100).toFixed(2);
+  const direction = displayDiff > 0 ? "DEX 高于 CEX" : "DEX 低于 CEX";
   // 报价跟随换侧：展示顺序与 label0/label1 对应
   const q0Raw = flipped ? cexQuote1 : cexQuote0;
   const q1Raw = flipped ? cexQuote0 : cexQuote1;

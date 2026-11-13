@@ -27,6 +27,11 @@ import {
   MAX_UINT256,
 } from "@/lib/wallet/build-mint";
 import { getAmountsForLiquidity, tickToSqrtPriceX96 } from "@/lib/v3/math";
+import {
+  inferDisplayTokenDecimals,
+  tickToDisplayPrice,
+  ticksToDisplayPriceRange,
+} from "@/lib/v3/display-orientation";
 import type { PoolRewardRadarItem } from "@/app/page";
 import type { LivePairCexAnalysis, UseBinanceRealtimeReturn } from "@/lib/cex/use-binance-ws";
 
@@ -781,11 +786,19 @@ export function MintPositionPanel({
   const isFlipped = data?.pairFlip === 1;
   const sym0 = data?.pool?.token0Symbol || "token0";
   const sym1 = data?.pool?.token1Symbol || "token1";
-  const displayPair = data
-    ? isFlipped
-      ? `${sym1}/${sym0}`
-      : `${sym0}/${sym1}`
-    : "";
+  const baseSym = isFlipped ? sym1 : sym0;
+  const quoteSym = isFlipped ? sym0 : sym1;
+  const poolDec0 = inferDisplayTokenDecimals(
+    data?.pool?.token0,
+    sym0,
+    data?.pool?.token0Decimals ?? poolRadar?.decimals0
+  );
+  const poolDec1 = inferDisplayTokenDecimals(
+    data?.pool?.token1,
+    sym1,
+    data?.pool?.token1Decimals ?? poolRadar?.decimals1
+  );
+  const displayPair = data ? `${baseSym}/${quoteSym}` : "";
   const displayPrice = data?.pool?.priceCurrent
     ? fmtFull(
         isFlipped && Number(data.pool.priceCurrent) > 0
@@ -793,6 +806,28 @@ export function MintPositionPanel({
           : Number(data.pool.priceCurrent)
       )
     : "";
+  const effTickLower =
+    tickLower !== "" && Number.isFinite(Number(tickLower))
+      ? Number(tickLower)
+      : data?.range?.tickLower;
+  const effTickUpper =
+    tickUpper !== "" && Number.isFinite(Number(tickUpper))
+      ? Number(tickUpper)
+      : data?.range?.tickUpper;
+  const selectedDisplayRange =
+    typeof effTickLower === "number" && typeof effTickUpper === "number"
+      ? ticksToDisplayPriceRange(
+          effTickLower,
+          effTickUpper,
+          poolDec0,
+          poolDec1,
+          isFlipped
+        )
+      : null;
+  const impliedCexDisplayPrice =
+    liveCex && Number.isFinite(liveCex.impliedTick)
+      ? tickToDisplayPrice(liveCex.impliedTick, poolDec0, poolDec1, isFlipped)
+      : "";
 
   // 解析实时 token0 / token1 USD 价格，供建仓收益模拟器与对比表使用
   const tokenPricesUsd = useMemo(() => {
@@ -1046,15 +1081,10 @@ export function MintPositionPanel({
           {/* 池子信息 + DEX 自动锁定 + 翻转同步 */}
           <div className="flex flex-wrap items-center gap-2 text-ink-soft">
             <span className="text-ink font-medium">
-              {displayPair} · fee {(data.pool.fee / 10000).toFixed(2)}% · ts{" "}
-              {data.pool.tickSpacing} · 当前 tick{" "}
-              <strong className="font-mono text-cyan-300">
-                {data.pool.currentTick}
-              </strong>
+              {displayPair} · 费率 {(data.pool.fee / 10000).toFixed(2)}%
               {displayPrice && (
-                <span className="ml-1.5 font-mono text-ink-soft">
-                  (1 {isFlipped ? sym1 : sym0} ≈ {displayPrice}{" "}
-                  {isFlipped ? sym0 : sym1})
+                <span className="ml-1.5 font-mono text-cyan-300">
+                  · 现价 1 {baseSym} ≈ {displayPrice} {quoteSym}
                 </span>
               )}
             </span>
@@ -1062,9 +1092,9 @@ export function MintPositionPanel({
               className="btn-ghost btn-xs"
               disabled={busy}
               onClick={() => refreshTick(rangeMode === "min")}
-              title="刷新最新链上 tick"
+              title="刷新最新链上现价与区间"
             >
-              ↻ 刷新 tick
+              ↻ 刷新现价
             </button>
             <button
               className={`btn-ghost btn-xs ${
@@ -1136,7 +1166,7 @@ export function MintPositionPanel({
                   ⚡ 模式 A：最小区间 (单格冲锋)
                 </div>
                 <div className="text-[10px] opacity-80">
-                  1 格 tickSpacing · 集中吃满 60% 活跃 L 奖池
+                  最小单格区间 · 集中吃满 60% 活跃 L 奖池
                 </div>
               </button>
 
@@ -1154,7 +1184,7 @@ export function MintPositionPanel({
                   🛡️ 模式 B：0 ~ 现价略高 (重U少主币)
                 </div>
                 <div className="text-[10px] opacity-80">
-                  98%+ 稳定币 + 少量 {isFlipped ? sym1 : sym0} · 下跌永不越界
+                  98%+ 稳定币 + 少量 {baseSym} · 下跌永不越界
                 </div>
               </button>
             </div>
@@ -1177,9 +1207,12 @@ export function MintPositionPanel({
                     disabled={busy}
                     onClick={() => applyMinWindowMode(true)}
                     className="btn-ghost btn-xs border border-amber-400/40 text-amber-200"
-                    title={`按币安实时隐含 Tick (${liveCex.impliedTick}) 对齐最小单格`}
+                    title={`按币安实时目标价 (≈ ${impliedCexDisplayPrice} ${quoteSym}) 对齐最小单格`}
                   >
-                    ⚡ 按币安实时价单格 (Tick {liveCex.impliedTick})
+                    ⚡ 按币安实时价单格
+                    {impliedCexDisplayPrice
+                      ? ` (≈ ${impliedCexDisplayPrice})`
+                      : ""}
                   </button>
                 )}
               </div>
@@ -1211,47 +1244,30 @@ export function MintPositionPanel({
                   ))}
                 </div>
                 <div className="text-[10.5px] text-amber-100/80">
-                  💡 <strong>重U少0G原理</strong>：下界锁定价格 0（Tick{" "}
-                  {!isFlipped ? "-887220" : "+887220"}），上界比现价高{" "}
+                  💡 <strong>防跌稳健原理</strong>：下界锁定价格 0，上界比现价高{" "}
                   {zeroAboveExtraTicks} 格。只需投入大量{" "}
                   <span className="font-mono font-semibold text-white">
-                    {!isFlipped ? sym1 : sym0}
+                    {quoteSym}
                   </span>{" "}
                   + 极少量{" "}
                   <span className="font-mono font-semibold text-white">
-                    {!isFlipped ? sym0 : sym1}
+                    {baseSym}
                   </span>
-                  ，既在区间内吃补贴，且主币下跌时永远不会向下越界！
+                  ，既在区间内吃补贴，且 {baseSym} 下跌时永远不会向下越界！
                 </div>
               </div>
             )}
 
-            {/* 精确 Tick 输入行 */}
-            <div className="flex flex-wrap items-center gap-1.5 pt-0.5">
-              <span className="text-ink-soft shrink-0">Tick 区间</span>
-              <input
-                className="input !w-[98px] px-2 py-1 font-mono"
-                value={tickLower}
-                onChange={(e) => setTickLower(e.target.value)}
-                placeholder="tickLower"
-              />
-              <span>~</span>
-              <input
-                className="input !w-[98px] px-2 py-1 font-mono"
-                value={tickUpper}
-                onChange={(e) => setTickUpper(e.target.value)}
-                placeholder="tickUpper"
-              />
-              <button
-                className="btn-ghost btn-xs"
-                disabled={busy}
-                onClick={() =>
-                  fetchPool({ withCompute: !!amount, withWallet: !!address })
-                }
-              >
-                应用区间
-              </button>
-            </div>
+            {/* 当前选定价格区间展示 */}
+            {selectedDisplayRange && (
+              <div className="flex flex-wrap items-center justify-between gap-2 rounded bg-surface-1/70 px-2.5 py-1.5 text-[11px]">
+                <span className="text-ink-soft">选定价格区间</span>
+                <span className="font-mono font-semibold text-cyan-200">
+                  {selectedDisplayRange.priceLow} ~{" "}
+                  {selectedDisplayRange.priceHigh} {quoteSym}
+                </span>
+              </div>
+            )}
           </div>
 
           {/* 金额输入（自动计算另一侧；若已翻转则主币排第一） */}
@@ -1515,6 +1531,17 @@ export function MintPositionPanel({
                         const isRowActive =
                           Number(tickLower) === row.sim.tl &&
                           Number(tickUpper) === row.sim.tu;
+                        const rowRange = ticksToDisplayPriceRange(
+                          row.sim.tl,
+                          row.sim.tu,
+                          poolDec0,
+                          poolDec1,
+                          isFlipped
+                        );
+                        const baseAmt = isFlipped ? row.sim.amt1 : row.sim.amt0;
+                        const basePct = isFlipped ? row.sim.pct1 : row.sim.pct0;
+                        const quoteAmt = isFlipped ? row.sim.amt0 : row.sim.amt1;
+                        const quotePct = isFlipped ? row.sim.pct0 : row.sim.pct1;
                         return (
                           <tr
                             key={row.id}
@@ -1534,17 +1561,18 @@ export function MintPositionPanel({
                             <td className="px-2 py-1 font-sans">
                               <div className="font-semibold">{row.title}</div>
                               <div className="text-[9.5px] text-ink-soft">
-                                [{row.sim.tl}, {row.sim.tu}] · {row.badge}
+                                {rowRange.priceLow} ~ {rowRange.priceHigh} ·{" "}
+                                {row.badge}
                               </div>
                             </td>
                             <td className="px-2 py-1">
                               <div>
-                                {sym0}: {fmtTokenAmount(row.sim.amt0)} (
-                                {row.sim.pct0.toFixed(0)}%)
+                                {baseSym}: {fmtTokenAmount(baseAmt)} (
+                                {basePct.toFixed(0)}%)
                               </div>
                               <div className="text-cyan-200">
-                                {sym1}: {fmtTokenAmount(row.sim.amt1)} (
-                                {row.sim.pct1.toFixed(0)}%)
+                                {quoteSym}: {fmtTokenAmount(quoteAmt)} (
+                                {quotePct.toFixed(0)}%)
                               </div>
                             </td>
                             <td className="px-2 py-1 text-emerald-300 font-semibold">

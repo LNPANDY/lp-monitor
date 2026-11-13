@@ -33,7 +33,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
                   PRO V3/V4
                 </span>
                 <span className="rounded border border-cyan-400/30 bg-cyan-500/15 px-1.5 py-0.5 font-mono text-[10px] font-semibold text-cyan-200">
-                  v0.22.2
+                  v0.22.3
                 </span>
               </div>
             </Link>
