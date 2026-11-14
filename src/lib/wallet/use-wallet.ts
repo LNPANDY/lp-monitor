@@ -14,7 +14,13 @@
  * 全部写交易由用户在钱包里手动确认（provider 会弹窗），本应用不持有私钥。
  */
 import { useEffect, useState, useCallback, useSyncExternalStore } from "react";
-import { getInjectedProvider, detectWalletName, type EIP1193Provider } from "./provider";
+import {
+  getInjectedProvider,
+  detectWalletName,
+  hasRabbyInstalled,
+  type EIP1193Provider,
+  type WalletPreference,
+} from "./provider";
 
 type Status = "disconnected" | "connecting" | "connected";
 
@@ -35,6 +41,7 @@ const initialState: WalletState = {
 // ===== module-level 单例 =====
 let state: WalletState = initialState;
 let provider: EIP1193Provider | null = null;
+const boundProviders = new WeakSet<EIP1193Provider>();
 const listeners = new Set<() => void>();
 
 function setState(patch: Partial<WalletState>) {
@@ -53,11 +60,15 @@ function getSnapshot() {
 
 /** 绑定 provider 事件，自动同步账户/链变化。 */
 function bindProviderEvents(p: EIP1193Provider) {
+  if (boundProviders.has(p)) return;
+  boundProviders.add(p);
   p.on?.("accountsChanged", (accounts: string[]) => {
+    if (provider !== p) return;
     const addr = accounts?.[0] ?? null;
     setState({ address: addr, status: addr ? "connected" : "disconnected" });
   });
   p.on?.("chainChanged", (chainIdHex: string) => {
+    if (provider !== p) return;
     setState({ chainId: hexToChainId(chainIdHex) });
   });
 }
@@ -68,7 +79,12 @@ function hexToChainId(hex: string): number {
 
 /** 初始化：尝试用已授权账户静默恢复（用户之前连过则不弹窗）。 */
 async function tryEagerConnect() {
-  const p = getInjectedProvider();
+  let pref: WalletPreference = "auto";
+  try {
+    const saved = window.localStorage.getItem("lp_wallet_pref");
+    if (saved === "rabby" || saved === "okx") pref = saved;
+  } catch {}
+  const p = getInjectedProvider(pref);
   if (!p) return;
   provider = p;
   bindProviderEvents(p);
@@ -98,20 +114,26 @@ if (typeof window !== "undefined") {
   }
 }
 
-/** 触发连接（会弹钱包授权窗）。返回连接成功的钱包地址。 */
-async function connect(): Promise<string | null> {
-  const p = getInjectedProvider();
+/** 触发连接（会弹钱包授权窗）。支持指定钱包偏好（如 "rabby"）。 */
+async function connect(pref: WalletPreference = "auto"): Promise<string | null> {
+  const p = getInjectedProvider(pref);
   if (!p) {
     const name = detectWalletName();
     setState({
-      error: name
-        ? `检测到 ${name} 但无法连接，请检查钱包扩展`
-        : "未检测到钱包扩展，请先安装 OKX 钱包或 MetaMask",
+      error:
+        pref === "rabby"
+          ? "未检测到 Rabby 钱包扩展，请确认浏览器已启用 Rabby"
+          : name
+            ? `检测到 ${name} 但无法连接，请检查钱包扩展`
+            : "未检测到钱包扩展，请先安装 Rabby / OKX / MetaMask",
     });
     return null;
   }
   provider = p;
   bindProviderEvents(p);
+  try {
+    window.localStorage.setItem("lp_wallet_pref", pref);
+  } catch {}
   setState({ status: "connecting", error: "" });
   try {
     const accounts = (await p.request({ method: "eth_requestAccounts" })) as string[];
@@ -517,8 +539,16 @@ export async function verifyNftPoolMatch(
 export function useWallet() {
   // useSyncExternalStore 保证多组件状态一致 + 避免 tearing
   const syncState = useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
+  const [hasRabby, setHasRabby] = useState(false);
 
-  const doConnect = useCallback(() => connect(), []);
+  useEffect(() => {
+    setHasRabby(hasRabbyInstalled());
+    const t = setTimeout(() => setHasRabby(hasRabbyInstalled()), 500);
+    return () => clearTimeout(t);
+  }, []);
+
+  const doConnect = useCallback(() => connect("auto"), []);
+  const doConnectRabby = useCallback(() => connect("rabby"), []);
   const doDisconnect = useCallback(() => disconnect(), []);
   const doSwitchChain = useCallback(
     (id: number, params?: Parameters<typeof switchChain>[1]) => switchChain(id, params),
@@ -536,11 +566,14 @@ export function useWallet() {
     chainId: syncState.chainId,
     status: syncState.status,
     error: syncState.error,
-    walletName: detectWalletName(),
+    walletName: detectWalletName(provider),
+    hasRabby,
     connect: doConnect,
+    connectRabby: doConnectRabby,
     disconnect: doDisconnect,
     switchChain: doSwitchChain,
     sendTx: doSendTx,
     sendTxWithRetry: doSendTxWithRetry,
   };
 }
+

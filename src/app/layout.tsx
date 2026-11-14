@@ -45,6 +45,12 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
                 主控终端
               </Link>
               <Link
+                href="/vault"
+                className="rounded-lg px-3 py-1.5 font-medium text-cyan-200 transition hover:bg-cyan-500/15 hover:text-white"
+              >
+                X Layer 金库
+              </Link>
+              <Link
                 href="/alerts"
                 className="rounded-lg px-3 py-1.5 font-medium text-slate-300 transition hover:bg-white/[0.06] hover:text-white"
               >

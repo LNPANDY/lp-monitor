@@ -103,8 +103,8 @@
 ## 六、 待办事项（TODO）
 
 - [x] **全站涨跌与上下界口径统一 + 移除界面原始 Tick 展示**：基于 `pair_flip` 与「不稳定币 / 稳定币」计价口径（新增 [`display-orientation.ts`](src/lib/v3/display-orientation.ts)），全面统一仓位卡片、双指针进度条、探针、建仓面板、Merkl 雷达及全部告警推送的正负号与涨跌/上下界描述，并将界面及推送中的原始 Tick 数值全部替换为换算后的实际价格展示。
-- [ ] **安装 `modern-web-guidance` Skill + `lp-monitor` UI 整体重塑**：
-  1. 稍后安装接入 [`GoogleChrome/modern-web-guidance`](https://github.com/GoogleChrome/modern-web-guidance) Skill（现代原生 `<dialog>` / Popover、过渡动画、容器查询、`content-visibility` 等规范）。
-  2. **先产出 UI 重塑效果图供确认**，待视觉方案敲定后再对主控台、仓位卡片、探针与建仓/Swap 面板进行整体改版落地。
-- [ ] **小资金安全托管钱包体系（方案 B）**：按第三章蓝图实施 AES-256-GCM 托管子钱包、主钱包死锁归集与交易白名单防火墙。
+- [ ] **UI 整体重塑（已定型方案 B2 · 瑞士精工分割线紧凑版）**：
+  1. 已安装接入 `modern-web-guidance` Skill（遵循高对比度、原生 `color-scheme` 日光/夜间自适应与降噪排版规范）。
+  2. 已敲定 **B2 方向**：`100%` 全量监控与建仓字段零删减、移除托管钱包设计（仅保留浏览器钱包）、采用 `1px` 横竖分割线网格替代卡片内多层套框以提升同屏密度（待用户指令时开始落地修改源码）。
+- [ ] **小资金安全托管钱包体系（方案 B · 暂缓）**：待用户明确开启后再按第三章蓝图实施。
 
