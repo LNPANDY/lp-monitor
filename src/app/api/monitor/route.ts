@@ -18,6 +18,10 @@ import {
   getLastMerklRewardsSummary,
   scanMerklRewardsAndApr,
 } from "@/lib/monitor/merkl-rewards";
+import {
+  getLastZiaIncentiveSummary,
+  scanZiaIncentiveWatcher,
+} from "@/lib/monitor/zia-incentive-watcher";
 import { ok, fail, getBody } from "@/lib/api";
 
 export const dynamic = "force-dynamic";
@@ -34,6 +38,10 @@ export async function GET() {
   if (!merklRewards) {
     scanMerklRewardsAndApr().catch(() => {});
   }
+  let ziaIncentive = getLastZiaIncentiveSummary();
+  if (!ziaIncentive) {
+    scanZiaIncentiveWatcher().catch(() => {});
+  }
   return ok({
     combinedRunning: isCombinedRunning(),
     fullRunning: isFullRunning(),
@@ -43,6 +51,7 @@ export async function GET() {
     lastFull: lastFullScanSummary(),
     stakingSecurity,
     merklRewards,
+    ziaIncentive,
   });
 }
 

@@ -29,6 +29,11 @@ import {
   getLastMerklRewardsSummary,
   type MerklRewardsSummary,
 } from "./merkl-rewards";
+import {
+  scanZiaIncentiveWatcher,
+  getLastZiaIncentiveSummary,
+  type ZiaIncentiveWatcherSummary,
+} from "./zia-incentive-watcher";
 import { getScanCron } from "../db/settings";
 import { getSetting, setSetting } from "../db/settings";
 
@@ -38,6 +43,7 @@ export interface CombinedScanSummary {
   favPools?: FavPoolScanSummary;      // 收藏池监控（Step 1.5，失败时缺省）
   stakingSecurity?: StakingSecuritySummary; // 质押合约安全哨兵（Step 1.8）
   merklRewards?: MerklRewardsSummary; // Merkl 质押奖励与高 APR 猎手（Step 1.9）
+  ziaIncentive?: ZiaIncentiveWatcherSummary; // Zia / 0G Merkl 新奖励抢跑哨兵
   known: KnownPositionsSummary | null; // 同上
   startedAt: string;
   durationMs: number;
@@ -226,6 +232,7 @@ async function runCombinedScanWrapper(opts?: { forceFullInventory?: boolean }) {
   let favPoolsSummary: FavPoolScanSummary | null = null;
   let stakingSecSummary: StakingSecuritySummary | null = null;
   let merklRewardsSummary: MerklRewardsSummary | null = null;
+  let ziaIncentiveSummary: ZiaIncentiveWatcherSummary | null = null;
   let knownSummary: KnownPositionsSummary | null = null;
   let combinedError: string | undefined;
 
@@ -241,11 +248,12 @@ async function runCombinedScanWrapper(opts?: { forceFullInventory?: boolean }) {
     s.hasFastScanFirstDone = true;
     console.log(`[scheduler-enhanced] discover done: new=${fastSummary.newInserted} source_changed=${fastSummary.sourceChanged} closed=${fastSummary.closed} (${Date.now()-tFast0}ms)`);
 
-    // ===== Step 1.5: 收藏池监控 & 质押合约安全哨兵（并行执行，独立容错）=====
+    // ===== Step 1.5: 收藏池监控 & 质押合约安全哨兵 & Zia/0G 新激励哨兵（并行执行，独立容错）=====
     const tFav0 = Date.now();
-    const [favRes, secRes] = await Promise.allSettled([
+    const [favRes, secRes, ziaRes] = await Promise.allSettled([
       scanFavoritePools(),
       scanStakingSecurity(),
+      scanZiaIncentiveWatcher(),
     ]);
     if (favRes.status === "fulfilled") {
       favPoolsSummary = favRes.value;
@@ -258,6 +266,14 @@ async function runCombinedScanWrapper(opts?: { forceFullInventory?: boolean }) {
       console.log(`[scheduler-enhanced] staking security done: status=${stakingSecSummary.status} contracts=${stakingSecSummary.checkedContracts} anomalies=${stakingSecSummary.anomalies.length} (${stakingSecSummary.durationMs}ms)`);
     } else {
       console.error("[scheduler-enhanced] staking security scan failed:", secRes.reason);
+    }
+    if (ziaRes.status === "fulfilled") {
+      ziaIncentiveSummary = ziaRes.value;
+      if (ziaIncentiveSummary.events.length > 0 || ziaIncentiveSummary.error) {
+        console.log(`[scheduler-enhanced] zia watcher: live=${ziaIncentiveSummary.liveOpportunities.length} soon=${ziaIncentiveSummary.soonOpportunities.length} alerts=${ziaIncentiveSummary.alertsSent} events=[${ziaIncentiveSummary.events.join(" | ")}]${ziaIncentiveSummary.error ? ` err=${ziaIncentiveSummary.error}` : ""} (${ziaIncentiveSummary.durationMs}ms)`);
+      }
+    } else {
+      console.error("[scheduler-enhanced] zia watcher failed:", ziaRes.reason);
     }
 
     // ===== Step 2: known scan (批量 slot0 + 8 路并发) =====
@@ -285,6 +301,7 @@ async function runCombinedScanWrapper(opts?: { forceFullInventory?: boolean }) {
     favPools: favPoolsSummary ?? undefined,
     stakingSecurity: stakingSecSummary ?? getLastStakingSecuritySummary() ?? undefined,
     merklRewards: merklRewardsSummary ?? getLastMerklRewardsSummary() ?? undefined,
+    ziaIncentive: ziaIncentiveSummary ?? getLastZiaIncentiveSummary() ?? undefined,
     known: knownSummary,
     startedAt: new Date(startedAt).toISOString(),
     durationMs: Date.now() - startedAt,
