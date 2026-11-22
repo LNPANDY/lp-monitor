@@ -31,10 +31,18 @@ else
   echo "==> 依赖无变化，跳过安装"
 fi
 
-# 2. 构建（next build 必须每次跑，因为源码可能变了）
-#    静默 lint/info 类输出，只保留关键信息。
-echo "==> 构建..."
-npm run build 2>&1 | grep -v -E "^$" | tail -40
+# 2. 构建（服务器部署默认走 build:fast：跳过已在开发端验证过的 tsc/eslint，保留 .next/cache 增量缓存）
+#    如需在服务器也强制做完整类型检查，可执行 FULL_BUILD=1 bash deploy/update.sh
+BUILD_START=$(date +%s)
+if [ "${FULL_BUILD:-0}" = "1" ]; then
+  echo "==> 完整构建（含 tsc + eslint）..."
+  NEXT_TELEMETRY_DISABLED=1 npm run build 2>&1 | grep -v -E "^$" | tail -40
+else
+  echo "==> 快速构建（跳过重复 tsc/eslint，保留增量缓存）..."
+  npm run build:fast 2>&1 | grep -v -E "^$" | tail -40
+fi
+BUILD_ELAPSED=$(( $(date +%s) - BUILD_START ))
+echo "==> 构建完成，耗时 ${BUILD_ELAPSED}s"
 
 # 3. 安装/更新 systemd 服务
 SERVICE_SRC="$ROOT/deploy/lp-monitor.service"

@@ -5,6 +5,7 @@
   "scripts": {
     "dev": "next dev",
     "build": "next build",
+    "build:fast": "NEXT_TELEMETRY_DISABLED=1 SKIP_BUILD_CHECKS=1 next build",
     "start": "next start",
     "lint": "next lint",
     "scan": "node --loader ts-node/esm src/lib/monitor/run-once.ts",
