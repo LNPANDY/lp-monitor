@@ -34,6 +34,7 @@ import {
   getLastZiaIncentiveSummary,
   type ZiaIncentiveWatcherSummary,
 } from "./zia-incentive-watcher";
+import { ZIA_FEATURES_ENABLED } from "../config/features";
 import { getScanCron } from "../db/settings";
 import { getSetting, setSetting } from "../db/settings";
 
@@ -248,12 +249,12 @@ async function runCombinedScanWrapper(opts?: { forceFullInventory?: boolean }) {
     s.hasFastScanFirstDone = true;
     console.log(`[scheduler-enhanced] discover done: new=${fastSummary.newInserted} source_changed=${fastSummary.sourceChanged} closed=${fastSummary.closed} (${Date.now()-tFast0}ms)`);
 
-    // ===== Step 1.5: 收藏池监控 & 质押合约安全哨兵 & Zia/0G 新激励哨兵（并行执行，独立容错）=====
+    // ===== Step 1.5: 收藏池监控（以及可选的 ZIA 质押安全/新激励哨兵）=====
     const tFav0 = Date.now();
     const [favRes, secRes, ziaRes] = await Promise.allSettled([
       scanFavoritePools(),
-      scanStakingSecurity(),
-      scanZiaIncentiveWatcher(),
+      ZIA_FEATURES_ENABLED ? scanStakingSecurity() : Promise.resolve(null),
+      ZIA_FEATURES_ENABLED ? scanZiaIncentiveWatcher() : Promise.resolve(null),
     ]);
     if (favRes.status === "fulfilled") {
       favPoolsSummary = favRes.value;
@@ -261,19 +262,21 @@ async function runCombinedScanWrapper(opts?: { forceFullInventory?: boolean }) {
     } else {
       console.error("[scheduler-enhanced] fav pools scan failed:", favRes.reason);
     }
-    if (secRes.status === "fulfilled") {
-      stakingSecSummary = secRes.value;
-      console.log(`[scheduler-enhanced] staking security done: status=${stakingSecSummary.status} contracts=${stakingSecSummary.checkedContracts} anomalies=${stakingSecSummary.anomalies.length} (${stakingSecSummary.durationMs}ms)`);
-    } else {
-      console.error("[scheduler-enhanced] staking security scan failed:", secRes.reason);
-    }
-    if (ziaRes.status === "fulfilled") {
-      ziaIncentiveSummary = ziaRes.value;
-      if (ziaIncentiveSummary.events.length > 0 || ziaIncentiveSummary.error) {
-        console.log(`[scheduler-enhanced] zia watcher: live=${ziaIncentiveSummary.liveOpportunities.length} soon=${ziaIncentiveSummary.soonOpportunities.length} alerts=${ziaIncentiveSummary.alertsSent} events=[${ziaIncentiveSummary.events.join(" | ")}]${ziaIncentiveSummary.error ? ` err=${ziaIncentiveSummary.error}` : ""} (${ziaIncentiveSummary.durationMs}ms)`);
+    if (ZIA_FEATURES_ENABLED) {
+      if (secRes.status === "fulfilled" && secRes.value) {
+        stakingSecSummary = secRes.value;
+        console.log(`[scheduler-enhanced] staking security done: status=${stakingSecSummary.status} contracts=${stakingSecSummary.checkedContracts} anomalies=${stakingSecSummary.anomalies.length} (${stakingSecSummary.durationMs}ms)`);
+      } else if (secRes.status === "rejected") {
+        console.error("[scheduler-enhanced] staking security scan failed:", secRes.reason);
       }
-    } else {
-      console.error("[scheduler-enhanced] zia watcher failed:", ziaRes.reason);
+      if (ziaRes.status === "fulfilled" && ziaRes.value) {
+        ziaIncentiveSummary = ziaRes.value;
+        if (ziaIncentiveSummary.events.length > 0 || ziaIncentiveSummary.error) {
+          console.log(`[scheduler-enhanced] zia watcher: live=${ziaIncentiveSummary.liveOpportunities.length} soon=${ziaIncentiveSummary.soonOpportunities.length} alerts=${ziaIncentiveSummary.alertsSent} events=[${ziaIncentiveSummary.events.join(" | ")}]${ziaIncentiveSummary.error ? ` err=${ziaIncentiveSummary.error}` : ""} (${ziaIncentiveSummary.durationMs}ms)`);
+        }
+      } else if (ziaRes.status === "rejected") {
+        console.error("[scheduler-enhanced] zia watcher failed:", ziaRes.reason);
+      }
     }
 
     // ===== Step 2: known scan (批量 slot0 + 8 路并发) =====
@@ -281,12 +284,14 @@ async function runCombinedScanWrapper(opts?: { forceFullInventory?: boolean }) {
     knownSummary = await scanKnownPositions();
     console.log(`[scheduler-enhanced] known scan done: ${knownSummary.positions} positions, ${knownSummary.active} active, ${knownSummary.alertsSent} alerts, (${Date.now()-tKnown0}ms)`);
 
-    // ===== Step 2.5: Merkl 质押奖励估算 & 高 APR 机会猎手（在 known scan 更新完仓位后执行）=====
-    try {
-      merklRewardsSummary = await scanMerklRewardsAndApr();
-      console.log(`[scheduler-enhanced] merkl rewards done: userDaily=${merklRewardsSummary.userTotalDailyW0g.toFixed(1)}W0G ($${merklRewardsSummary.userTotalDailyUsd.toFixed(2)}) highAprPools=${merklRewardsSummary.highAprPoolsCount} (${merklRewardsSummary.durationMs}ms)`);
-    } catch (e) {
-      console.error("[scheduler-enhanced] merkl rewards scan failed:", e);
+    // ===== Step 2.5: Merkl 质押奖励估算 & 高 APR 机会猎手（仅在 ZIA 开关启用时执行）=====
+    if (ZIA_FEATURES_ENABLED) {
+      try {
+        merklRewardsSummary = await scanMerklRewardsAndApr();
+        console.log(`[scheduler-enhanced] merkl rewards done: userDaily=${merklRewardsSummary.userTotalDailyW0g.toFixed(1)}W0G ($${merklRewardsSummary.userTotalDailyUsd.toFixed(2)}) highAprPools=${merklRewardsSummary.highAprPoolsCount} (${merklRewardsSummary.durationMs}ms)`);
+      } catch (e) {
+        console.error("[scheduler-enhanced] merkl rewards scan failed:", e);
+      }
     }
   } catch (e: any) {
     combinedError = e?.message ?? String(e);
@@ -299,9 +304,9 @@ async function runCombinedScanWrapper(opts?: { forceFullInventory?: boolean }) {
   const summary: CombinedScanSummary = {
     fast: fastSummary,
     favPools: favPoolsSummary ?? undefined,
-    stakingSecurity: stakingSecSummary ?? getLastStakingSecuritySummary() ?? undefined,
-    merklRewards: merklRewardsSummary ?? getLastMerklRewardsSummary() ?? undefined,
-    ziaIncentive: ziaIncentiveSummary ?? getLastZiaIncentiveSummary() ?? undefined,
+    stakingSecurity: ZIA_FEATURES_ENABLED ? (stakingSecSummary ?? getLastStakingSecuritySummary() ?? undefined) : undefined,
+    merklRewards: ZIA_FEATURES_ENABLED ? (merklRewardsSummary ?? getLastMerklRewardsSummary() ?? undefined) : undefined,
+    ziaIncentive: ZIA_FEATURES_ENABLED ? (ziaIncentiveSummary ?? getLastZiaIncentiveSummary() ?? undefined) : undefined,
     known: knownSummary,
     startedAt: new Date(startedAt).toISOString(),
     durationMs: Date.now() - startedAt,

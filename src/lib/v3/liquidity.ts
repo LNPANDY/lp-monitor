@@ -442,6 +442,86 @@ export async function analyzeDirect(
   };
 }
 
+const V4_STATEVIEW_LIQ_ABI = [
+  {
+    name: "getSlot0",
+    type: "function",
+    stateMutability: "view",
+    inputs: [{ name: "poolId", type: "bytes32" }],
+    outputs: [
+      { name: "sqrtPriceX96", type: "uint160" },
+      { name: "tick", type: "int24" },
+      { name: "protocolFee", type: "uint24" },
+      { name: "lpFee", type: "uint24" },
+    ],
+  },
+  {
+    name: "getLiquidity",
+    type: "function",
+    stateMutability: "view",
+    inputs: [{ name: "poolId", type: "bytes32" }],
+    outputs: [{ name: "liquidity", type: "uint128" }],
+  },
+] as const;
+
+/**
+ * 场景A（Uniswap V4 专用）：通过 StateView.getSlot0(poolId) + getLiquidity(poolId)
+ * 计算全池当前活跃流动性在你区间内的等效双币数量 + 你的精确占比。
+ */
+export async function analyzeDirectV4(
+  client: PublicClient,
+  stateview: `0x${string}`,
+  poolId: `0x${string}`,
+  decimals0: number,
+  decimals1: number,
+  myLiquidity: bigint,
+  tickLower: number,
+  tickUpper: number,
+  symbol0: string,
+  symbol1: string
+): Promise<LiquidityResult> {
+  const [slot0, poolLiquidity] = await Promise.all([
+    client.readContract({
+      address: stateview,
+      abi: V4_STATEVIEW_LIQ_ABI,
+      functionName: "getSlot0",
+      args: [poolId],
+    }),
+    client.readContract({
+      address: stateview,
+      abi: V4_STATEVIEW_LIQ_ABI,
+      functionName: "getLiquidity",
+      args: [poolId],
+    }),
+  ]);
+  const sqrtPriceX96 = slot0[0] as bigint;
+  const currentTick = Number(slot0[1]);
+  const poolL = poolLiquidity as bigint;
+  const sqrtA = tickToSqrtPriceX96(tickLower);
+  const sqrtB = tickToSqrtPriceX96(tickUpper);
+
+  const total = getAmountsForLiquidity(sqrtPriceX96, sqrtA, sqrtB, poolL, decimals0, decimals1);
+  const mine = getAmountsForLiquidity(sqrtPriceX96, sqrtA, sqrtB, myLiquidity, decimals0, decimals1);
+  const inRange = currentTick >= tickLower && currentTick < tickUpper;
+  const share = inRange && poolL > 0n ? Number(myLiquidity) / Number(poolL) : 0;
+
+  return {
+    total,
+    mine,
+    share,
+    priceLow: tickToPriceDisplay(tickLower, decimals0, decimals1),
+    priceHigh: tickToPriceDisplay(tickUpper, decimals0, decimals1),
+    priceLabel: `${symbol0}/${symbol1}`,
+    currentTick,
+    tickLower,
+    tickUpper,
+    token0Symbol: symbol0,
+    token1Symbol: symbol1,
+    positionCount: 1,
+    sampledAt: new Date().toISOString(),
+  };
+}
+
 // ==================== 场景 B：已质押 ====================
 
 /**

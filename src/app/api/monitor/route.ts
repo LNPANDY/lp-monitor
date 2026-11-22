@@ -22,6 +22,7 @@ import {
   getLastZiaIncentiveSummary,
   scanZiaIncentiveWatcher,
 } from "@/lib/monitor/zia-incentive-watcher";
+import { ZIA_FEATURES_ENABLED } from "@/lib/config/features";
 import { ok, fail, getBody } from "@/lib/api";
 
 export const dynamic = "force-dynamic";
@@ -29,18 +30,23 @@ export const dynamic = "force-dynamic";
 /** 返回当前调度状态与上次扫描摘要。 */
 export async function GET() {
   ensureEnhancedScheduler();
-  let stakingSecurity = getLastStakingSecuritySummary();
-  if (!stakingSecurity) {
-    // 首次启动时尚未完成首轮扫描，异步触发一次快速质押安全检查
-    scanStakingSecurity().catch(() => {});
-  }
-  let merklRewards = getLastMerklRewardsSummary();
-  if (!merklRewards) {
-    scanMerklRewardsAndApr().catch(() => {});
-  }
-  let ziaIncentive = getLastZiaIncentiveSummary();
-  if (!ziaIncentive) {
-    scanZiaIncentiveWatcher().catch(() => {});
+  let stakingSecurity = null;
+  let merklRewards = null;
+  let ziaIncentive = null;
+  if (ZIA_FEATURES_ENABLED) {
+    stakingSecurity = getLastStakingSecuritySummary();
+    if (!stakingSecurity) {
+      // 首次启动时尚未完成首轮扫描，异步触发一次快速质押安全检查
+      scanStakingSecurity().catch(() => {});
+    }
+    merklRewards = getLastMerklRewardsSummary();
+    if (!merklRewards) {
+      scanMerklRewardsAndApr().catch(() => {});
+    }
+    ziaIncentive = getLastZiaIncentiveSummary();
+    if (!ziaIncentive) {
+      scanZiaIncentiveWatcher().catch(() => {});
+    }
   }
   return ok({
     combinedRunning: isCombinedRunning(),

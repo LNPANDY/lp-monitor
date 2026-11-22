@@ -3,7 +3,7 @@ import { ok, fail } from "@/lib/api";
 import { getClient } from "@/lib/chains";
 import { resolveTokens } from "@/lib/chains/tokens";
 import { getDexe } from "@/lib/chains/dexes";
-import { analyzeDirect, analyzeStaked } from "@/lib/v3/liquidity";
+import { analyzeDirect, analyzeDirectV4, analyzeStaked } from "@/lib/v3/liquidity";
 import type { LiquidityResult } from "@/lib/v3/liquidity";
 
 export const dynamic = "force-dynamic";
@@ -29,9 +29,10 @@ interface PositionRow {
 }
 
 /**
- * 对单个仓位做流动性分析（场景A 直持 / 场景B 质押）。
+ * 对单个仓位做流动性分析（场景A 直持 V3/V4 / 场景B 质押）。
  */
 export async function POST(req: Request, { params }: { params: { id: string } }) {
+  try {
   const url = new URL(req.url);
   const force = url.searchParams.get("force") === "1";
   const db = getDb();
@@ -58,7 +59,7 @@ export async function POST(req: Request, { params }: { params: { id: string } })
     }
   }
 
-  if (!pos.pool) return fail("该仓位缺少 pool 地址，无法分析");
+  if (!pos.pool) return fail("该仓位缺少 pool 地址 / poolId，无法分析");
   const { client } = getClient(pos.chain_id_ref);
 
   // 2. decimals（用缓存表 + 必要时 RPC）
@@ -68,12 +69,34 @@ export async function POST(req: Request, { params }: { params: { id: string } })
   const sym0 = pos.token0_symbol || tokenMap.get(pos.token0.toLowerCase())?.symbol || pos.token0.slice(0, 8);
   const sym1 = pos.token1_symbol || tokenMap.get(pos.token1.toLowerCase())?.symbol || pos.token1.slice(0, 8);
   const myLiquidity = BigInt(pos.last_liquidity || "0");
+  let dex = pos.dex_id ? getDexe(pos.dex_id) : null;
+  if (!dex && /^0x[0-9a-fA-F]{64}$/.test(pos.pool)) {
+    const v4Row = db
+      .prepare("SELECT id FROM dexes WHERE chain_id_ref=? AND type='v4' ORDER BY enabled DESC LIMIT 1")
+      .get(pos.chain_id_ref) as { id: number } | undefined;
+    if (v4Row) dex = getDexe(v4Row.id);
+  }
 
-  // 3. 计算流动性
+  // 3. 计算流动性（支持 V4 StateView / V3 直持 / V3 质押）
   let result: LiquidityResult;
   try {
-    if (pos.source === "staking" && pos.staker_contract) {
-      const dex = pos.dex_id ? getDexe(pos.dex_id) : null;
+    if (dex?.type === "v4" || /^0x[0-9a-fA-F]{64}$/.test(pos.pool)) {
+      if (!dex?.stateview || !/^0x[0-9a-fA-F]{40}$/.test(dex.stateview)) {
+        return fail("该 V4 DEX 未配置 StateView 合约地址，无法分析流动性");
+      }
+      result = await analyzeDirectV4(
+        client,
+        dex.stateview as `0x${string}`,
+        pos.pool as `0x${string}`,
+        dec0,
+        dec1,
+        myLiquidity,
+        pos.tick_lower,
+        pos.tick_upper,
+        sym0,
+        sym1
+      );
+    } else if (pos.source === "staking" && pos.staker_contract) {
       if (!dex) return fail("该仓位缺少 DEX（npm）信息，无法分析质押流动性");
       result = await analyzeStaked(
         client,
@@ -143,4 +166,7 @@ export async function POST(req: Request, { params }: { params: { id: string } })
   );
 
   return ok({ ...result, pairFlip, cached: false });
+  } catch (e) {
+    return fail(`流动性分析异常：${(e as Error).message}`, 500);
+  }
 }

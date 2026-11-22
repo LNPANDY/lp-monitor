@@ -18,6 +18,8 @@ import {
   toDisplayPriceDiff,
 } from "@/lib/v3/display-orientation";
 import { useBinanceRealtime, type UseBinanceRealtimeReturn } from "@/lib/cex/use-binance-ws";
+import { ZIA_FEATURES_ENABLED } from "@/lib/config/features";
+import type { PositionFeeMetrics } from "@/lib/monitor/position-fees";
 
 /** 推送冷却可选值（分钟） */
 const COOLDOWN_OPTIONS = [0, 2, 5, 10, 20, 30, 60];
@@ -275,6 +277,8 @@ export interface PositionHoldingsInfo {
   sym1: string;
   amt0: number;
   amt1: number;
+  p0Usd: number;
+  p1Usd: number;
   usd0: number;
   usd1: number;
   totalUsd: number;
@@ -353,6 +357,8 @@ function computePositionHoldings(
     sym1,
     amt0,
     amt1,
+    p0Usd: p0Usd ?? 0,
+    p1Usd: p1Usd ?? 0,
     usd0,
     usd1,
     totalUsd,
@@ -384,15 +390,36 @@ export default function DashboardPage() {
     { refreshInterval: 10_000 }
   );
   const { data: merklDirect, mutate: reloadMerkl } = useSWR<MerklRewardsSummary>(
-    "/api/merkl-rewards",
+    ZIA_FEATURES_ENABLED ? "/api/merkl-rewards" : null,
     fetcher,
     { refreshInterval: 30_000 }
   );
+  const { data: positionFees, mutate: reloadPositionFees } = useSWR<
+    Record<number, PositionFeeMetrics>
+  >("/api/position-fees", fetcher, { refreshInterval: 60_000 });
   const { data: topAlertData } = useSWR<any>(
     "/api/alert-settings",
     fetcher,
     { refreshInterval: 30_000 }
   );
+
+  async function refreshPositionFees() {
+    const r = await fetch("/api/position-fees?force=1", { headers: authHeaders() });
+    const j = await r.json().catch(() => null);
+    if (j?.ok) reloadPositionFees(j.data, false);
+    else reloadPositionFees();
+  }
+
+  async function resetFeeSince(positionId: number) {
+    const r = await fetch("/api/position-fees", {
+      method: "POST",
+      headers: authHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({ action: "reset_since", positionId }),
+    });
+    const j = await r.json().catch(() => null);
+    if (j?.ok) reloadPositionFees(j.data, false);
+    else reloadPositionFees();
+  }
 
   const list = positions ?? [];
   const outOfRange = list.filter((p) => p.last_in_range === 0);
@@ -407,13 +434,15 @@ export default function DashboardPage() {
   const [merklBusy, setMerklBusy] = useState(false);
   const [aprThreshInput, setAprThreshInput] = useState<string>("");
 
-  const sec: MonitorState["stakingSecurity"] =
-    mon?.stakingSecurity ?? mon?.lastCombined?.stakingSecurity ?? null;
+  const sec: MonitorState["stakingSecurity"] = ZIA_FEATURES_ENABLED
+    ? mon?.stakingSecurity ?? mon?.lastCombined?.stakingSecurity ?? null
+    : null;
   const secAnomalies = sec?.anomalies ?? [];
   const hasSecAnomaly = secAnomalies.length > 0;
 
-  const merkl: MerklRewardsSummary | null =
-    merklDirect ?? mon?.merklRewards ?? mon?.lastCombined?.merklRewards ?? null;
+  const merkl: MerklRewardsSummary | null = ZIA_FEATURES_ENABLED
+    ? merklDirect ?? mon?.merklRewards ?? mon?.lastCombined?.merklRewards ?? null
+    : null;
 
   useEffect(() => {
     if (merkl && !aprThreshInput) {
@@ -488,16 +517,18 @@ export default function DashboardPage() {
     if (!j.ok) alert(j.error);
     reloadPos();
     reloadMon();
-    reloadMerkl();
+    reloadPositionFees();
+    if (ZIA_FEATURES_ENABLED) reloadMerkl();
     setTimeout(() => {
       reloadPos();
       reloadMon();
-      reloadMerkl();
+      reloadPositionFees();
+      if (ZIA_FEATURES_ENABLED) reloadMerkl();
     }, 3_000);
     setTimeout(() => {
       reloadPos();
       reloadMon();
-      reloadMerkl();
+      if (ZIA_FEATURES_ENABLED) reloadMerkl();
     }, 8_000);
   }
 
@@ -508,7 +539,7 @@ export default function DashboardPage() {
 
   return (
     <div className="space-y-4">
-      {/* 顶部极速状态控制条（单一极速扫描模式 + 质押合约安全异动哨兵 + Merkl 奖励与高 APR 雷达） */}
+      {/* 顶部极速状态控制条 */}
       <div className="card flex flex-wrap items-center justify-between gap-3 px-4 py-3">
         <div className="flex flex-wrap items-center gap-4">
           <Stat label="监控仓位" value={list.length} />
@@ -534,77 +565,81 @@ export default function DashboardPage() {
             )}
           </div>
 
-          {/* 顶部质押合约安全异动小提示（绿色小圆点 = 安全；红色脉冲 = 发现异动） */}
-          <button
-            type="button"
-            onClick={() => setShowSecurityDrawer((v) => !v)}
-            className={`inline-flex items-center gap-2 rounded-full border px-3 py-1 text-xs font-medium transition ${
-              hasSecAnomaly
-                ? "border-danger bg-danger/20 text-danger animate-pulse shadow-[0_0_12px_rgba(244,63,94,0.4)]"
-                : "border-emerald-500/35 bg-emerald-500/10 text-emerald-300 hover:bg-emerald-500/15"
-            }`}
-            title="点击查看 ZIA 质押合约安全状态（提取锁死开关 / withdraw 解押静态预演 / 管理员变更 / TVL 异动）"
-          >
-            <span
-              className={`inline-block h-2.5 w-2.5 rounded-full ${
-                hasSecAnomaly
-                  ? "bg-danger shadow-[0_0_8px_#f43f5e]"
-                  : "bg-emerald-400 shadow-[0_0_8px_#34d399]"
-              }`}
-            />
-            {hasSecAnomaly ? (
-              <span>
-                🚨 质押异动报警 ({secAnomalies.length})
-                {sec?.highFreqPushActive ? " · 高频推送中" : sec?.muted ? " · 已静音" : ""}
-              </span>
-            ) : (
-              <span>
-                质押安全
-                {sec && sec.checkedContracts > 0
-                  ? ` · ${sec.checkedContracts}池正常`
-                  : ""}
-                {sec && sec.simulatedPositions > 0
-                  ? ` · ${sec.simulatedPositions}仓解押预演通过`
-                  : ""}
-              </span>
-            )}
-            <span className="text-[10px] opacity-75">
-              {showSecurityDrawer ? "▲" : "▼"}
-            </span>
-          </button>
-
-          {/* 顶部 Merkl 质押总奖励 & 高 APR 猎手雷达胶囊 */}
-          <button
-            type="button"
-            onClick={() => setShowMerklDrawer((v) => !v)}
-            className={`inline-flex items-center gap-2 rounded-full border px-3 py-1 text-xs font-medium transition ${
-              merkl && merkl.highAprPoolsCount > 0
-                ? "border-amber-400/50 bg-amber-500/15 text-amber-200 hover:bg-amber-500/25 shadow-[0_0_10px_rgba(245,158,11,0.2)]"
-                : "border-cyan-500/35 bg-cyan-500/10 text-cyan-200 hover:bg-cyan-500/20"
-            }`}
-            title="点击展开 ZIA Merkl 质押奖励实时精算 & 全池高 APR 机会猎手雷达"
-          >
-            <span>
-              🎁 质押产出:{" "}
-              {merkl ? (
-                <span className="font-mono font-semibold text-white">
-                  ${merkl.userTotalHourlyUsd.toFixed(2)}/h · $
-                  {merkl.userTotalDailyUsd.toFixed(1)}/d ({merkl.userTotalDailyW0g.toFixed(0)} W0G)
+          {ZIA_FEATURES_ENABLED && (
+            <>
+              {/* 顶部质押合约安全异动小提示（绿色小圆点 = 安全；红色脉冲 = 发现异动） */}
+              <button
+                type="button"
+                onClick={() => setShowSecurityDrawer((v) => !v)}
+                className={`inline-flex items-center gap-2 rounded-full border px-3 py-1 text-xs font-medium transition ${
+                  hasSecAnomaly
+                    ? "border-danger bg-danger/20 text-danger animate-pulse shadow-[0_0_12px_rgba(244,63,94,0.4)]"
+                    : "border-emerald-500/35 bg-emerald-500/10 text-emerald-300 hover:bg-emerald-500/15"
+                }`}
+                title="点击查看 ZIA 质押合约安全状态（提取锁死开关 / withdraw 解押静态预演 / 管理员变更 / TVL 异动）"
+              >
+                <span
+                  className={`inline-block h-2.5 w-2.5 rounded-full ${
+                    hasSecAnomaly
+                      ? "bg-danger shadow-[0_0_8px_#f43f5e]"
+                      : "bg-emerald-400 shadow-[0_0_8px_#34d399]"
+                  }`}
+                />
+                {hasSecAnomaly ? (
+                  <span>
+                    🚨 质押异动报警 ({secAnomalies.length})
+                    {sec?.highFreqPushActive ? " · 高频推送中" : sec?.muted ? " · 已静音" : ""}
+                  </span>
+                ) : (
+                  <span>
+                    质押安全
+                    {sec && sec.checkedContracts > 0
+                      ? ` · ${sec.checkedContracts}池正常`
+                      : ""}
+                    {sec && sec.simulatedPositions > 0
+                      ? ` · ${sec.simulatedPositions}仓解押预演通过`
+                      : ""}
+                  </span>
+                )}
+                <span className="text-[10px] opacity-75">
+                  {showSecurityDrawer ? "▲" : "▼"}
                 </span>
-              ) : (
-                "测算中…"
-              )}
-            </span>
-            {merkl && merkl.pools.length > 0 && (
-              <span className="rounded bg-amber-500/25 px-1.5 py-0.5 font-mono text-[11px] text-amber-200 border border-amber-400/30">
-                🔥 最高池 {merkl.pools[0].pairLabel.split(" ")[0]}{" "}
-                {merkl.pools[0].sim1000AprPct.toFixed(0)}% APR
-              </span>
-            )}
-            <span className="text-[10px] opacity-75">
-              {showMerklDrawer ? "▲" : "▼"}
-            </span>
-          </button>
+              </button>
+
+              {/* 顶部 Merkl 质押总奖励 & 高 APR 猎手雷达胶囊 */}
+              <button
+                type="button"
+                onClick={() => setShowMerklDrawer((v) => !v)}
+                className={`inline-flex items-center gap-2 rounded-full border px-3 py-1 text-xs font-medium transition ${
+                  merkl && merkl.highAprPoolsCount > 0
+                    ? "border-amber-400/50 bg-amber-500/15 text-amber-200 hover:bg-amber-500/25 shadow-[0_0_10px_rgba(245,158,11,0.2)]"
+                    : "border-cyan-500/35 bg-cyan-500/10 text-cyan-200 hover:bg-cyan-500/20"
+                }`}
+                title="点击展开 ZIA Merkl 质押奖励实时精算 & 全池高 APR 机会猎手雷达"
+              >
+                <span>
+                  🎁 质押产出:{" "}
+                  {merkl ? (
+                    <span className="font-mono font-semibold text-white">
+                      ${merkl.userTotalHourlyUsd.toFixed(2)}/h · $
+                      {merkl.userTotalDailyUsd.toFixed(1)}/d ({merkl.userTotalDailyW0g.toFixed(0)} W0G)
+                    </span>
+                  ) : (
+                    "测算中…"
+                  )}
+                </span>
+                {merkl && merkl.pools.length > 0 && (
+                  <span className="rounded bg-amber-500/25 px-1.5 py-0.5 font-mono text-[11px] text-amber-200 border border-amber-400/30">
+                    🔥 最高池 {merkl.pools[0].pairLabel.split(" ")[0]}{" "}
+                    {merkl.pools[0].sim1000AprPct.toFixed(0)}% APR
+                  </span>
+                )}
+                <span className="text-[10px] opacity-75">
+                  {showMerklDrawer ? "▲" : "▼"}
+                </span>
+              </button>
+            </>
+          )}
         </div>
         <div className="flex flex-wrap items-center gap-2">
           <button
@@ -648,7 +683,7 @@ export default function DashboardPage() {
       </div>
 
       {/* 当发现质押异动时自动强制展开红色异动告警面板；平时点击顶部绿色小圆点可按需展开详情 */}
-      {(hasSecAnomaly || showSecurityDrawer) && (
+      {ZIA_FEATURES_ENABLED && (hasSecAnomaly || showSecurityDrawer) && (
         <div
           className={`card p-4 space-y-3 border ${
             hasSecAnomaly
@@ -860,8 +895,8 @@ export default function DashboardPage() {
         </div>
       )}
 
-      {/* Merkl 质押奖励精算 & 全池高 APR 机会猎手抽屉（点击顶部「🎁 质押产出」胶囊展开） */}
-      {showMerklDrawer && (
+      {/* Merkl 质押奖励精算 & 全池高 APR 机会猎手抽屉（仅 ZIA 开关开启时可用） */}
+      {ZIA_FEATURES_ENABLED && showMerklDrawer && (
         <div className="card p-4 space-y-3 border border-cyan-500/35 bg-surface-1/95">
           <div className="flex flex-wrap items-center justify-between gap-2">
             <div className="flex flex-wrap items-center gap-2">
@@ -1157,6 +1192,9 @@ export default function DashboardPage() {
                       merkl?.positions?.[`id:${p.id}`]
                     }
                     w0gPriceUsd={merkl?.w0gPriceUsd}
+                    feeMetrics={positionFees?.[p.id] ?? null}
+                    onRefreshFees={refreshPositionFees}
+                    onResetFeeSince={resetFeeSince}
                     binanceRt={binanceRt}
                     highlight
                     onFlipped={reloadPos}
@@ -1185,6 +1223,9 @@ export default function DashboardPage() {
                       merkl?.positions?.[`id:${p.id}`]
                     }
                     w0gPriceUsd={merkl?.w0gPriceUsd}
+                    feeMetrics={positionFees?.[p.id] ?? null}
+                    onRefreshFees={refreshPositionFees}
+                    onResetFeeSince={resetFeeSince}
                     binanceRt={binanceRt}
                     onFlipped={reloadPos}
                     onReopenPool={handleReopenPool}
@@ -2278,6 +2319,9 @@ function PositionCard({
   p,
   rewardEst,
   w0gPriceUsd,
+  feeMetrics,
+  onRefreshFees,
+  onResetFeeSince,
   binanceRt,
   highlight,
   closed,
@@ -2287,6 +2331,9 @@ function PositionCard({
   p: Position;
   rewardEst?: PositionRewardEstimate;
   w0gPriceUsd?: number;
+  feeMetrics?: PositionFeeMetrics | null;
+  onRefreshFees?: () => Promise<void> | void;
+  onResetFeeSince?: (positionId: number) => Promise<void> | void;
   binanceRt?: UseBinanceRealtimeReturn;
   highlight?: boolean;
   closed?: boolean;
@@ -2294,6 +2341,7 @@ function PositionCard({
   onReopenPool?: (chainId: number, pool: string) => void;
 }) {
   const { address: connectedWallet } = useWallet();
+  const [feeBusy, setFeeBusy] = useState(false);
   const inRange = p.last_in_range === 1;
   // 若 Merkl ZiaVault 扫描已发现该 tokenId 在质押金库内，即使 DB source 尚未刷完也立即识别为质押中
   const isStaked = p.source === "staking" || !!rewardEst;
@@ -2745,6 +2793,216 @@ function PositionCard({
             </div>
           </div>
         )}
+
+        {/* ==================== Module ③.5：实时链上手续费 & 真实收益精算（V4 + V3 通用） ==================== */}
+        {!closed && feeMetrics && !feeMetrics.error && (() => {
+          const p0Usd = holdings?.p0Usd ?? 0;
+          const p1Usd = holdings?.p1Usd ?? 0;
+          const principalUsd = holdings?.totalUsd ?? 0;
+          const fee0Usd = feeMetrics.fees0 * p0Usd;
+          const fee1Usd = feeMetrics.fees1 * p1Usd;
+          const uncollectedUsd = fee0Usd + fee1Usd;
+          const primFee = flip
+            ? { sym: sym1, amt: feeMetrics.fees1, usd: fee1Usd }
+            : { sym: sym0, amt: feeMetrics.fees0, usd: fee0Usd };
+          const secFee = flip
+            ? { sym: sym0, amt: feeMetrics.fees0, usd: fee0Usd }
+            : { sym: sym1, amt: feeMetrics.fees1, usd: fee1Usd };
+
+          // 区间集中倍数 M = 2 / (2 - sqrt(P/Pb) - sqrt(Pa/P))
+          let concMult: number | null = null;
+          if (inRange && p.tick_upper > p.tick_lower) {
+            const sqrtPaOverP = Math.pow(1.0001, (p.tick_lower - p.last_current_tick) / 2);
+            const sqrtPOverPb = Math.pow(1.0001, (p.last_current_tick - p.tick_upper) / 2);
+            const denom = 2 - sqrtPaOverP - sqrtPOverPb;
+            if (denom > 1e-6) concMult = 2 / denom;
+          }
+
+          // 已实现真实速度（运行 >= 5 分钟才推算年化，避免刚开仓 10 秒噪音放大）
+          const elapsedH = feeMetrics.elapsedHours;
+          const elapsedLabel =
+            elapsedH < 1
+              ? `${Math.max(1, Math.round(elapsedH * 60))}分钟`
+              : elapsedH < 48
+                ? `${elapsedH.toFixed(1)}小时`
+                : `${(elapsedH / 24).toFixed(1)}天`;
+          const realizedDailyUsd = elapsedH >= 0.08 ? (uncollectedUsd / elapsedH) * 24 : null;
+          const realizedAprPct =
+            realizedDailyUsd !== null && principalUsd > 0
+              ? (realizedDailyUsd * 365 / principalUsd) * 100
+              : null;
+
+          // 按池子 24h / 6h 成交量 × 费率 × 本仓 ActiveL 占比 推算的理论手续费产出
+          const estDailyUsd = feeMetrics.estDailyFeeUsd;
+          const estAprPct =
+            estDailyUsd !== null && principalUsd > 0
+              ? (estDailyUsd * 365 / principalUsd) * 100
+              : null;
+          const estDaily6hUsd = feeMetrics.estDailyFee6hUsd;
+          const estApr6hPct =
+            estDaily6hUsd !== null && principalUsd > 0
+              ? (estDaily6hUsd * 365 / principalUsd) * 100
+              : null;
+
+          const fmtFeeAmt = (v: number) => {
+            if (v <= 0) return "0";
+            if (v < 0.0001) return v.toFixed(6);
+            if (v < 0.01) return v.toFixed(5);
+            return fmtTokenAmount(v);
+          };
+
+          return (
+            <div className="my-1.5 rounded-lg border border-emerald-500/25 bg-emerald-500/[0.06] p-2.5 text-xs space-y-2">
+              <div className="flex flex-wrap items-center justify-between gap-1.5">
+                <span className="font-semibold text-ink">
+                  💸 实时手续费与真实收益{" "}
+                  <span className="font-mono text-emerald-300">
+                    (未领 ${uncollectedUsd < 1 ? uncollectedUsd.toFixed(3) : uncollectedUsd.toFixed(2)})
+                  </span>
+                </span>
+                <div className="flex items-center gap-1.5">
+                  {estAprPct !== null && (
+                    <span
+                      className={`rounded px-1.5 py-0.5 font-mono text-[11px] font-bold border ${
+                        inRange
+                          ? "bg-emerald-500/20 text-emerald-200 border-emerald-400/35"
+                          : "bg-rose-500/20 text-rose-300 border-rose-400/35"
+                      }`}
+                      title="按池子实时 24h 成交量 × 池费率 × 本仓活跃流动性占比推算的理论毛 APR"
+                    >
+                      {inRange ? `24h 理论 APR ${estAprPct.toFixed(1)}%` : "越界停产 0%"}
+                    </span>
+                  )}
+                  <button
+                    type="button"
+                    disabled={feeBusy}
+                    onClick={async () => {
+                      setFeeBusy(true);
+                      try { await onRefreshFees?.(); } finally { setFeeBusy(false); }
+                    }}
+                    className="rounded border border-white/10 bg-white/[0.04] px-1.5 py-0.5 text-[10px] text-ink-soft hover:text-ink hover:bg-white/[0.08]"
+                    title="强制从链上刷新最新未领手续费与成交量"
+                  >
+                    {feeBusy ? "…" : "⚡"}
+                  </button>
+                  <button
+                    type="button"
+                    disabled={feeBusy}
+                    onClick={async () => {
+                      if (!confirm("确认将当前时刻设为已实现手续费的重新计息起点？（适合领完手续费后点一次）")) return;
+                      setFeeBusy(true);
+                      try { await onResetFeeSince?.(p.id); } finally { setFeeBusy(false); }
+                    }}
+                    className="rounded border border-white/10 bg-white/[0.04] px-1.5 py-0.5 text-[10px] text-ink-soft hover:text-ink hover:bg-white/[0.08]"
+                    title="重置已实现 APR 的计息起点"
+                  >
+                    ↺
+                  </button>
+                </div>
+              </div>
+
+              {/* 1. 精确未领双币明细 */}
+              <div className="grid grid-cols-2 gap-1.5 font-mono text-[11px]">
+                <div className="flex items-center justify-between rounded bg-surface-0/70 px-2 py-1">
+                  <span className="text-emerald-300 font-semibold">{primFee.sym}</span>
+                  <span className="text-ink">
+                    {fmtFeeAmt(primFee.amt)}{" "}
+                    <span className="text-ink-soft">
+                      (${primFee.usd < 1 ? primFee.usd.toFixed(2) : primFee.usd.toFixed(1)})
+                    </span>
+                  </span>
+                </div>
+                <div className="flex items-center justify-between rounded bg-surface-0/70 px-2 py-1">
+                  <span className="text-cyan-300 font-semibold">{secFee.sym}</span>
+                  <span className="text-ink">
+                    {fmtFeeAmt(secFee.amt)}{" "}
+                    <span className="text-ink-soft">
+                      (${secFee.usd < 1 ? secFee.usd.toFixed(2) : secFee.usd.toFixed(1)})
+                    </span>
+                  </span>
+                </div>
+              </div>
+
+              {/* 2. 已实现真实收益 vs 24h/6h 实时理论收益 */}
+              <div className="grid grid-cols-2 gap-1.5 font-mono text-[11px]">
+                <div className="rounded border border-white/[0.07] bg-surface-0/60 px-2 py-1.5 space-y-0.5">
+                  <div className="font-sans text-[10px] text-ink-soft flex items-center justify-between">
+                    <span>📈 链上实测速度</span>
+                    <span>已跑 {elapsedLabel}</span>
+                  </div>
+                  {realizedDailyUsd !== null ? (
+                    <>
+                      <div className="text-emerald-300 font-semibold">
+                        ${realizedDailyUsd.toFixed(2)}/天{" "}
+                        <span className="text-[10px] font-normal text-ink-soft">
+                          (${(realizedDailyUsd / 24).toFixed(2)}/h)
+                        </span>
+                      </div>
+                      <div className="text-[10.5px] text-amber-200">
+                        实测 APR {realizedAprPct !== null ? `${realizedAprPct.toFixed(1)}%` : "—"}
+                      </div>
+                    </>
+                  ) : (
+                    <div className="text-[10.5px] text-ink-muted">
+                      建仓刚满 {elapsedLabel}，5 分钟后自动推算年化
+                    </div>
+                  )}
+                </div>
+
+                <div className="rounded border border-white/[0.07] bg-surface-0/60 px-2 py-1.5 space-y-0.5">
+                  <div className="font-sans text-[10px] text-ink-soft flex items-center justify-between">
+                    <span>🔥 池量理论产出</span>
+                    <span>
+                      {feeMetrics.poolVolume24hUsd !== null
+                        ? `24h $${(feeMetrics.poolVolume24hUsd / 1e6).toFixed(1)}M`
+                        : "—"}
+                    </span>
+                  </div>
+                  {estDailyUsd !== null ? (
+                    <>
+                      <div className="text-cyan-300 font-semibold">
+                        ${estDailyUsd.toFixed(2)}/天{" "}
+                        <span className="text-[10px] font-normal text-ink-soft">
+                          (月 ${(estDailyUsd * 30).toFixed(0)})
+                        </span>
+                      </div>
+                      <div className="text-[10.5px] text-ink-soft">
+                        {estApr6hPct !== null
+                          ? `近6h节奏 ${estApr6hPct.toFixed(1)}% ($${(estDaily6hUsd ?? 0).toFixed(1)}/d)`
+                          : `月化 ${(estAprPct ? estAprPct / 12 : 0).toFixed(1)}%`}
+                      </div>
+                    </>
+                  ) : (
+                    <div className="text-[10.5px] text-ink-muted">暂无池成交量数据</div>
+                  )}
+                </div>
+              </div>
+
+              {/* 3. 活跃池占比、集中倍数、含未领总价值 */}
+              <div className="flex flex-wrap items-center justify-between gap-1 text-[10.5px] font-mono text-ink-soft pt-0.5 border-t border-white/[0.06]">
+                <span>
+                  活跃池占比{" "}
+                  <span className="text-ink font-semibold">
+                    {(feeMetrics.activeLShare * 100).toFixed(4)}%
+                  </span>
+                  {concMult !== null && (
+                    <>
+                      {" "}· 集中 <span className="text-cyan-300">{concMult.toFixed(1)}x</span>
+                    </>
+                  )}
+                </span>
+                {principalUsd > 0 && (
+                  <span>
+                    本金+未领{" "}
+                    <span className="text-emerald-300 font-semibold">
+                      ${(principalUsd + uncollectedUsd).toFixed(2)}
+                    </span>
+                  </span>
+                )}
+              </div>
+            </div>
+          );
+        })()}
 
         {/* ==================== Module ④：Merkl 50/25/25 三桶得分明细 & 越界重开磨损回本测算 ==================== */}
         {!closed && isStaked && rewardEst && (
