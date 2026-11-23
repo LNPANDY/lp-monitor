@@ -25,6 +25,12 @@ import { getDb } from "../db";
 import { getClient } from "../chains";
 import { resolveTokens } from "../chains/tokens";
 import { getSetting, setSetting } from "../db/settings";
+import { getAmountsForLiquidity, tickToSqrtPriceX96 } from "../v3/math";
+import {
+  ensurePositionCostBasis,
+  recordFallbackClaimedFees,
+  type PositionCostBasis,
+} from "./position-pnl";
 
 const Q128 = 1n << 128n;
 const MASK256 = (1n << 256n) - 1n;
@@ -92,6 +98,8 @@ export interface PositionFeeMetrics {
   feeSinceMs: number;
   /** 已运行小时数 */
   elapsedHours: number;
+  /** 真实开仓成本与累计已领手续费台账（链上自动追溯 / 快照 / 手动校准） */
+  costBasis: PositionCostBasis | null;
   updatedAt: string;
   error?: string;
 }
@@ -119,6 +127,11 @@ function getCache(): FeeCacheGlobal {
     g[GLOBAL_FEE_KEY] = { map: {}, fetchedAt: 0, volCache: {} } as FeeCacheGlobal;
   }
   return g[GLOBAL_FEE_KEY] as FeeCacheGlobal;
+}
+
+export function invalidatePositionFeesCache(): void {
+  const cache = getCache();
+  cache.fetchedAt = 0;
 }
 
 function parseSqliteUtcMs(s?: string | null): number {
@@ -155,8 +168,7 @@ function saveFeeBaseline(positionId: number, b: FeeBaseline): void {
 /** 手动重置某仓位的已实现手续费计息起点（领取手续费后可一键清零重新计时）。 */
 export function resetPositionFeeSince(positionId: number, sinceMs = Date.now()): void {
   saveFeeBaseline(positionId, { sinceMs, lastFees0Raw: "0", lastFees1Raw: "0" });
-  const cache = getCache();
-  cache.fetchedAt = 0; // 失效缓存以便下次立即重算
+  invalidatePositionFeesCache();
 }
 
 async function fetchDexScreenerVolume(chainId: number, poolAddr: string): Promise<PoolVolumeCacheEntry> {
@@ -329,9 +341,12 @@ interface ActivePosRow {
   id: number;
   chain_id_ref: number;
   chain_id: number;
+  wallet_address: string;
   token_id: string;
   token0: string;
   token1: string;
+  token0_symbol: string;
+  token1_symbol: string;
   pool: string;
   fee: number;
   tick_lower: number;
@@ -344,7 +359,75 @@ interface ActivePosRow {
   token1_decimals: number | null;
 }
 
-/** 批量读取所有活跃仓位的精确未领手续费、活跃流动性占比和理论日产。 */
+/** 强制对单个仓位重新从链上追溯开仓投入与已领手续费。 */
+export async function syncPositionPnlNow(positionId: number): Promise<PositionCostBasis | null> {
+  const db = getDb();
+  const r = db
+    .prepare(
+      `SELECT p.id, p.chain_id_ref, c.chain_id, w.address AS wallet_address,
+              p.token_id, p.token0, p.token1, p.token0_symbol, p.token1_symbol,
+              p.pool, p.fee, p.tick_lower, p.tick_upper, p.created_at,
+              d.type AS dex_type, d.npm AS dex_npm, d.stateview AS dex_stateview,
+              t0.decimals AS token0_decimals, t1.decimals AS token1_decimals
+       FROM positions p
+       JOIN chains c ON c.id = p.chain_id_ref
+       JOIN wallets w ON w.id = p.wallet_id
+       LEFT JOIN dexes d ON d.id = p.dex_id
+       LEFT JOIN tokens t0 ON t0.chain_id_ref = p.chain_id_ref AND LOWER(t0.address) = LOWER(p.token0)
+       LEFT JOIN tokens t1 ON t1.chain_id_ref = p.chain_id_ref AND LOWER(t1.address) = LOWER(p.token1)
+       WHERE p.id=?`
+    )
+    .get(positionId) as ActivePosRow | undefined;
+  if (!r) return null;
+
+  let dexType = r.dex_type || "v3-fork";
+  let npm = r.dex_npm as Address | null;
+  const isV4PoolId = /^0x[0-9a-fA-F]{64}$/.test(r.pool || "");
+  if (!npm && isV4PoolId) {
+    const v4Dex = db
+      .prepare("SELECT type, npm FROM dexes WHERE chain_id_ref=? AND type='v4' ORDER BY enabled DESC LIMIT 1")
+      .get(r.chain_id_ref) as { type: string; npm: string } | undefined;
+    if (v4Dex) {
+      dexType = v4Dex.type;
+      npm = v4Dex.npm as Address;
+    }
+  }
+  if (!npm) return null;
+
+  const { client } = getClient(r.chain_id_ref);
+  let dec0 = r.token0_decimals;
+  let dec1 = r.token1_decimals;
+  let sym0 = r.token0_symbol;
+  let sym1 = r.token1_symbol;
+  if (dec0 == null || dec1 == null || !sym0 || !sym1) {
+    const meta = await resolveTokens(client, r.chain_id_ref, [r.token0, r.token1]);
+    dec0 = dec0 ?? meta.get(r.token0.toLowerCase())?.decimals ?? 18;
+    dec1 = dec1 ?? meta.get(r.token1.toLowerCase())?.decimals ?? 18;
+    sym0 = sym0 || meta.get(r.token0.toLowerCase())?.symbol || "";
+    sym1 = sym1 || meta.get(r.token1.toLowerCase())?.symbol || "";
+  }
+
+  const res = await ensurePositionCostBasis({
+    positionId: r.id,
+    chainId: r.chain_id,
+    dexType: isV4PoolId ? "v4" : dexType,
+    npm,
+    ownerAddress: r.wallet_address,
+    tokenId: r.token_id,
+    token0: r.token0,
+    token1: r.token1,
+    symbol0: sym0,
+    symbol1: sym1,
+    dec0,
+    dec1,
+    fallbackCreatedMs: parseSqliteUtcMs(r.created_at),
+    forceResync: true,
+  });
+  invalidatePositionFeesCache();
+  return res;
+}
+
+/** 批量读取所有活跃仓位的精确未领手续费、活跃流动性占比、理论日产与真实成本台账。 */
 export async function fetchAllActivePositionFees(opts?: {
   force?: boolean;
 }): Promise<Record<number, PositionFeeMetrics>> {
@@ -357,12 +440,14 @@ export async function fetchAllActivePositionFees(opts?: {
   const db = getDb();
   const rows = db
     .prepare(
-      `SELECT p.id, p.chain_id_ref, c.chain_id, p.token_id, p.token0, p.token1, p.pool, p.fee,
-              p.tick_lower, p.tick_upper, p.created_at,
+      `SELECT p.id, p.chain_id_ref, c.chain_id, w.address AS wallet_address,
+              p.token_id, p.token0, p.token1, p.token0_symbol, p.token1_symbol,
+              p.pool, p.fee, p.tick_lower, p.tick_upper, p.created_at,
               d.type AS dex_type, d.npm AS dex_npm, d.stateview AS dex_stateview,
               t0.decimals AS token0_decimals, t1.decimals AS token1_decimals
        FROM positions p
        JOIN chains c ON c.id = p.chain_id_ref
+       JOIN wallets w ON w.id = p.wallet_id
        LEFT JOIN dexes d ON d.id = p.dex_id
        LEFT JOIN tokens t0 ON t0.chain_id_ref = p.chain_id_ref AND LOWER(t0.address) = LOWER(p.token0)
        LEFT JOIN tokens t1 ON t1.chain_id_ref = p.chain_id_ref AND LOWER(t1.address) = LOWER(p.token1)
@@ -396,10 +481,14 @@ export async function fetchAllActivePositionFees(opts?: {
         const { client } = getClient(r.chain_id_ref);
         let dec0 = r.token0_decimals;
         let dec1 = r.token1_decimals;
-        if (dec0 == null || dec1 == null) {
+        let sym0 = r.token0_symbol;
+        let sym1 = r.token1_symbol;
+        if (dec0 == null || dec1 == null || !sym0 || !sym1) {
           const meta = await resolveTokens(client, r.chain_id_ref, [r.token0, r.token1]);
           dec0 = dec0 ?? meta.get(r.token0.toLowerCase())?.decimals ?? 18;
           dec1 = dec1 ?? meta.get(r.token1.toLowerCase())?.decimals ?? 18;
+          sym0 = sym0 || meta.get(r.token0.toLowerCase())?.symbol || "";
+          sym1 = sym1 || meta.get(r.token1.toLowerCase())?.symbol || "";
         }
         let fees0Raw = 0n;
         let fees1Raw = 0n;
@@ -446,7 +535,8 @@ export async function fetchAllActivePositionFees(opts?: {
         const fees1 = Number(formatUnits(fees1Raw, dec1));
         const feeRate = effectiveFeePpm > 0 && effectiveFeePpm < 0x800000 ? effectiveFeePpm / 1_000_000 : 0.0005;
 
-        // 维护计息起点：首次用 positions.created_at，若检测到已领取手续费（两边明显回落）则自动重置
+        // 维护计息起点：首次用 positions.created_at，若检测到已领取手续费（两边明显回落）则自动重置并同步已领台账
+        let feesJustCollected = false;
         let baseline = loadFeeBaseline(r.id);
         if (!baseline) {
           baseline = {
@@ -461,6 +551,11 @@ export async function fetchAllActivePositionFees(opts?: {
           const dropped0 = prev0 > 0n && fees0Raw * 5n < prev0;
           const dropped1 = prev1 > 0n && fees1Raw * 5n < prev1;
           if ((dropped0 && fees1Raw <= prev1) || (dropped1 && fees0Raw <= prev0)) {
+            feesJustCollected = true;
+            // 对于无 Blockscout 的快照模式链，自动把刚才领取掉的差额累加进已领手续费
+            const claimed0Delta = prev0 > fees0Raw ? Number(formatUnits(prev0 - fees0Raw, dec0)) : 0;
+            const claimed1Delta = prev1 > fees1Raw ? Number(formatUnits(prev1 - fees1Raw, dec1)) : 0;
+            recordFallbackClaimedFees(r.id, claimed0Delta, claimed1Delta);
             baseline = {
               sinceMs: nowMs,
               lastFees0Raw: fees0Raw.toString(),
@@ -477,10 +572,51 @@ export async function fetchAllActivePositionFees(opts?: {
           }
         }
 
-        const elapsedHours = Math.max(0, (nowMs - baseline.sinceMs) / 3_600_000);
+        // 计算当前持仓两币数量（仅作不支持 Blockscout 的链首次快照兜底）
+        let fallbackAmt0: number | undefined;
+        let fallbackAmt1: number | undefined;
+        if (posLiq > 0n) {
+          try {
+            const amts = getAmountsForLiquidity(
+              tickToSqrtPriceX96(currentTick),
+              tickToSqrtPriceX96(r.tick_lower),
+              tickToSqrtPriceX96(r.tick_upper),
+              posLiq,
+              dec0,
+              dec1
+            );
+            fallbackAmt0 = Number(amts.amount0) || 0;
+            fallbackAmt1 = Number(amts.amount1) || 0;
+          } catch {}
+        }
 
-        // 拉取池子实时 24h / 6h 成交量（5 分钟缓存）
-        const vol = await fetchDexScreenerVolume(r.chain_id, poolIdOrAddr);
+        // 并行拉取：池子实时成交量 + 真实开仓成本与已领手续费台账
+        const [vol, costBasis] = await Promise.all([
+          fetchDexScreenerVolume(r.chain_id, poolIdOrAddr),
+          ensurePositionCostBasis({
+            positionId: r.id,
+            chainId: r.chain_id,
+            dexType: isV4PoolId ? "v4" : dexType,
+            npm,
+            ownerAddress: r.wallet_address,
+            tokenId: r.token_id,
+            token0: r.token0,
+            token1: r.token1,
+            symbol0: sym0,
+            symbol1: sym1,
+            dec0,
+            dec1,
+            fallbackAmt0,
+            fallbackAmt1,
+            fallbackCreatedMs: parseSqliteUtcMs(r.created_at),
+            forceResync: feesJustCollected,
+          }),
+        ]);
+
+        const effectiveSinceMs =
+          costBasis && costBasis.entryTimestamp > 0 ? costBasis.entryTimestamp : baseline.sinceMs;
+        const elapsedHours = Math.max(0, (nowMs - effectiveSinceMs) / 3_600_000);
+
         const estDailyFeeUsd =
           vol.volume24hUsd !== null ? vol.volume24hUsd * feeRate * activeLShare : null;
         const estHourlyFeeUsd = estDailyFeeUsd !== null ? estDailyFeeUsd / 24 : null;
@@ -506,8 +642,9 @@ export async function fetchAllActivePositionFees(opts?: {
           estDailyFeeUsd,
           estHourlyFeeUsd,
           estDailyFee6hUsd,
-          feeSinceMs: baseline.sinceMs,
+          feeSinceMs: effectiveSinceMs,
           elapsedHours,
+          costBasis,
           updatedAt: new Date(nowMs).toISOString(),
         };
       } catch (e: any) {
@@ -532,6 +669,7 @@ export async function fetchAllActivePositionFees(opts?: {
           estDailyFee6hUsd: null,
           feeSinceMs: parseSqliteUtcMs(r.created_at),
           elapsedHours: 0,
+          costBasis: null,
           updatedAt: new Date(nowMs).toISOString(),
           error: e?.shortMessage || e?.message || String(e),
         };

@@ -257,6 +257,24 @@ function migrate(db: DB) {
       UNIQUE(chain_id_ref, dex_name, token0, token1)
     );
 
+    -- 仓位真实成本与已领取手续费台账（支持自动链上追溯 + 手动校准）
+    CREATE TABLE IF NOT EXISTS position_cost_basis (
+      position_id        INTEGER PRIMARY KEY REFERENCES positions(id) ON DELETE CASCADE,
+      entry_tx_hash      TEXT    NOT NULL DEFAULT '',
+      entry_timestamp    INTEGER NOT NULL DEFAULT 0,   -- 开仓 UTC 毫秒时间戳
+      entry_amt0         REAL    NOT NULL DEFAULT 0,   -- 净投入 token0（开仓 + 加仓 - 撤回本金）
+      entry_amt1         REAL    NOT NULL DEFAULT 0,   -- 净投入 token1
+      entry_price0_usd   REAL    NOT NULL DEFAULT 0,   -- 开仓时 token0 历史 USD 单价
+      entry_price1_usd   REAL    NOT NULL DEFAULT 0,   -- 开仓时 token1 历史 USD 单价
+      entry_value_usd    REAL    NOT NULL DEFAULT 0,   -- 开仓投入总 USD 价值（含加减仓净变动）
+      claimed_fees0      REAL    NOT NULL DEFAULT 0,   -- 累计已领取手续费 token0
+      claimed_fees1      REAL    NOT NULL DEFAULT 0,   -- 累计已领取手续费 token1
+      claimed_fees_usd   REAL    NOT NULL DEFAULT 0,   -- 累计已领取手续费按领取时 USD 折算
+      last_synced_block  INTEGER NOT NULL DEFAULT 0,   -- 已同步到的区块号（用于增量查后续领费/加减仓）
+      source             TEXT    NOT NULL DEFAULT 'auto', -- 'onchain' | 'snapshot' | 'manual'
+      updated_at         TEXT    NOT NULL DEFAULT (datetime('now'))
+    );
+
     -- CEX 差价预警静音（按 token 对，不区分 DEX，同一 token0/token1 跨 DEX 共享）
     CREATE TABLE IF NOT EXISTS cex_alert_mutes (
       id            INTEGER PRIMARY KEY AUTOINCREMENT,

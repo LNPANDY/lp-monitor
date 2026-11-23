@@ -421,6 +421,35 @@ export default function DashboardPage() {
     else reloadPositionFees();
   }
 
+  async function syncPositionPnl(positionId: number) {
+    const r = await fetch("/api/position-fees", {
+      method: "POST",
+      headers: authHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({ action: "sync_pnl", positionId }),
+    });
+    const j = await r.json().catch(() => null);
+    if (j?.ok) reloadPositionFees(j.data, false);
+    else reloadPositionFees();
+  }
+
+  async function savePositionCostBasis(payload: {
+    positionId: number;
+    entryAmt0: number;
+    entryAmt1: number;
+    entryValueUsd: number;
+    claimedFees0: number;
+    claimedFees1: number;
+  }) {
+    const r = await fetch("/api/position-fees", {
+      method: "POST",
+      headers: authHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({ action: "save_cost_basis", ...payload }),
+    });
+    const j = await r.json().catch(() => null);
+    if (j?.ok) reloadPositionFees(j.data, false);
+    else reloadPositionFees();
+  }
+
   const list = positions ?? [];
   const outOfRange = list.filter((p) => p.last_in_range === 0);
   const closed = closedPositions ?? [];
@@ -1195,6 +1224,8 @@ export default function DashboardPage() {
                     feeMetrics={positionFees?.[p.id] ?? null}
                     onRefreshFees={refreshPositionFees}
                     onResetFeeSince={resetFeeSince}
+                    onSyncPnl={syncPositionPnl}
+                    onSaveCostBasis={savePositionCostBasis}
                     binanceRt={binanceRt}
                     highlight
                     onFlipped={reloadPos}
@@ -1226,6 +1257,8 @@ export default function DashboardPage() {
                     feeMetrics={positionFees?.[p.id] ?? null}
                     onRefreshFees={refreshPositionFees}
                     onResetFeeSince={resetFeeSince}
+                    onSyncPnl={syncPositionPnl}
+                    onSaveCostBasis={savePositionCostBasis}
                     binanceRt={binanceRt}
                     onFlipped={reloadPos}
                     onReopenPool={handleReopenPool}
@@ -2322,6 +2355,8 @@ function PositionCard({
   feeMetrics,
   onRefreshFees,
   onResetFeeSince,
+  onSyncPnl,
+  onSaveCostBasis,
   binanceRt,
   highlight,
   closed,
@@ -2334,6 +2369,15 @@ function PositionCard({
   feeMetrics?: PositionFeeMetrics | null;
   onRefreshFees?: () => Promise<void> | void;
   onResetFeeSince?: (positionId: number) => Promise<void> | void;
+  onSyncPnl?: (positionId: number) => Promise<void> | void;
+  onSaveCostBasis?: (payload: {
+    positionId: number;
+    entryAmt0: number;
+    entryAmt1: number;
+    entryValueUsd: number;
+    claimedFees0: number;
+    claimedFees1: number;
+  }) => Promise<void> | void;
   binanceRt?: UseBinanceRealtimeReturn;
   highlight?: boolean;
   closed?: boolean;
@@ -2342,6 +2386,12 @@ function PositionCard({
 }) {
   const { address: connectedWallet } = useWallet();
   const [feeBusy, setFeeBusy] = useState(false);
+  const [editCostOpen, setEditCostOpen] = useState(false);
+  const [cbEntry0, setCbEntry0] = useState("");
+  const [cbEntry1, setCbEntry1] = useState("");
+  const [cbEntryUsd, setCbEntryUsd] = useState("");
+  const [cbClaimed0, setCbClaimed0] = useState("");
+  const [cbClaimed1, setCbClaimed1] = useState("");
   const inRange = p.last_in_range === 1;
   // 若 Merkl ZiaVault 扫描已发现该 tokenId 在质押金库内，即使 DB source 尚未刷完也立即识别为质押中
   const isStaked = p.source === "staking" || !!rewardEst;
@@ -2794,20 +2844,69 @@ function PositionCard({
           </div>
         )}
 
-        {/* ==================== Module ③.5：实时链上手续费 & 真实收益精算（V4 + V3 通用） ==================== */}
+        {/* ==================== Module ③.5：真实收益与手续费台账（开仓价值 vs 当前持仓 + 已领 + 待领） ==================== */}
         {!closed && feeMetrics && !feeMetrics.error && (() => {
           const p0Usd = holdings?.p0Usd ?? 0;
           const p1Usd = holdings?.p1Usd ?? 0;
-          const principalUsd = holdings?.totalUsd ?? 0;
+          const curAmt0 = holdings?.amt0 ?? 0;
+          const curAmt1 = holdings?.amt1 ?? 0;
+          const curPosUsd = holdings?.totalUsd ?? 0;
+          const cb = feeMetrics.costBasis;
+
           const fee0Usd = feeMetrics.fees0 * p0Usd;
           const fee1Usd = feeMetrics.fees1 * p1Usd;
           const uncollectedUsd = fee0Usd + fee1Usd;
-          const primFee = flip
-            ? { sym: sym1, amt: feeMetrics.fees1, usd: fee1Usd }
-            : { sym: sym0, amt: feeMetrics.fees0, usd: fee0Usd };
-          const secFee = flip
-            ? { sym: sym0, amt: feeMetrics.fees0, usd: fee0Usd }
-            : { sym: sym1, amt: feeMetrics.fees1, usd: fee1Usd };
+
+          const claimed0 = cb?.claimedFees0 ?? 0;
+          const claimed1 = cb?.claimedFees1 ?? 0;
+          const claimedSpotUsd = claimed0 * p0Usd + claimed1 * p1Usd;
+          const claimedUsd = claimedSpotUsd > 0 ? claimedSpotUsd : (cb?.claimedFeesUsd ?? 0);
+          const totalFeesUsd = claimedUsd + uncollectedUsd;
+
+          // 当前总价值 = 当前仓位两币价值 + 已领取手续费 + 待领取手续费
+          const totalCurrentUsd = curPosUsd + claimedUsd + uncollectedUsd;
+
+          // 开仓时两币投入与开仓时总价值
+          const hasCostBasis = !!cb && (cb.entryValueUsd > 0 || cb.entryAmt0 > 0 || cb.entryAmt1 > 0);
+          const entryAmt0 = cb?.entryAmt0 ?? 0;
+          const entryAmt1 = cb?.entryAmt1 ?? 0;
+          const entryValUsd =
+            cb && cb.entryValueUsd > 0
+              ? cb.entryValueUsd
+              : cb
+                ? cb.entryAmt0 * (cb.entryPrice0Usd || p0Usd) + cb.entryAmt1 * (cb.entryPrice1Usd || p1Usd)
+                : 0;
+
+          // ① 真实总收益（U 本位）= (当前持仓 + 已领手续费 + 待领手续费) - 开仓时总价值
+          const realPnlUsd = hasCostBasis && entryValUsd > 0 ? totalCurrentUsd - entryValUsd : null;
+          const realPnlPct =
+            realPnlUsd !== null && entryValUsd > 0 ? (realPnlUsd / entryValUsd) * 100 : null;
+
+          // ② 相对纯囤币净收益（vs HODL）= 当前总价值 - (开仓两币数量 × 现价) = 总手续费 - 无常损失 IL
+          const hodlValUsd =
+            hasCostBasis && (entryAmt0 > 0 || entryAmt1 > 0)
+              ? entryAmt0 * p0Usd + entryAmt1 * p1Usd
+              : 0;
+          const ilUsd = hodlValUsd > 0 ? curPosUsd - hodlValUsd : null;
+          const vsHodlNetUsd = hodlValUsd > 0 ? totalCurrentUsd - hodlValUsd : null;
+
+          const elapsedH = feeMetrics.elapsedHours;
+          const elapsedLabel =
+            elapsedH < 1
+              ? `${Math.max(1, Math.round(elapsedH * 60))}分钟`
+              : elapsedH < 48
+                ? `${elapsedH.toFixed(1)}小时`
+                : `${(elapsedH / 24).toFixed(1)}天`;
+
+          const vsHodlNetAprPct =
+            vsHodlNetUsd !== null && entryValUsd > 0 && elapsedH >= 0.5
+              ? (vsHodlNetUsd / entryValUsd) * (8760 / elapsedH) * 100
+              : null;
+          const realizedFeeDailyUsd = elapsedH >= 0.25 ? (totalFeesUsd / elapsedH) * 24 : null;
+          const realizedFeeAprPct =
+            realizedFeeDailyUsd !== null && curPosUsd > 0
+              ? (realizedFeeDailyUsd * 365 / curPosUsd) * 100
+              : null;
 
           // 区间集中倍数 M = 2 / (2 - sqrt(P/Pb) - sqrt(Pa/P))
           let concMult: number | null = null;
@@ -2818,59 +2917,90 @@ function PositionCard({
             if (denom > 1e-6) concMult = 2 / denom;
           }
 
-          // 已实现真实速度（运行 >= 5 分钟才推算年化，避免刚开仓 10 秒噪音放大）
-          const elapsedH = feeMetrics.elapsedHours;
-          const elapsedLabel =
-            elapsedH < 1
-              ? `${Math.max(1, Math.round(elapsedH * 60))}分钟`
-              : elapsedH < 48
-                ? `${elapsedH.toFixed(1)}小时`
-                : `${(elapsedH / 24).toFixed(1)}天`;
-          const realizedDailyUsd = elapsedH >= 0.08 ? (uncollectedUsd / elapsedH) * 24 : null;
-          const realizedAprPct =
-            realizedDailyUsd !== null && principalUsd > 0
-              ? (realizedDailyUsd * 365 / principalUsd) * 100
-              : null;
-
           // 按池子 24h / 6h 成交量 × 费率 × 本仓 ActiveL 占比 推算的理论手续费产出
           const estDailyUsd = feeMetrics.estDailyFeeUsd;
           const estAprPct =
-            estDailyUsd !== null && principalUsd > 0
-              ? (estDailyUsd * 365 / principalUsd) * 100
+            estDailyUsd !== null && curPosUsd > 0
+              ? (estDailyUsd * 365 / curPosUsd) * 100
               : null;
           const estDaily6hUsd = feeMetrics.estDailyFee6hUsd;
           const estApr6hPct =
-            estDaily6hUsd !== null && principalUsd > 0
-              ? (estDaily6hUsd * 365 / principalUsd) * 100
+            estDaily6hUsd !== null && curPosUsd > 0
+              ? (estDaily6hUsd * 365 / curPosUsd) * 100
               : null;
 
-          const fmtFeeAmt = (v: number) => {
+          const fmtAmt = (v: number) => {
             if (v <= 0) return "0";
             if (v < 0.0001) return v.toFixed(6);
             if (v < 0.01) return v.toFixed(5);
             return fmtTokenAmount(v);
           };
+          const fmtSignedUsd = (v: number) =>
+            `${v >= 0 ? "+" : "-"}$${Math.abs(v).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+          const fmtUsd = (v: number) =>
+            `$${v.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+
+          const entryDateLabel = (() => {
+            if (!cb?.entryTimestamp) return "";
+            const d = new Date(cb.entryTimestamp + 8 * 3600_000);
+            const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
+            const dd = String(d.getUTCDate()).padStart(2, "0");
+            const hh = String(d.getUTCHours()).padStart(2, "0");
+            const mi = String(d.getUTCMinutes()).padStart(2, "0");
+            return `${mm}/${dd} ${hh}:${mi}`;
+          })();
+
+          const sourceBadge =
+            cb?.source === "onchain"
+              ? { text: "链上精确", cls: "bg-emerald-500/15 text-emerald-300 border-emerald-400/30" }
+              : cb?.source === "manual"
+                ? { text: "手动校准", cls: "bg-amber-500/15 text-amber-200 border-amber-400/30" }
+                : cb?.source === "snapshot"
+                  ? { text: "快照基准", cls: "bg-slate-500/20 text-slate-300 border-white/15" }
+                  : null;
+
+          const pairStr = (a0: number, a1: number) =>
+            flip
+              ? `${fmtAmt(a1)} ${sym1} + ${fmtAmt(a0)} ${sym0}`
+              : `${fmtAmt(a0)} ${sym0} + ${fmtAmt(a1)} ${sym1}`;
+
+          const openCostEditor = () => {
+            setCbEntry0(entryAmt0 > 0 ? String(Number(entryAmt0.toFixed(8))) : String(Number(curAmt0.toFixed(8))));
+            setCbEntry1(entryAmt1 > 0 ? String(Number(entryAmt1.toFixed(8))) : String(Number(curAmt1.toFixed(8))));
+            setCbEntryUsd(entryValUsd > 0 ? entryValUsd.toFixed(2) : curPosUsd.toFixed(2));
+            setCbClaimed0(claimed0 > 0 ? String(Number(claimed0.toFixed(8))) : "0");
+            setCbClaimed1(claimed1 > 0 ? String(Number(claimed1.toFixed(8))) : "0");
+            setEditCostOpen((v) => !v);
+          };
 
           return (
             <div className="my-1.5 rounded-lg border border-emerald-500/25 bg-emerald-500/[0.06] p-2.5 text-xs space-y-2">
+              {/* 顶部标题栏 */}
               <div className="flex flex-wrap items-center justify-between gap-1.5">
-                <span className="font-semibold text-ink">
-                  💸 实时手续费与真实收益{" "}
-                  <span className="font-mono text-emerald-300">
-                    (未领 ${uncollectedUsd < 1 ? uncollectedUsd.toFixed(3) : uncollectedUsd.toFixed(2)})
+                <div className="flex items-center gap-1.5 flex-wrap">
+                  <span className="font-semibold text-ink">
+                    💸 真实收益与手续费
                   </span>
-                </span>
-                <div className="flex items-center gap-1.5">
+                  <span className="font-mono text-[10.5px] text-ink-soft">
+                    (已跑 {elapsedLabel})
+                  </span>
+                  {sourceBadge && (
+                    <span className={`rounded border px-1 py-0 text-[9.5px] ${sourceBadge.cls}`}>
+                      {sourceBadge.text}
+                    </span>
+                  )}
+                </div>
+                <div className="flex items-center gap-1">
                   {estAprPct !== null && (
                     <span
-                      className={`rounded px-1.5 py-0.5 font-mono text-[11px] font-bold border ${
+                      className={`rounded px-1.5 py-0.5 font-mono text-[10.5px] font-bold border ${
                         inRange
                           ? "bg-emerald-500/20 text-emerald-200 border-emerald-400/35"
                           : "bg-rose-500/20 text-rose-300 border-rose-400/35"
                       }`}
                       title="按池子实时 24h 成交量 × 池费率 × 本仓活跃流动性占比推算的理论毛 APR"
                     >
-                      {inRange ? `24h 理论 APR ${estAprPct.toFixed(1)}%` : "越界停产 0%"}
+                      {inRange ? `24h理论 ${estAprPct.toFixed(1)}%` : "越界 0%"}
                     </span>
                   )}
                   <button
@@ -2888,102 +3018,255 @@ function PositionCard({
                   <button
                     type="button"
                     disabled={feeBusy}
-                    onClick={async () => {
-                      if (!confirm("确认将当前时刻设为已实现手续费的重新计息起点？（适合领完手续费后点一次）")) return;
-                      setFeeBusy(true);
-                      try { await onResetFeeSince?.(p.id); } finally { setFeeBusy(false); }
-                    }}
-                    className="rounded border border-white/10 bg-white/[0.04] px-1.5 py-0.5 text-[10px] text-ink-soft hover:text-ink hover:bg-white/[0.08]"
-                    title="重置已实现 APR 的计息起点"
+                    onClick={openCostEditor}
+                    className={`rounded border px-1.5 py-0.5 text-[10px] ${
+                      editCostOpen
+                        ? "border-amber-400/40 bg-amber-500/20 text-amber-200"
+                        : "border-white/10 bg-white/[0.04] text-ink-soft hover:text-ink hover:bg-white/[0.08]"
+                    }`}
+                    title="手动校准开仓投入与已领手续费，或重新链上追溯"
                   >
-                    ↺
+                    ✎ 校准
                   </button>
                 </div>
               </div>
 
-              {/* 1. 精确未领双币明细 */}
-              <div className="grid grid-cols-2 gap-1.5 font-mono text-[11px]">
-                <div className="flex items-center justify-between rounded bg-surface-0/70 px-2 py-1">
-                  <span className="text-emerald-300 font-semibold">{primFee.sym}</span>
-                  <span className="text-ink">
-                    {fmtFeeAmt(primFee.amt)}{" "}
-                    <span className="text-ink-soft">
-                      (${primFee.usd < 1 ? primFee.usd.toFixed(2) : primFee.usd.toFixed(1)})
-                    </span>
-                  </span>
-                </div>
-                <div className="flex items-center justify-between rounded bg-surface-0/70 px-2 py-1">
-                  <span className="text-cyan-300 font-semibold">{secFee.sym}</span>
-                  <span className="text-ink">
-                    {fmtFeeAmt(secFee.amt)}{" "}
-                    <span className="text-ink-soft">
-                      (${secFee.usd < 1 ? secFee.usd.toFixed(2) : secFee.usd.toFixed(1)})
-                    </span>
-                  </span>
-                </div>
-              </div>
-
-              {/* 2. 已实现真实收益 vs 24h/6h 实时理论收益 */}
-              <div className="grid grid-cols-2 gap-1.5 font-mono text-[11px]">
-                <div className="rounded border border-white/[0.07] bg-surface-0/60 px-2 py-1.5 space-y-0.5">
+              {/* 1. 核心双指标卡片：真实总收益（U本位） vs 相对纯囤币净收益（vs HODL） */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5 font-mono text-[11px]">
+                <div className="rounded border border-white/[0.08] bg-surface-0/75 px-2.5 py-2 space-y-0.5">
                   <div className="font-sans text-[10px] text-ink-soft flex items-center justify-between">
-                    <span>📈 链上实测速度</span>
-                    <span>已跑 {elapsedLabel}</span>
+                    <span>📊 真实总收益 (vs 开仓价值)</span>
+                    {realPnlPct !== null && (
+                      <span className={realPnlPct >= 0 ? "text-emerald-300 font-mono" : "text-rose-300 font-mono"}>
+                        {realPnlPct >= 0 ? "+" : ""}{realPnlPct.toFixed(2)}%
+                      </span>
+                    )}
                   </div>
-                  {realizedDailyUsd !== null ? (
+                  {realPnlUsd !== null ? (
                     <>
-                      <div className="text-emerald-300 font-semibold">
-                        ${realizedDailyUsd.toFixed(2)}/天{" "}
-                        <span className="text-[10px] font-normal text-ink-soft">
-                          (${(realizedDailyUsd / 24).toFixed(2)}/h)
-                        </span>
+                      <div className={`text-sm font-bold ${realPnlUsd >= 0 ? "text-emerald-300" : "text-rose-300"}`}>
+                        {fmtSignedUsd(realPnlUsd)}
                       </div>
-                      <div className="text-[10.5px] text-amber-200">
-                        实测 APR {realizedAprPct !== null ? `${realizedAprPct.toFixed(1)}%` : "—"}
+                      <div className="text-[10px] text-ink-soft">
+                        开仓 {fmtUsd(entryValUsd)} → 现总值 {fmtUsd(totalCurrentUsd)}
                       </div>
                     </>
                   ) : (
                     <div className="text-[10.5px] text-ink-muted">
-                      建仓刚满 {elapsedLabel}，5 分钟后自动推算年化
+                      暂未获取开仓成本（点右上角「✎ 校准」可链上追溯或录入）
                     </div>
                   )}
                 </div>
 
-                <div className="rounded border border-white/[0.07] bg-surface-0/60 px-2 py-1.5 space-y-0.5">
+                <div className="rounded border border-white/[0.08] bg-surface-0/75 px-2.5 py-2 space-y-0.5">
                   <div className="font-sans text-[10px] text-ink-soft flex items-center justify-between">
-                    <span>🔥 池量理论产出</span>
-                    <span>
-                      {feeMetrics.poolVolume24hUsd !== null
-                        ? `24h $${(feeMetrics.poolVolume24hUsd / 1e6).toFixed(1)}M`
-                        : "—"}
-                    </span>
+                    <span>⚖️ LP 净收益 (vs 纯囤币不动)</span>
+                    {vsHodlNetAprPct !== null && (
+                      <span className={vsHodlNetAprPct >= 0 ? "text-amber-200 font-mono" : "text-rose-300 font-mono"}>
+                        净年化 {vsHodlNetAprPct >= 0 ? "+" : ""}{vsHodlNetAprPct.toFixed(1)}%
+                      </span>
+                    )}
                   </div>
-                  {estDailyUsd !== null ? (
+                  {vsHodlNetUsd !== null ? (
                     <>
-                      <div className="text-cyan-300 font-semibold">
-                        ${estDailyUsd.toFixed(2)}/天{" "}
-                        <span className="text-[10px] font-normal text-ink-soft">
-                          (月 ${(estDailyUsd * 30).toFixed(0)})
-                        </span>
+                      <div className={`text-sm font-bold ${vsHodlNetUsd >= 0 ? "text-emerald-300" : "text-rose-300"}`}>
+                        {fmtSignedUsd(vsHodlNetUsd)}
                       </div>
-                      <div className="text-[10.5px] text-ink-soft">
-                        {estApr6hPct !== null
-                          ? `近6h节奏 ${estApr6hPct.toFixed(1)}% ($${(estDaily6hUsd ?? 0).toFixed(1)}/d)`
-                          : `月化 ${(estAprPct ? estAprPct / 12 : 0).toFixed(1)}%`}
+                      <div className="text-[10px] text-ink-soft">
+                        总费 +{fmtUsd(totalFeesUsd)} · IL{" "}
+                        <span className={(ilUsd ?? 0) >= 0 ? "text-emerald-300" : "text-rose-300"}>
+                          {fmtSignedUsd(ilUsd ?? 0)}
+                        </span>
                       </div>
                     </>
                   ) : (
-                    <div className="text-[10.5px] text-ink-muted">暂无池成交量数据</div>
+                    <div className="text-[10.5px] text-ink-muted">
+                      手续费合计 {fmtUsd(totalFeesUsd)}
+                      {realizedFeeAprPct !== null ? ` · 实测费率 ${realizedFeeAprPct.toFixed(1)}%` : ""}
+                    </div>
                   )}
                 </div>
               </div>
 
-              {/* 3. 活跃池占比、集中倍数、含未领总价值 */}
+              {/* 2. 四行清晰对照账本：开仓投入 / 当前持仓 / 已领手续费 / 待领手续费 */}
+              <div className="rounded border border-white/[0.06] bg-surface-0/55 px-2 py-1.5 space-y-1 font-mono text-[10.5px]">
+                {hasCostBasis && (
+                  <div className="flex flex-wrap items-center justify-between gap-1 text-ink-soft">
+                    <span className="font-sans text-ink-soft">
+                      开仓投入{entryDateLabel ? ` (${entryDateLabel})` : ""}
+                    </span>
+                    <span className="text-right">
+                      <span className="text-ink/85">{pairStr(entryAmt0, entryAmt1)}</span>
+                      <span className="ml-1.5 text-ink font-semibold">{fmtUsd(entryValUsd)}</span>
+                    </span>
+                  </div>
+                )}
+                <div className="flex flex-wrap items-center justify-between gap-1 text-ink-soft">
+                  <span className="font-sans">当前仓位持仓</span>
+                  <span className="text-right">
+                    <span className="text-ink/90">{pairStr(curAmt0, curAmt1)}</span>
+                    <span className="ml-1.5 text-ink font-semibold">{fmtUsd(curPosUsd)}</span>
+                  </span>
+                </div>
+                <div className="flex flex-wrap items-center justify-between gap-1 text-ink-soft">
+                  <span className="font-sans">已领取手续费</span>
+                  <span className="text-right">
+                    <span className={claimed0 > 0 || claimed1 > 0 ? "text-emerald-200" : "text-ink-muted"}>
+                      {pairStr(claimed0, claimed1)}
+                    </span>
+                    <span className={`ml-1.5 font-semibold ${claimedUsd > 0 ? "text-emerald-300" : "text-ink-muted"}`}>
+                      {fmtUsd(claimedUsd)}
+                    </span>
+                  </span>
+                </div>
+                <div className="flex flex-wrap items-center justify-between gap-1 text-ink-soft">
+                  <span className="font-sans">待领取手续费</span>
+                  <span className="text-right">
+                    <span className="text-emerald-200">{pairStr(feeMetrics.fees0, feeMetrics.fees1)}</span>
+                    <span className="ml-1.5 text-emerald-300 font-semibold">{fmtUsd(uncollectedUsd)}</span>
+                  </span>
+                </div>
+                <div className="flex flex-wrap items-center justify-between gap-1 pt-1 border-t border-white/[0.06]">
+                  <span className="font-sans font-semibold text-ink">当前总价值 (持仓+已领+待领)</span>
+                  <span className="text-emerald-300 font-bold">
+                    {fmtUsd(totalCurrentUsd)}
+                    {hodlValUsd > 0 && (
+                      <span className="ml-1.5 font-normal text-[10px] text-ink-soft">
+                        (HODL {fmtUsd(hodlValUsd)})
+                      </span>
+                    )}
+                  </span>
+                </div>
+              </div>
+
+              {/* 3. 可折叠：开仓成本与已领手续费校准面板 */}
+              {editCostOpen && (
+                <div className="rounded border border-amber-400/30 bg-surface-0/90 p-2 space-y-2 text-[11px]">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="font-semibold text-amber-200">✎ 校准开仓成本与已领手续费</span>
+                    <button
+                      type="button"
+                      disabled={feeBusy}
+                      onClick={async () => {
+                        setFeeBusy(true);
+                        try {
+                          await onSyncPnl?.(p.id);
+                          setEditCostOpen(false);
+                        } finally {
+                          setFeeBusy(false);
+                        }
+                      }}
+                      className="rounded border border-cyan-400/35 bg-cyan-500/15 px-2 py-0.5 text-[10px] text-cyan-200 hover:bg-cyan-500/25"
+                    >
+                      {feeBusy ? "追溯中…" : "🔗 链上重新追溯"}
+                    </button>
+                  </div>
+                  <div className="grid grid-cols-2 sm:grid-cols-3 gap-1.5">
+                    <label className="space-y-0.5">
+                      <span className="text-[10px] text-ink-soft">开仓 {sym0} 数量</span>
+                      <input
+                        type="number"
+                        step="any"
+                        value={cbEntry0}
+                        onChange={(e) => setCbEntry0(e.target.value)}
+                        className="w-full rounded border border-white/15 bg-black/30 px-1.5 py-1 font-mono text-[11px] text-ink"
+                      />
+                    </label>
+                    <label className="space-y-0.5">
+                      <span className="text-[10px] text-ink-soft">开仓 {sym1} 数量</span>
+                      <input
+                        type="number"
+                        step="any"
+                        value={cbEntry1}
+                        onChange={(e) => setCbEntry1(e.target.value)}
+                        className="w-full rounded border border-white/15 bg-black/30 px-1.5 py-1 font-mono text-[11px] text-ink"
+                      />
+                    </label>
+                    <label className="space-y-0.5">
+                      <span className="text-[10px] text-ink-soft">开仓总价值 (USD)</span>
+                      <input
+                        type="number"
+                        step="any"
+                        value={cbEntryUsd}
+                        onChange={(e) => setCbEntryUsd(e.target.value)}
+                        className="w-full rounded border border-white/15 bg-black/30 px-1.5 py-1 font-mono text-[11px] text-ink"
+                      />
+                    </label>
+                    <label className="space-y-0.5">
+                      <span className="text-[10px] text-ink-soft">已领 {sym0} 手续费</span>
+                      <input
+                        type="number"
+                        step="any"
+                        value={cbClaimed0}
+                        onChange={(e) => setCbClaimed0(e.target.value)}
+                        className="w-full rounded border border-white/15 bg-black/30 px-1.5 py-1 font-mono text-[11px] text-ink"
+                      />
+                    </label>
+                    <label className="space-y-0.5">
+                      <span className="text-[10px] text-ink-soft">已领 {sym1} 手续费</span>
+                      <input
+                        type="number"
+                        step="any"
+                        value={cbClaimed1}
+                        onChange={(e) => setCbClaimed1(e.target.value)}
+                        className="w-full rounded border border-white/15 bg-black/30 px-1.5 py-1 font-mono text-[11px] text-ink"
+                      />
+                    </label>
+                    <div className="flex items-end gap-1">
+                      <button
+                        type="button"
+                        disabled={feeBusy}
+                        onClick={async () => {
+                          setFeeBusy(true);
+                          try {
+                            await onSaveCostBasis?.({
+                              positionId: p.id,
+                              entryAmt0: Number(cbEntry0) || 0,
+                              entryAmt1: Number(cbEntry1) || 0,
+                              entryValueUsd: Number(cbEntryUsd) || 0,
+                              claimedFees0: Number(cbClaimed0) || 0,
+                              claimedFees1: Number(cbClaimed1) || 0,
+                            });
+                            setEditCostOpen(false);
+                          } finally {
+                            setFeeBusy(false);
+                          }
+                        }}
+                        className="flex-1 rounded bg-emerald-500/25 border border-emerald-400/40 px-2 py-1 text-[10.5px] font-semibold text-emerald-200 hover:bg-emerald-500/35"
+                      >
+                        保存
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setEditCostOpen(false)}
+                        className="rounded border border-white/10 px-2 py-1 text-[10.5px] text-ink-soft hover:text-ink"
+                      >
+                        取消
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* 4. 底部参考条：池量理论产出 + 实测费率 + 活跃池占比 + 集中倍数 */}
               <div className="flex flex-wrap items-center justify-between gap-1 text-[10.5px] font-mono text-ink-soft pt-0.5 border-t border-white/[0.06]">
                 <span>
-                  活跃池占比{" "}
+                  {estDailyUsd !== null ? (
+                    <>
+                      池量理论{" "}
+                      <span className="text-cyan-300 font-semibold">${estDailyUsd.toFixed(1)}/天</span>
+                      {estApr6hPct !== null && (
+                        <span> (近6h {estApr6hPct.toFixed(0)}%)</span>
+                      )}
+                    </>
+                  ) : (
+                    <span>实测费速 {realizedFeeDailyUsd !== null ? `$${realizedFeeDailyUsd.toFixed(2)}/天` : "—"}</span>
+                  )}
+                </span>
+                <span>
+                  活跃占比{" "}
                   <span className="text-ink font-semibold">
-                    {(feeMetrics.activeLShare * 100).toFixed(4)}%
+                    {(feeMetrics.activeLShare * 100).toFixed(3)}%
                   </span>
                   {concMult !== null && (
                     <>
@@ -2991,14 +3274,6 @@ function PositionCard({
                     </>
                   )}
                 </span>
-                {principalUsd > 0 && (
-                  <span>
-                    本金+未领{" "}
-                    <span className="text-emerald-300 font-semibold">
-                      ${(principalUsd + uncollectedUsd).toFixed(2)}
-                    </span>
-                  </span>
-                )}
               </div>
             </div>
           );
