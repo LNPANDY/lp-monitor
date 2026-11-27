@@ -299,6 +299,20 @@ function migrate(db: DB) {
     );
     CREATE INDEX IF NOT EXISTS idx_push_states_position ON push_states(position_id);
     CREATE INDEX IF NOT EXISTS idx_push_states_time ON push_states(last_push_time);
+
+    -- OKX X-Liquidity 多仓位真实总收益台账（记录总入金、买RWA成本、提现回笼、已领LP手续费、OKX奖励金）
+    CREATE TABLE IF NOT EXISTS okx_xlayer_ledger_entries (
+      id             INTEGER PRIMARY KEY AUTOINCREMENT,
+      wallet_address TEXT    NOT NULL DEFAULT '',
+      entry_type     TEXT    NOT NULL,               -- 'deposit' | 'withdraw' | 'rwa_buy_cost' | 'lp_fee_realized' | 'okx_bonus'
+      amount_usd     REAL    NOT NULL DEFAULT 0,     -- USD 金额（正数）
+      pool_name      TEXT    NOT NULL DEFAULT '',    -- 可选关联池子，如 'GMEx-USDC'
+      token_id       TEXT    NOT NULL DEFAULT '',    -- 可选关联 NFT tokenId
+      note           TEXT    NOT NULL DEFAULT '',    -- 备注（如：转入 USDC、平仓实收、领取第6期 USDG）
+      occurred_at    TEXT    NOT NULL DEFAULT (datetime('now')),
+      created_at     TEXT    NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_okx_ledger_wallet ON okx_xlayer_ledger_entries(wallet_address, occurred_at DESC);
   `);
 
   // 兼容已有数据库：新增列用 ADD COLUMN（忽略已存在的错误）
@@ -462,6 +476,32 @@ function seedDefaults(db: DB) {
        VALUES (?, 'Uniswap V3', 'v3-fork', '0x1F98431c8aD98523631AE4a59f267346ea31F984', '0xC36442b4a4522E871399CD717aBDD847Ab11FE88', 1)`
     ).run(chainRow.id);
   }
+
+  // 幂等补齐 X Layer (Chain ID 196) 及 Uniswap V3 DEX（支持 OKX X-Liquidity 仓位监控与一键撤池）
+  const hasXLayer = db
+    .prepare("SELECT id FROM chains WHERE chain_id=? OR key=? LIMIT 1")
+    .get(196, "xlayer") as { id: number } | undefined;
+  let xlayerChainIdRef = hasXLayer?.id;
+  if (!xlayerChainIdRef) {
+    const xlayerRpcs = JSON.stringify([
+      "https://rpc.xlayer.tech",
+      "https://xlayerrpc.okx.com",
+    ]);
+    const info = db
+      .prepare(
+        `INSERT INTO chains (key, name, chain_id, rpc_urls, explorer_url, symbol, enabled, is_default)
+         VALUES ('xlayer', 'X Layer', 196, ?, 'https://www.oklink.com/zh-hans/x-layer', 'OKB', 1, 0)`
+      )
+      .run(xlayerRpcs);
+    xlayerChainIdRef = Number(info.lastInsertRowid);
+  }
+  if (xlayerChainIdRef) {
+    db.prepare(
+      `INSERT OR IGNORE INTO dexes (chain_id_ref, name, type, factory, npm, enabled)
+       VALUES (?, 'Uniswap V3', 'v3-fork', '0x4b2ab38dbf28d31d467aa8993f6c2585981d6804', '0x315e413a11ab0df498ef83873012430ca36638ae', 1)`
+    ).run(xlayerChainIdRef);
+  }
+
   seedDefaultSettings(db);
 }
 

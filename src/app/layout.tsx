@@ -45,6 +45,12 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
                 主控终端
               </Link>
               <Link
+                href="/okx-xlayer"
+                className="rounded-lg px-3 py-1.5 font-medium text-emerald-300 transition hover:bg-emerald-500/15 hover:text-white"
+              >
+                OKX X-Liquidity
+              </Link>
+              <Link
                 href="/vault"
                 className="rounded-lg px-3 py-1.5 font-medium text-cyan-200 transition hover:bg-cyan-500/15 hover:text-white"
               >
