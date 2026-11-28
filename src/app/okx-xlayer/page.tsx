@@ -153,13 +153,16 @@ function calcPoolPlan(
   const actualWidthTicks = tickUpper - tickLower;
   const widthPct = (Math.pow(1.0001, actualWidthTicks) - 1) * 100;
 
-  // 计算展示方向下界与上界价格
+  // 计算展示方向下界与上界价格，并除以 ERC-4626 股息包装乘数与 OKX 原股页面 1:1 对齐
   const rawPriceLow = Math.pow(1.0001, tickLower) * Math.pow(10, pool.dec0 - pool.dec1);
   const rawPriceHigh = Math.pow(1.0001, tickUpper) * Math.pow(10, pool.dec0 - pool.dec1);
-  const displayPriceLow = pool.displayInverted ? 1 / rawPriceHigh : rawPriceLow;
-  const displayPriceHigh = pool.displayInverted ? 1 / rawPriceLow : rawPriceHigh;
+  const wrappedLow = pool.displayInverted ? 1 / rawPriceHigh : rawPriceLow;
+  const wrappedHigh = pool.displayInverted ? 1 / rawPriceLow : rawPriceHigh;
+  const mult = pool.wrapMultiplier > 0 ? pool.wrapMultiplier : 1;
+  const displayPriceLow = wrappedLow / mult;
+  const displayPriceHigh = wrappedHigh / mult;
 
-  const pNow = pool.displayPrice > 0 ? pool.displayPrice : 1;
+  const pNow = pool.unwrappedDexPrice > 0 ? pool.unwrappedDexPrice : (pool.displayPrice > 0 ? pool.displayPrice : 1);
   const marginDownPct = Math.max(0, (1 - displayPriceLow / pNow) * 100);
   const marginUpPct = Math.max(0, (displayPriceHigh / pNow - 1) * 100);
 
@@ -742,6 +745,7 @@ export default function OkxXLayerPage() {
                   <thead className="border-b border-white/10 bg-slate-950/60 text-[11px] text-slate-400">
                     <tr>
                       <th className="px-3 py-2.5">池子 / 定位</th>
+                      <th className="px-2 py-2.5 text-right">真股价 / 折溢价</th>
                       <th className="px-2 py-2.5 text-right">集中度</th>
                       <th className="px-2 py-2.5 text-right">当前区间总量</th>
                       <th className="px-2 py-2.5 text-right">推荐资金</th>
@@ -753,13 +757,13 @@ export default function OkxXLayerPage() {
                   <tbody className="divide-y divide-white/[0.05]">
                     {poolsLoading ? (
                       <tr>
-                        <td colSpan={7} className="px-4 py-10 text-center text-slate-400">
-                          正在连接 X Layer 主网 RPC 拉取全部 51 个池子实时活跃流动性...
+                        <td colSpan={8} className="px-4 py-10 text-center text-slate-400">
+                          正在连接 X Layer 主网 RPC 与 Yahoo Finance 拉取实时深度及盘前/盘后美股报价...
                         </td>
                       </tr>
                     ) : filteredRows.length === 0 ? (
                       <tr>
-                        <td colSpan={7} className="px-4 py-8 text-center text-slate-400">
+                        <td colSpan={8} className="px-4 py-8 text-center text-slate-400">
                           没有匹配的池子
                         </td>
                       </tr>
@@ -768,6 +772,7 @@ export default function OkxXLayerPage() {
                         const selected = activeSelected?.pool.poolAddress === pool.poolAddress;
                         const badge = GROUP_BADGE[pool.strategyGroup];
                         const isOverCap = capitalUsd > pool.recMaxUsd;
+                        const sp = pool.spreadVsExtPct;
                         return (
                           <tr
                             key={pool.poolAddress}
@@ -786,8 +791,40 @@ export default function OkxXLayerPage() {
                                 </span>
                               </div>
                               <div className="mt-0.5 text-[10px] text-slate-400">
-                                现价 {fmtPrice(pool.displayPrice)} {pool.displayQuoteSymbol} · TVL {fmtUsd(pool.okxTvlUsd, 0)} · OKX {fmtUsd(pool.okxDailyUsd, 0)}/d
+                                DEX {fmtPrice(pool.unwrappedDexPrice || pool.displayPrice)} {pool.displayQuoteSymbol} · TVL {fmtUsd(pool.okxTvlUsd, 0)} · OKX {fmtUsd(pool.okxDailyUsd, 0)}/d
                               </div>
+                            </td>
+                            <td className="px-2 py-2.5 text-right font-mono">
+                              {pool.realExtPrice !== null && sp !== null ? (
+                                <div>
+                                  <span
+                                    className={`font-semibold ${
+                                      sp <= -0.5
+                                        ? "text-emerald-300"
+                                        : sp >= 0.5
+                                          ? "text-rose-300"
+                                          : "text-slate-200"
+                                    }`}
+                                  >
+                                    {sp >= 0 ? "+" : ""}
+                                    {sp.toFixed(2)}%
+                                  </span>
+                                  <div className="text-[10px] text-slate-400">
+                                    {pool.realExtSession === "POST"
+                                      ? "盘后"
+                                      : pool.realExtSession === "PRE"
+                                        ? "盘前"
+                                        : pool.realExtSession === "24/7"
+                                          ? "现货"
+                                          : "收盘"}{" "}
+                                    {fmtPrice(pool.realExtPrice)}
+                                  </div>
+                                </div>
+                              ) : (
+                                <span className="text-[10px] text-slate-500">
+                                  {pool.tag === "RWA" ? "Pre-IPO" : "—"}
+                                </span>
+                              )}
                             </td>
                             <td className="px-2 py-2.5 text-right font-mono">
                               <span
@@ -901,13 +938,69 @@ export default function OkxXLayerPage() {
                 <div className="rounded-xl border border-white/10 bg-slate-950/70 p-3 space-y-2.5">
                   <div className="flex items-center justify-between text-[11px] text-slate-400">
                     <span>
-                      当前池价：1 {activeSelected.pool.displayBaseSymbol} ={" "}
+                      链上原股价：1 {activeSelected.pool.displayBaseSymbol.replace(/^w/, "")} ={" "}
                       <strong className="font-mono text-white">
-                        {fmtPrice(activeSelected.pool.displayPrice)} {activeSelected.pool.displayQuoteSymbol}
+                        {fmtPrice(activeSelected.pool.unwrappedDexPrice || activeSelected.pool.displayPrice)}{" "}
+                        {activeSelected.pool.displayQuoteSymbol}
                       </strong>
                     </span>
-                    <span className="font-mono text-[10px]">tick {activeSelected.pool.currentTick}</span>
+                    <span className="font-mono text-[10px]">
+                      tick {activeSelected.pool.currentTick}
+                      {Math.abs((activeSelected.pool.wrapMultiplier || 1) - 1) > 0.0005 &&
+                        ` · 乘数 ${activeSelected.pool.wrapMultiplier.toFixed(4)}`}
+                    </span>
                   </div>
+
+                  {/* 真实美股/港股/欧股 常规盘 & 盘前盘后价差比对 */}
+                  {activeSelected.pool.realExtPrice !== null && activeSelected.pool.spreadVsExtPct !== null && (
+                    <div className="rounded-lg border border-white/10 bg-slate-900/90 p-2.5 text-[11px] space-y-1">
+                      <div className="flex items-center justify-between">
+                        <span className="text-slate-400">
+                          真实股市 ({activeSelected.pool.realStockTicker})
+                        </span>
+                        <span
+                          className={`font-mono font-bold ${
+                            activeSelected.pool.spreadVsExtPct <= -0.5
+                              ? "text-emerald-300"
+                              : activeSelected.pool.spreadVsExtPct >= 0.5
+                                ? "text-rose-300"
+                                : "text-slate-200"
+                          }`}
+                        >
+                          链上{activeSelected.pool.spreadVsExtPct >= 0 ? "溢价 +" : "折价 "}
+                          {activeSelected.pool.spreadVsExtPct.toFixed(2)}%
+                        </span>
+                      </div>
+                      <div className="flex flex-wrap items-center justify-between gap-1 font-mono text-[10px] text-slate-300">
+                        <span>
+                          常规盘：{fmtPrice(activeSelected.pool.realRegularPrice || 0)}
+                          {activeSelected.pool.spreadVsRegularPct !== null &&
+                            ` (${activeSelected.pool.spreadVsRegularPct >= 0 ? "+" : ""}${activeSelected.pool.spreadVsRegularPct.toFixed(2)}%)`}
+                        </span>
+                        <span className="text-cyan-300">
+                          {activeSelected.pool.realExtSession === "POST"
+                            ? "盘后"
+                            : activeSelected.pool.realExtSession === "PRE"
+                              ? "盘前"
+                              : activeSelected.pool.realExtSession === "24/7"
+                                ? "现货"
+                                : "最新"}
+                          ：{fmtPrice(activeSelected.pool.realExtPrice)}
+                          {activeSelected.pool.realExtTime ? ` (${activeSelected.pool.realExtTime})` : ""}
+                        </span>
+                      </div>
+                      {activeSelected.pool.spreadVsExtPct <= -Math.max(0.5, activeSelected.plan.marginUpPct) && (
+                        <div className="rounded bg-emerald-500/15 px-2 py-1 text-[10px] text-emerald-200">
+                          ⚡ 链上折价 {Math.abs(activeSelected.pool.spreadVsExtPct).toFixed(2)}% &gt; 你的上界余量 +{activeSelected.plan.marginUpPct.toFixed(2)}%：开盘套利极易瞬间拉穿你的上界停工，建议把上界放宽！
+                        </div>
+                      )}
+                      {activeSelected.pool.spreadVsExtPct >= 0.8 && (
+                        <div className="rounded bg-rose-500/15 px-2 py-1 text-[10px] text-rose-200">
+                          ⚠️ 链上溢价 +{activeSelected.pool.spreadVsExtPct.toFixed(2)}%：开盘套利可能砸盘回归，95/5 会向下多接 RWA，慎选过窄！
+                        </div>
+                      )}
+                    </div>
+                  )}
 
                   <div className="grid grid-cols-2 gap-2">
                     <div className="rounded-lg border border-white/10 bg-slate-900 p-2.5">
@@ -946,7 +1039,7 @@ export default function OkxXLayerPage() {
                     <span className="font-mono text-slate-200">
                       [{activeSelected.plan.tickLower}, {activeSelected.plan.tickUpper}]
                     </span>{" "}
-                    · 跨度 {activeSelected.plan.widthTicks} ticks
+                    · 跨度 {activeSelected.plan.widthTicks} ticks（价格已自动按原股乘数校准）
                   </div>
                 </div>
 

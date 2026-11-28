@@ -35,6 +35,52 @@ export const XLAYER_MAJOR_TOKENS: Record<
   "0xe538905cf8410324e03a5a23c1c177a474d59b2b": { symbol: "WOKB", decimals: 18, isStable: false },
 };
 
+/** RWA 基础符号（去前缀 w 与后缀 x/y）→ Yahoo Finance 实时股票代码（含美股盘前/盘后、港股、欧股） */
+export const RWA_YAHOO_TICKERS: Record<string, { ticker: string; market: "US" | "HK" | "EU" | "ETF" }> = {
+  QQQ: { ticker: "QQQ", market: "ETF" },
+  SPY: { ticker: "SPY", market: "ETF" },
+  SLV: { ticker: "SLV", market: "ETF" },
+  TSLA: { ticker: "TSLA", market: "US" },
+  NVDA: { ticker: "NVDA", market: "US" },
+  CRCL: { ticker: "CRCL", market: "US" },
+  AAPL: { ticker: "AAPL", market: "US" },
+  GOOGL: { ticker: "GOOGL", market: "US" },
+  MSFT: { ticker: "MSFT", market: "US" },
+  META: { ticker: "META", market: "US" },
+  TSM: { ticker: "TSM", market: "US" },
+  GME: { ticker: "GME", market: "US" },
+  MSTR: { ticker: "MSTR", market: "US" },
+  BMNR: { ticker: "BMNR", market: "US" },
+  AVGO: { ticker: "AVGO", market: "US" },
+  "BRK.B": { ticker: "BRK-B", market: "US" },
+  ASML: { ticker: "ASML", market: "US" },
+  AMZN: { ticker: "AMZN", market: "US" },
+  INTC: { ticker: "INTC", market: "US" },
+  KO: { ticker: "KO", market: "US" },
+  MCD: { ticker: "MCD", market: "US" },
+  JNJ: { ticker: "JNJ", market: "US" },
+  HOOD: { ticker: "HOOD", market: "US" },
+  MS: { ticker: "MS", market: "US" },
+  BABA: { ticker: "BABA", market: "US" },
+  NTES: { ticker: "NTES", market: "US" },
+  GS: { ticker: "GS", market: "US" },
+  LLY: { ticker: "LLY", market: "US" },
+  AMD: { ticker: "AMD", market: "US" },
+  V: { ticker: "V", market: "US" },
+  PDD: { ticker: "PDD", market: "US" },
+  MRVL: { ticker: "MRVL", market: "US" },
+  JD: { ticker: "JD", market: "US" },
+  TTWO: { ticker: "TTWO", market: "US" },
+  MA: { ticker: "MA", market: "US" },
+  TCENT: { ticker: "0700.HK", market: "HK" },
+  XIAO: { ticker: "1810.HK", market: "HK" },
+  MEIT: { ticker: "3690.HK", market: "HK" },
+  POPMT: { ticker: "9992.HK", market: "HK" },
+  "MC.FR": { ticker: "MC.PA", market: "EU" },
+  RMS: { ticker: "RMS.PA", market: "EU" },
+  "RR.GB": { ticker: "RR.L", market: "EU" },
+};
+
 export type StrategyGroup = "bias95" | "crypto247" | "corr_rwa" | "other" | "avoid";
 
 export interface OkxXLayerPoolMeta {

@@ -16,6 +16,7 @@ import {
   OKX_PHASE6_END_MS,
   OKX_PRODUCT_URL_BASE,
   OKX_XLAYER_POOLS,
+  RWA_YAHOO_TICKERS,
   XLAYER_CHAIN_ID,
   XLAYER_MAJOR_TOKENS,
   XLAYER_RPCS,
@@ -57,6 +58,10 @@ const ERC20_ABI = parseAbi([
   "function symbol() view returns (string)",
 ]);
 
+const ERC4626_ABI = parseAbi([
+  "function convertToAssets(uint256 shares) view returns (uint256)",
+]);
+
 const xlayerClient = createPublicClient({
   chain: {
     id: XLAYER_CHAIN_ID,
@@ -81,9 +86,24 @@ export interface OkxLivePoolMetrics extends OkxXLayerPoolMeta {
   price1Usd: number;
   /** 展示方向：1 RWA(或主币) = displayPrice 主流币(或计价币) */
   displayInverted: boolean;
+  /** 底层包装代币池价（1 wXXXx = ? 主流币） */
   displayPrice: number;
+  /** ERC-4626 股息包装乘数比（baseMult / quoteMult），用于换算为 OKX 页面展示的原股价格 */
+  wrapMultiplier: number;
+  /** 扣除股息乘数后的链上原股价格（与 OKX 原股申购页价格、真实美股价格 1:1 对应） */
+  unwrappedDexPrice: number;
   displayBaseSymbol: string;
   displayQuoteSymbol: string;
+  /** 真实股票/ETF 行情比对（来自 Yahoo Finance，含常规盘与盘前/盘后报价） */
+  realStockTicker: string | null;
+  realMarket: "US" | "HK" | "EU" | "ETF" | "CRYPTO" | null;
+  realRegularPrice: number | null;
+  realExtPrice: number | null;
+  realExtSession: "PRE" | "POST" | "REGULAR" | "24/7" | null;
+  realExtTime: string | null;
+  /** 链上原股 DEX 价 vs 真实常规盘/盘前盘后的精准折溢价 (%)：正=链上溢价(易砸)，负=链上折价(易拉) */
+  spreadVsRegularPct: number | null;
+  spreadVsExtPct: number | null;
   /** 协议抽成比例（0.25 = 25%），LP 净到手 = 1 - protocolFeeShare */
   protocolFeeShare: number;
   /** 池内实时链上余额与 TVL */
@@ -113,6 +133,7 @@ export interface OkxPoolsSnapshotResponse {
   phase6EndMs: number;
   totalPools: number;
   okxSynced: boolean;
+  realQuotesCount: number;
   majorPricesUsd: Record<string, number>;
   tokenPricesUsd: Record<string, number>;
   pools: OkxLivePoolMetrics[];
@@ -121,15 +142,18 @@ export interface OkxPoolsSnapshotResponse {
 interface CacheBox {
   snapshot: OkxPoolsSnapshotResponse | null;
   fetchedAt: number;
+  multMap: Record<string, number>;
+  multFetchedAt: number;
 }
 
 const GLOBAL_KEY = "__lpMonitorOkxXLayerCache__";
 const CACHE_TTL_MS = 60_000;
+const MULT_TTL_MS = 10 * 60_000;
 
 function getCache(): CacheBox {
   const g = globalThis as any;
   if (!g[GLOBAL_KEY]) {
-    g[GLOBAL_KEY] = { snapshot: null, fetchedAt: 0 } as CacheBox;
+    g[GLOBAL_KEY] = { snapshot: null, fetchedAt: 0, multMap: {}, multFetchedAt: 0 } as CacheBox;
   }
   return g[GLOBAL_KEY] as CacheBox;
 }
@@ -144,7 +168,7 @@ async function mapConcurrent<T, R>(items: T[], conc: number, fn: (item: T) => Pr
   return results;
 }
 
-/** 从 Binance 拉取主流币现货 USD 价格（BTC/ETH/SOL）。 */
+/** 从 Binance 拉取主流币与黄金现货 USD 价格（BTC/ETH/SOL/PAXG）。 */
 async function fetchBinanceMajorPrices(): Promise<Record<string, number>> {
   const out: Record<string, number> = {
     USDG: 1,
@@ -154,12 +178,14 @@ async function fetchBinanceMajorPrices(): Promise<Record<string, number>> {
     ETH: 1650,
     SOL: 120,
     OKB: 45,
+    PAXG: 3650,
   };
   try {
     const pairs = [
       ["BTC", "BTCUSDT"],
       ["ETH", "ETHUSDT"],
       ["SOL", "SOLUSDT"],
+      ["PAXG", "PAXGUSDT"],
     ] as const;
     await Promise.all(
       pairs.map(async ([k, sym]) => {
@@ -183,6 +209,163 @@ async function fetchBinanceMajorPrices(): Promise<Record<string, number>> {
     );
   } catch {}
   return out;
+}
+
+/** 读取所有 wXXXx (ERC-4626) 股息包装乘数 convertToAssets(1e18)，10 分钟缓存。 */
+async function fetchWrappedRwaMultipliers(): Promise<Record<string, number>> {
+  const cache = getCache();
+  const now = Date.now();
+  if (Object.keys(cache.multMap).length > 0 && now - cache.multFetchedAt < MULT_TTL_MS) {
+    return cache.multMap;
+  }
+  const wrappedAddrs = new Set<string>();
+  for (const p of OKX_XLAYER_POOLS) {
+    if (p.token0Symbol.startsWith("w")) wrappedAddrs.add(p.token0);
+    if (p.token1Symbol.startsWith("w")) wrappedAddrs.add(p.token1);
+  }
+  const oneE18 = 10n ** 18n;
+  const out: Record<string, number> = {};
+  await mapConcurrent(Array.from(wrappedAddrs), 12, async (addr) => {
+    try {
+      const assets = await xlayerClient.readContract({
+        address: addr as Address,
+        abi: ERC4626_ABI,
+        functionName: "convertToAssets",
+        args: [oneE18],
+      });
+      const m = Number(formatUnits(assets, 18));
+      out[addr] = Number.isFinite(m) && m > 0.5 && m < 5 ? m : 1;
+    } catch {
+      out[addr] = 1;
+    }
+  });
+  cache.multMap = out;
+  cache.multFetchedAt = now;
+  return out;
+}
+
+interface RealStockQuoteUsd {
+  ticker: string;
+  market: "US" | "HK" | "EU" | "ETF";
+  regUsd: number;
+  extUsd: number;
+  session: "PRE" | "POST" | "REGULAR";
+  extTime: string | null;
+}
+
+/** 并行从 Yahoo Finance 拉取全部美股/港股/欧股常规盘与盘前/盘后报价，并换算为 USD。 */
+async function fetchRealStockQuotes(): Promise<Record<string, RealStockQuoteUsd>> {
+  const uniqueTickers = Array.from(
+    new Set([
+      ...Object.values(RWA_YAHOO_TICKERS).map((x) => x.ticker),
+      "HKD=X",
+      "EURUSD=X",
+      "GBPUSD=X",
+    ])
+  );
+
+  interface RawYf {
+    ticker: string;
+    currency: string;
+    reg: number;
+    ext: number;
+    session: "PRE" | "POST" | "REGULAR";
+    extTime: string | null;
+  }
+
+  const rawList = await mapConcurrent(uniqueTickers, 12, async (ticker): Promise<RawYf | null> => {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), 7000);
+    try {
+      const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(
+        ticker
+      )}?interval=5m&range=1d&includePrePost=true`;
+      const res = await fetch(url, {
+        headers: { "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)" },
+        signal: ctrl.signal,
+        cache: "no-store",
+      });
+      if (!res.ok) return null;
+      const j = await res.json();
+      const result = j?.chart?.result?.[0];
+      const meta = result?.meta;
+      const reg = Number(meta?.regularMarketPrice);
+      if (!Number.isFinite(reg) || reg <= 0) return null;
+
+      const closes: (number | null)[] = result?.indicators?.quote?.[0]?.close || [];
+      const timestamps: number[] = result?.timestamp || [];
+      let ext = reg;
+      let extTs = Number(meta?.regularMarketTime) || 0;
+      for (let i = closes.length - 1; i >= 0; i--) {
+        const c = closes[i];
+        if (c !== null && c !== undefined && Number.isFinite(c) && c > 0) {
+          ext = c;
+          extTs = timestamps[i] || extTs;
+          break;
+        }
+      }
+
+      const regStart = Number(meta?.currentTradingPeriod?.regular?.start) || 0;
+      const regEnd = Number(meta?.currentTradingPeriod?.regular?.end) || 0;
+      let session: "PRE" | "POST" | "REGULAR" = "REGULAR";
+      if (regEnd > 0 && extTs > regEnd) session = "POST";
+      else if (regStart > 0 && extTs < regStart) session = "PRE";
+
+      const extTime = extTs
+        ? new Date(extTs * 1000 + 8 * 3600_000).toISOString().replace("T", " ").slice(5, 16)
+        : null;
+
+      return {
+        ticker,
+        currency: String(meta?.currency || "USD"),
+        reg,
+        ext,
+        session,
+        extTime,
+      };
+    } catch {
+      return null;
+    } finally {
+      clearTimeout(t);
+    }
+  });
+
+  const rawByTicker: Record<string, RawYf> = {};
+  for (const r of rawList) {
+    if (r) rawByTicker[r.ticker] = r;
+  }
+
+  const hkdPerUsd = rawByTicker["HKD=X"]?.reg || 7.8;
+  const usdPerEur = rawByTicker["EURUSD=X"]?.reg || 1.09;
+  const usdPerGbp = rawByTicker["GBPUSD=X"]?.reg || 1.31;
+
+  const toUsd = (val: number, currency: string): number => {
+    if (currency === "USD") return val;
+    if (currency === "HKD") return val / hkdPerUsd;
+    if (currency === "EUR") return val * usdPerEur;
+    if (currency === "GBp") return (val / 100) * usdPerGbp;
+    if (currency === "GBP") return val * usdPerGbp;
+    return val;
+  };
+
+  const out: Record<string, RealStockQuoteUsd> = {};
+  for (const [cleanKey, meta] of Object.entries(RWA_YAHOO_TICKERS)) {
+    const q = rawByTicker[meta.ticker];
+    if (!q) continue;
+    out[cleanKey] = {
+      ticker: meta.ticker,
+      market: meta.market,
+      regUsd: toUsd(q.reg, q.currency),
+      extUsd: toUsd(q.ext, q.currency),
+      session: q.session,
+      extTime: q.extTime,
+    };
+  }
+  return out;
+}
+
+function cleanRwaBaseKey(sym: string): string {
+  return sym.replace(/^w/, "").replace(/[xy]$/, "");
 }
 
 interface OkxRemotePoolInfo {
@@ -282,9 +465,11 @@ export async function fetchOkxXLayerPoolsSnapshot(opts?: {
     return cache.snapshot;
   }
 
-  const [majorSpot, okxRemote] = await Promise.all([
+  const [majorSpot, okxRemote, multMap, realStockQuotes] = await Promise.all([
     fetchBinanceMajorPrices(),
     fetchOkxEventMetrics(),
+    fetchWrappedRwaMultipliers(),
+    fetchRealStockQuotes(),
   ]);
 
   // 并行读取 51 个 V3 池的 slot0 / liquidity / 双币余额
@@ -365,7 +550,47 @@ export async function fetchOkxXLayerPoolsSnapshot(opts?: {
     majorSpot.OKB = tokenPricesUsd[wokbAddr];
   }
 
+  /** 根据资产符号返回真实外部报价（美股/港股/欧股/黄金/主流币），用于精确比对折溢价 */
+  const resolveExternalQuote = (
+    sym: string
+  ): {
+    regUsd: number;
+    extUsd: number;
+    ticker: string | null;
+    market: "US" | "HK" | "EU" | "ETF" | "CRYPTO" | null;
+    session: "PRE" | "POST" | "REGULAR" | "24/7";
+    extTime: string | null;
+  } | null => {
+    if (sym === "USDG" || sym === "USDC" || sym === "USDT0") {
+      return { regUsd: 1, extUsd: 1, ticker: null, market: null, session: "24/7", extTime: null };
+    }
+    if (sym === "xBTC") {
+      return { regUsd: majorSpot.BTC, extUsd: majorSpot.BTC, ticker: "BTCUSDT", market: "CRYPTO", session: "24/7", extTime: null };
+    }
+    if (sym === "xETH") {
+      return { regUsd: majorSpot.ETH, extUsd: majorSpot.ETH, ticker: "ETHUSDT", market: "CRYPTO", session: "24/7", extTime: null };
+    }
+    if (sym === "xSOL") {
+      return { regUsd: majorSpot.SOL, extUsd: majorSpot.SOL, ticker: "SOLUSDT", market: "CRYPTO", session: "24/7", extTime: null };
+    }
+    const baseKey = cleanRwaBaseKey(sym);
+    if (baseKey === "PAXG") {
+      return { regUsd: majorSpot.PAXG, extUsd: majorSpot.PAXG, ticker: "PAXGUSDT", market: "CRYPTO", session: "24/7", extTime: null };
+    }
+    const q = realStockQuotes[baseKey];
+    if (!q) return null;
+    return {
+      regUsd: q.regUsd,
+      extUsd: q.extUsd,
+      ticker: q.ticker,
+      market: q.market,
+      session: q.session,
+      extTime: q.extTime,
+    };
+  };
+
   const updatedAt = new Date().toISOString();
+  let realQuotesCount = 0;
   const pools: OkxLivePoolMetrics[] = rawReads.map((r) => {
     const m = r.meta;
     const p0 = tokenPricesUsd[m.token0] || 0;
@@ -385,10 +610,44 @@ export async function fetchOkxXLayerPoolsSnapshot(opts?: {
     const displayInverted = m.majorSide === "token0";
     const displayPrice =
       r.price0In1 > 0 ? (displayInverted ? 1 / r.price0In1 : r.price0In1) : 0;
+    const displayBaseAddr = displayInverted ? m.token1 : m.token0;
+    const displayQuoteAddr = displayInverted ? m.token0 : m.token1;
     const displayBaseSymbol = displayInverted ? m.token1Symbol : m.token0Symbol;
     const displayQuoteSymbol = displayInverted ? m.token0Symbol : m.token1Symbol;
 
-    // 推荐资金：按 20% 自我稀释上限（cap = depth8pct * 0.25）给出舒适上限，最低 $300，上限 $15,000
+    // 精确扣除 ERC-4626 股息包装乘数：1 wBase = baseMult * Base => 1 Base = (displayPrice / (baseMult / quoteMult)) Quote
+    const baseMult = multMap[displayBaseAddr] ?? 1;
+    const quoteMult = multMap[displayQuoteAddr] ?? 1;
+    const wrapMultiplier = quoteMult > 0 ? baseMult / quoteMult : 1;
+    const unwrappedDexPrice = wrapMultiplier > 0 ? displayPrice / wrapMultiplier : displayPrice;
+
+    // 比对真实外部股价（常规盘 + 盘前/盘后）
+    let realStockTicker: string | null = null;
+    let realMarket: "US" | "HK" | "EU" | "ETF" | "CRYPTO" | null = null;
+    let realRegularPrice: number | null = null;
+    let realExtPrice: number | null = null;
+    let realExtSession: "PRE" | "POST" | "REGULAR" | "24/7" | null = null;
+    let realExtTime: string | null = null;
+    let spreadVsRegularPct: number | null = null;
+    let spreadVsExtPct: number | null = null;
+
+    if (unwrappedDexPrice > 0) {
+      const bq = resolveExternalQuote(displayBaseSymbol);
+      const qq = resolveExternalQuote(displayQuoteSymbol);
+      if (bq && qq && qq.regUsd > 0 && qq.extUsd > 0 && bq.ticker) {
+        realStockTicker = qq.ticker ? `${bq.ticker}/${qq.ticker}` : bq.ticker;
+        realMarket = bq.market;
+        realRegularPrice = bq.regUsd / qq.regUsd;
+        realExtPrice = bq.extUsd / qq.extUsd;
+        realExtSession = bq.session !== "24/7" ? bq.session : qq.session;
+        realExtTime = bq.extTime || qq.extTime;
+        spreadVsRegularPct = Number((((unwrappedDexPrice - realRegularPrice) / realRegularPrice) * 100).toFixed(2));
+        spreadVsExtPct = Number((((unwrappedDexPrice - realExtPrice) / realExtPrice) * 100).toFixed(2));
+        realQuotesCount++;
+      }
+    }
+
+    // 推荐资金：按 20% 自我稀释上限（cap = depth8pct * 0.25）给出舒适上限，最低 $500，上限 $15,000
     const recMaxUsd =
       depth8pctUsd > 0
         ? Math.max(500, Math.min(15000, Math.round((depth8pctUsd * 0.25) / 100) * 100))
@@ -405,8 +664,18 @@ export async function fetchOkxXLayerPoolsSnapshot(opts?: {
       price1Usd: p1,
       displayInverted,
       displayPrice,
+      wrapMultiplier: Number(wrapMultiplier.toFixed(6)),
+      unwrappedDexPrice,
       displayBaseSymbol,
       displayQuoteSymbol,
+      realStockTicker,
+      realMarket,
+      realRegularPrice,
+      realExtPrice,
+      realExtSession,
+      realExtTime,
+      spreadVsRegularPct,
+      spreadVsExtPct,
       protocolFeeShare,
       bal0: r.bal0,
       bal1: r.bal1,
@@ -430,6 +699,7 @@ export async function fetchOkxXLayerPoolsSnapshot(opts?: {
     phase6EndMs: OKX_PHASE6_END_MS,
     totalPools: pools.length,
     okxSynced: okxRemote.ok,
+    realQuotesCount,
     majorPricesUsd: majorSpot,
     tokenPricesUsd,
     pools,
